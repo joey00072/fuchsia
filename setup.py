@@ -1,0 +1,47 @@
+from setuptools import setup, find_packages
+
+setup(
+    name="fuchsia",
+    version="0.1.0",
+    packages=find_packages(),
+    install_requires=[
+        "torch>=2.0.0",
+        "transformers>=4.36.0",
+        "datasets>=2.15.0",
+        "peft>=0.7.0",
+        "wandb>=0.16.0",
+        "rich>=13.7.0",
+        "accelerate>=0.25.0",
+        "bitsandbytes>=0.41.0",
+        "sentencepiece>=0.1.99",
+        "protobuf>=4.25.1",
+        "tqdm>=4.66.1",
+        "numpy>=1.24.0",
+        "pandas>=2.1.0",
+        "scikit-learn>=1.3.0",
+        "lightning>=2.1.0",
+        "fabric>=2.1.0",
+    ],
+    python_requires=">=3.8",
+    author="Joey",
+    author_email="joey00072@gmail.com",
+    description="A collection of autoregressive model implementations and experiments",
+    long_description=open("README.md").read(),
+    long_description_content_type="text/markdown",
+    url="https://github.com/joey00072/fuchsia",
+    entry_points={
+        "console_scripts": [
+            "fuchsia=fuchsia.cli:main",
+        ],
+    },
+    classifiers=[
+        "Development Status :: 3 - Alpha",
+        "Intended Audience :: Science/Research",
+        "License :: OSI Approved :: MIT License",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    ],
+) 
