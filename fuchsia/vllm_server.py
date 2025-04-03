@@ -1,3 +1,21 @@
+# Copyright 2025 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+
+# derived from https://github.com/huggingface/trl/blob/main/trl/scripts/vllm_serve.py
+# from original pr of binary-husky (https://github.com/binary-husky) pr https://github.com/huggingface/trl/pull/3094
 
 import argparse
 import ctypes
@@ -12,9 +30,12 @@ import torch.distributed as dist
 from fastapi import BackgroundTasks, FastAPI
 from pydantic import BaseModel
 import uvicorn
+from collections import defaultdict
+
 
 from datasets import Dataset,load_dataset
 from transformers import AutoTokenizer
+
 
 import asyncio
 # Check CUDA availability
@@ -41,8 +62,10 @@ logger = logging.getLogger(__name__)
 # the 'spawn' start method
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
+
 import socket
 import psutil
+import numpy as np
 
 def get_ip_addresses():
     """Get all network IP addresses with detailed information"""
@@ -396,12 +419,13 @@ class DataSamplerConfig(ServerConfig):
         
         self.vllm_n:int = kwargs.get("vllm_n", 1)
         self.vllm_repetition_penalty:float = kwargs.get("vllm_repetition_penalty", 1.0)
-        self.vllm_temperature:float = kwargs.get("vllm_temperature", 1.0)
+        self.vllm_temperature:float = kwargs.get("vllm_temperature", 0.9)
         self.vllm_top_p:float = kwargs.get("vllm_top_p", 1.0)
         self.vllm_top_k:int = kwargs.get("vllm_top_k", -1)
         self.vllm_min_p:float = kwargs.get("vllm_min_p", 0.0)
-        self.vllm_max_tokens:int = kwargs.get("vllm_max_tokens", 16)
+        self.vllm_max_tokens:int = kwargs.get("vllm_max_tokens", 1024)
         self.guided_decoding:Optional[GuidedDecodingParams] = kwargs.get("guided_decoding", None)
+        self.generation_batch_size:int = kwargs.get("generation_batch_size", 1)
 
 class DataSamplerServer(VLLMServer):
     def __init__(self, config: DataSamplerConfig, dataset: Dataset, reward_functions: list[Callable] = None):
@@ -427,7 +451,7 @@ class DataSamplerServer(VLLMServer):
         self.buffer = []
         self.dataset_iter = iter(self.dataset)
         self._epoch = 1  
-        self._generation_batch_size = 1
+        self._generation_batch_size = config.generation_batch_size
         self._sampling_params = SamplingParams(
             n=config.vllm_n,
             repetition_penalty=config.vllm_repetition_penalty,
@@ -457,11 +481,13 @@ class DataSamplerServer(VLLMServer):
                 
                 await asyncio.sleep(5)
                 return {"sample": None}
-            sample = self.buffer.pop(0)
+            items = self.buffer.pop(0)
             # Add buffer fill task to run in background after response
-            background_tasks.add_task(self.buffer_fill)
-            
-            return {"sample": sample}
+            if len(self.buffer) < self.buffer_size:
+                background_tasks.add_task(self.buffer_fill)
+                print("requesting buffer fill")
+                
+            return {"sample": items}
         
         @app.post("/buffer_fill/")
         async def buffer_fill(background_tasks: BackgroundTasks):
@@ -473,6 +499,35 @@ class DataSamplerServer(VLLMServer):
             
             background_tasks.add_task(self.buffer_fill)
             return {"message": "Buffer filling started"}
+
+        @app.get("/buffer_status/")
+        async def buffer_status():
+            """
+            Returns the current status of the buffer including:
+            - Current buffer size
+            - Maximum buffer size
+            - Whether buffer is currently being filled
+            - Current epoch number
+            """
+            return {
+                "current_size": len(self.buffer),
+                "max_size": self.buffer_size,
+                "is_filling": self._is_filling,
+                "epoch": self._epoch
+            }
+
+        @app.post("/empty_buffer/")
+        async def empty_buffer():
+            """
+            Empties the buffer and returns the number of items that were removed.
+            """
+            items_removed = len(self.buffer)
+            self.buffer.clear()
+            return {
+                "message": "Buffer emptied successfully",
+                "items_removed": items_removed
+            }
+
         return app
     
     def buffer_fill(self):
@@ -482,22 +537,27 @@ class DataSamplerServer(VLLMServer):
         self._is_filling = True
         try:
             while len(self.buffer) < self.buffer_size:
-                samples = []
+                items = []
                 for _ in range(self._generation_batch_size):        
                     try:
-                        sample = next(self.dataset_iter)
-                        samples.append(sample)
+                        item = next(self.dataset_iter)
+                        items.append(item)
                     except StopIteration:
                         self.dataset_iter = iter(self.dataset)
                         self._epoch += 1
                 
-                samples_with_rewards = self.process_sample(samples)
-                self.buffer.append(samples_with_rewards)
+                items_with_rewards = self.process_sample(items)
+                print("="*10)
+                print("="*10)
+                print(items_with_rewards)
+                print("="*10)
+                self.buffer.extend(items_with_rewards)
+                print(f"buffer: {len(self.buffer[0]['completions'])}")
         finally:
             self._is_filling = False
     
-    def process_sample(self, samples):
-        prompts = [sample[self.dataset_feild] for sample in samples]
+    def process_sample(self, items):
+        prompts = [item[self.dataset_feild] for item in items]
         guided_decoding = None
         sampling_params = SamplingParams(
             n=self.config.vllm_n,
@@ -513,16 +573,53 @@ class DataSamplerServer(VLLMServer):
         completion_ids = [list(output.token_ids) for outputs in all_outputs for output in outputs.outputs]
         
         completions = [self.tokenizer.decode(c) for c in completion_ids]
-        rewards = self.calculate_rewards(samples, completions)
         
-        return {"completion_ids": completion_ids, "completions": completions, "rewards": rewards}
+        all_outputs = []
+        for g_idx,item in enumerate(items):
+            output = {}
+            output["item"] = [item]*self.config.vllm_n
+            output["completions"] = []
+            output["completion_ids"] = []
+            for idx in range(self.config.vllm_n):
+                g_completion = completions[g_idx*self.config.vllm_n + idx]
+                g_completion_id = completion_ids[g_idx*self.config.vllm_n + idx]
+                output["inputs"] = item[self.dataset_feild]
+                output["completions"].append(g_completion)
+                output["completion_ids"].append(g_completion_id)
+            
+            output["all_rewards"], output["rewards"], output["mean"], output["std"] = self.calculate_rewards(output["item"], output["completions"], output["completion_ids"])
+            all_outputs.append(output)
         
-    def calculate_rewards(self, samples, completions):
-        rewards = [[] for _ in range(len(self.reward_functions))]
-        for sample, completion in zip(samples, completions):
-            for idx, reward_function in enumerate(self.reward_functions):
-                rewards[idx].append(reward_function(sample, completion))
-        return rewards
+        print(f"items: {len(items)}, completions: {len(completions)}")        
+        
+        # for output in all_outputs:
+        #     print(output)
+        #     print("-"*100)
+        return all_outputs
+        
+    def calculate_rewards(self, items, completions, completion_ids):
+        all_rewards = {}
+        for reward_function in self.reward_functions:
+            print(f"reward_function: {reward_function.__name__}")
+            rewards = reward_function(self.tokenizer, items, completions, completion_ids)
+            all_rewards[reward_function.__name__] = rewards
+        
+        lst = []
+        for key,value in all_rewards.items():
+            lst.append(value)
+        lst = np.array(lst)
+        print(lst)
+        total_rewards = lst.sum(axis=0)
+        print(lst)
+        mean = total_rewards.mean()
+        std = total_rewards.std()
+        
+        # total reward to pytohn list
+        total_rewards = total_rewards.tolist()
+        mean = mean
+        std = std.tolist()
+        
+        return all_rewards, total_rewards, mean, std
         
 
 def load_config_from_yaml(yaml_path: str) -> ServerConfig:
@@ -574,26 +671,33 @@ def run_server():
 
 
 def test_datasampler():
+    max_model_len = 1024 * 8
     config = DataSamplerConfig(
-        model="unsloth/Llama-3.2-3B-Instruct",
+        model="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
         revision="main",
-        tensor_parallel_size=1,
         host="0.0.0.0",
         port=8000,
         dataset_feild="Question Text",
         buffer_size=4,
-        max_model_len=1024,
+        max_model_len=max_model_len,
         gpu_memory_utilization=0.7,
         dtype="bfloat16",
-        quantization="fp8",
+        vllm_max_tokens=max_model_len,
+        vllm_n=8,
+        vllm_repetition_penalty=1.0,
+        vllm_temperature=1.0,
+        vllm_top_p=1.0,
+        vllm_top_k=-1,
+        vllm_min_p=0.0,
+        
+        # quantization="fp8",
     )
     ds = load_dataset("CK0607/2025-Jee-Mains-Question",split="train")
-    def reward_function(samples, completions):
+    def reward_function(tokenizer, items, completions, completion_ids):
         return [len(completion) for completion in completions]
     
     server = DataSamplerServer(config, ds, [reward_function])
     server.serve()  
     
 if __name__ == "__main__":
-    # main()
     test_datasampler()

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+
 import atexit
 import logging
 import time
@@ -31,13 +33,12 @@ from vllm.distributed.utils import StatelessProcessGroup
 
 logger = logging.getLogger(__name__)
 
-
 class VLLMClient:
     """
     A client class to interact with a vLLM server.
 
     This class provides methods to generate completions, initialize and manage weight update groups, and update model
-    weights in a distributed setting. Before using it, start the vLLM server with `trl vllm-serve`.
+    weights in a distributed setting. Before using it, start the vLLM server with `foosha serve`.
 
     Args:
         host (`str`, *optional*, defaults to `"0.0.0.0"`):
@@ -54,7 +55,7 @@ class VLLMClient:
         Run the vLLM server with the model `Qwen/Qwen2.5-7B`:
 
         ```
-        $ trl vllm-serve --model Qwen/Qwen2.5-7B
+        $ foosha serve --model Qwen/Qwen2.5-7B
         ...
         INFO:     Application startup complete.
         INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
@@ -63,7 +64,7 @@ class VLLMClient:
         Use the client to generate completions and update model weights:
 
         ```python
-        >>> from trl.extras.vllm_client import VLLMClient
+        >>> from foosha.extras.vllm_client import VLLMClient
         >>> client = VLLMClient()
         >>> client.generate(["Hello, AI!", "Tell me a joke"])
         [[2980, 498, 1492, 752, 448, 264, 13027, 8645, 30, 358, 2776, 4460, 311, 3270, 264, 2025],
@@ -82,9 +83,25 @@ class VLLMClient:
         self.host = host
         self.server_port = server_port
         self.group_port = group_port
-        self.check_server(connection_timeout)  # check server and fail after timeout
+        self._base_url = f"http://{self.host}:{self.server_port}"
+        self.check_server(connection_timeout)
         self.init_communicator()
-        atexit.register(self.close_communicator)  # when the client object is deleted, close the weight update group
+        atexit.register(self.close_communicator)
+
+    def _make_request(self, endpoint: str, method: str = "get", **kwargs) -> dict:
+        """Helper method to make HTTP requests and handle responses."""
+        url = f"{self._base_url}/{endpoint.strip('/')}/"
+        try:
+            if method.lower() == "get":
+                response = self.session.get(url, **kwargs)
+            else:
+                response = self.session.post(url, **kwargs)
+            
+            if response.status_code == 200:
+                return response.json() if response.content else {}
+            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+        except requests.exceptions.RequestException as e:
+            raise ConnectionError(f"Failed to connect to {url}: {str(e)}")
 
     def check_server(self, total_timeout: float = 0.0, retry_interval: float = 2.0):
         """
@@ -109,7 +126,7 @@ class VLLMClient:
                 if elapsed_time >= total_timeout:
                     raise ConnectionError(
                         f"The vLLM server can't be reached at {self.host}:{self.server_port} after {total_timeout} "
-                        "seconds. Make sure the server is running by running `trl vllm-serve`."
+                        "seconds. Make sure the server is running by running `foosha serve`."
                     ) from exc
             else:
                 if response.status_code == 200:
@@ -159,47 +176,34 @@ class VLLMClient:
             `list[list[int]]`:
                 List of lists of token IDs representing the model-generated completions for each prompt.
         """
-        url = f"http://{self.host}:{self.server_port}/generate/"
-        response = self.session.post(
-            url,
-            json={
-                "prompts": prompts,
-                "n": n,
-                "repetition_penalty": repetition_penalty,
-                "temperature": temperature,
-                "top_p": top_p,
-                "top_k": top_k,
-                "min_p": min_p,
-                "max_tokens": max_tokens,
-                "guided_decoding_regex": guided_decoding_regex,
-            },
-        )
-        if response.status_code == 200:
-            return response.json()["completion_ids"]
-        else:
-            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+        params = {
+            "prompts": prompts,
+            "n": n,
+            "repetition_penalty": repetition_penalty,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+            "max_tokens": max_tokens,
+            "guided_decoding_regex": guided_decoding_regex,
+        }
+        return self._make_request("generate", method="post", json=params)["completion_ids"]
 
     def init_communicator(self):
         """
         Initializes the weight update group in a distributed setup for model synchronization.
         """
         # Get the tensor parallel size from the server
-        url = f"http://{self.host}:{self.server_port}/get_tensor_parallel_size/"
-        response = requests.get(url)
-        if response.status_code == 200:
-            tensor_parallel_size = response.json()["tensor_parallel_size"]
-        else:
-            raise Exception(f"Request failed: {response.status_code}, {response.text}")
-
+        tensor_parallel_size = self._make_request("get_tensor_parallel_size")["tensor_parallel_size"]
         world_size = tensor_parallel_size + 1
         self.rank = tensor_parallel_size  # The client's rank is the last process
 
         # Initialize weight update group
-        url = f"http://{self.host}:{self.server_port}/init_communicator/"
-        # In the server side, the host is set to 0.0.0.0
-        response = self.session.post(url, json={"host": "0.0.0.0", "port": self.group_port, "world_size": world_size})
-        if response.status_code != 200:
-            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+        self._make_request(
+            "init_communicator",
+            method="post",
+            json={"host": "0.0.0.0", "port": self.group_port, "world_size": world_size}
+        )
 
         # Set up the communication group for weight broadcasting
         pg = StatelessProcessGroup.create(host=self.host, port=self.group_port, rank=self.rank, world_size=world_size)
@@ -215,11 +219,11 @@ class VLLMClient:
             weights (`torch.Tensor`):
                 Tensor containing the updated weights.
         """
-        dtype, shape = str(weights.dtype), tuple(weights.shape)
-        url = f"http://{self.host}:{self.server_port}/update_named_param/"
-        response = self.session.post(url, json={"name": name, "dtype": dtype, "shape": shape})
-        if response.status_code != 200:
-            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+        self._make_request(
+            "update_named_param",
+            method="post",
+            json={"name": name, "dtype": str(weights.dtype), "shape": tuple(weights.shape)}
+        )
 
         # Broadcast the weights to the other processes
         self.pynccl_comm.broadcast(weights, src=self.rank, stream=torch.cuda.current_stream())
@@ -241,19 +245,58 @@ class VLLMClient:
         """
         Resets the prefix cache for the model.
         """
-        url = f"http://{self.host}:{self.server_port}/reset_prefix_cache/"
-        response = self.session.post(url)
-        if response.status_code != 200:
-            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+        self._make_request("reset_prefix_cache", method="post")
 
     def close_communicator(self):
         """
         Closes the weight update group and cleans up the communication group.
         """
-        url = f"http://{self.host}:{self.server_port}/close_communicator/"
-        response = self.session.post(url)
-        if response.status_code != 200:
-            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+        self._make_request("close_communicator", method="post")
+
+    def get_sample(self) -> Optional[dict]:
+        """
+        Gets a sample from the server's buffer.
+
+        Returns:
+            `dict` or `None`:
+                A dictionary containing the sample data with completion_ids, completions, and rewards,
+                or None if the buffer is empty.
+        """
+        response = self._make_request("get_sample", method="post")
+        return response.get("sample")
+
+    def empty_buffer(self):
+        """
+        Empties the server's buffer by removing all samples.
+
+        Returns:
+            `dict`:
+                A dictionary containing the status of the operation.
+        """
+        return self._make_request("empty_buffer", method="post")
+
+    def fill_buffer(self, num_samples:int=None):
+        """
+        Fills the server's buffer with new samples.
+
+        Args:
+            num_samples (`int`, *optional*, defaults to `100`):
+                Number of samples to generate and add to the buffer.
+
+        Returns:
+            `dict`:
+                A dictionary containing the status of the operation.
+        """
+        if num_samples is None:
+            return self._make_request("buffer_fill", method="post")
+        else:
+            return self._make_request("buffer_fill", method="post", json={"num_samples": num_samples})
+
+    def trigger_buffer_fill(self):
+        """
+        Triggers the server to start filling its buffer with new samples.
+        """
+        return self._make_request("buffer_fill", method="post")
 
 
 # Example usage
@@ -263,11 +306,11 @@ if __name__ == "__main__":
     client = VLLMClient()
 
     # Generate completions
-    responses = client.generate(["Hello, AI!", "Tell me a joke"], n=4, max_tokens=32, sampling_params=SamplingParams())
+    responses = client.generate(["Hello, AI!", "Tell me a joke"], n=4, max_tokens=32)
     print("Responses:", responses)  # noqa
 
     # Update model weights
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B").to("cuda")
+    model = AutoModelForCausalLM.from_pretrained("unsloth/Llama-3.2-3B-Instruct").to("cuda")
     client.update_model_params(model)

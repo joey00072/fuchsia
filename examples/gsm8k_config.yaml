@@ -1,0 +1,35 @@
+# GSM8K Training Configuration
+
+# Model configuration
+model_name: "unsloth/Llama-3.1-8B-Instruct"
+
+# LoRA configuration
+lora:
+  r: 8
+  alpha: 16
+  target_modules: null  # Set to null to use default target modules
+
+# GRPO training configuration
+grpo:
+  group_size: 8
+  micro_group_size: 2
+  batch_size: 1
+  lr: 5e-6
+  weight_decay: 0.1
+  beta: 0.00
+  log_wandb: true
+  wandb_project: "fuchsia-grpo"
+
+# Dataset configuration
+dataset:
+  name: "openai/gsm8k"
+  split: "train"
+  max_samples: null  # Set to null to use all samples
+
+# Training configuration
+training:
+  max_epochs: 1
+  max_iterations: 1000
+  save_steps: 100
+  eval_steps: 50
+  output_dir: "gsm8k_output" 

@@ -9,8 +9,6 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional, List, Callable, Any
 
-from fuchsia.vllm_client import VLLMClient
-
 
 @dataclass
 class GRPOConfig:
@@ -27,9 +25,7 @@ class GRPOConfig:
     using_lora: bool = False
     wandb_project: str = "nanoGRPO"
     use_vllm: bool = False
-    dataset_feild: str = "prompt"
-    num_policy_updates: int = 8
-    
+
     def __post_init__(self):
         dtype_map = {
             "bfloat16": torch.bfloat16,
@@ -56,8 +52,7 @@ class GRPO:
         dataset,
         optimizer = None,
         reward_functions: List[Callable] = None,
-        config: GRPOConfig = None,
-        vllm_client: VLLMClient = None
+        config: GRPOConfig = None
     ):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
@@ -67,7 +62,7 @@ class GRPO:
         self.model = model
         self.ref_model = ref_model
         self.tokenizer = tokenizer
-        self.dataset = dataset
+        self.dataset = dataset.shuffle(seed=42)
         self.data_loader_iter = iter(self.dataset)
         self.group_size = config.group_size
         self.micro_group_size = config.micro_group_size   
@@ -78,14 +73,12 @@ class GRPO:
         self.epsilon = config.epsilon
         self.optimizer = optimizer if optimizer is not None else torch.optim.AdamW(self.model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
         self.reward_functions: list = reward_functions
-        self.dataset_feild = config.dataset_feild
-        self.num_policy_updates = config.num_policy_updates
-        
+
         self.using_lora = config.using_lora 
-        if self.using_lora and self.beta > 0:
+        if self.using_lora:
             self.ref_model = model
 
-        self.distributed = config.use_vllm
+        self.distributed = False
         self.log_wandb = config.log_wandb
         if self.log_wandb:
             wandb.init(project=config.wandb_project)
@@ -93,17 +86,12 @@ class GRPO:
         self.metrics = defaultdict(list)
 
         self.model.to(self.device).to(config.dtype)
-        if self.beta > 0 and ref_model is not None:
+        if self.beta > 0:
             self.ref_model.to(self.device).to(config.dtype)
         
         if config.use_vllm:
-            print("Using VLLM")
-            self.vllm_client = vllm_client if vllm_client is not None else VLLMClient()
+            self.vllm_client = VLLMClient(model=self.model, tokenizer=self.tokenizer)
             
-            
-            
-            
-
     def get_per_token_logps(self, model, input_ids) -> Tensor:
         logits = model(input_ids=input_ids).logits
         logits = logits[:, :-1, :]  # Shape: [2, 660, 128256]
@@ -115,7 +103,7 @@ class GRPO:
         policy_log_probs = self.get_per_token_logps(self.model, inputs)
         
         kld = 0
-        if self.beta != 0:
+        if self.beta == 0:
             with (
                 self.ref_model.disable_adapter()
                 if self.using_lora  
@@ -179,11 +167,7 @@ class GRPO:
         end_time = time.time()
         print(f"Time for generation: {end_time - start_time} seconds")
 
-
         decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=False)
-        
-        import rich
-        rich.print(decoded_outputs[0])
         
         rewards = self.compute_rewards(samples,decoded_outputs)
 
@@ -193,52 +177,6 @@ class GRPO:
         valid_gen_mask = gen_tokens != self.tokenizer.pad_token_id
         loss_mask[:, prompt_length:] = valid_gen_mask
 
-        return outputs, torch.tensor(rewards, dtype=self.dtype).float(), loss_mask[:, 1:]
-    
-    
-    def distributed_sample_batch(self):
-        inputs_texts = []
-        outputs = []
-        completions = []
-        samples = []
-        rewards = []
-        for _ in range(self.batch_size):
-            item = next(self.data_loader_iter)
-            rewards.append(item["rewards"])
-            for idx in range(len(item["completions"])):
-                samples.append(item)
-                prompt = item["inputs"]
-                inputs_texts.append(prompt)
-                completions.append(item["completions"][idx])
-
-        encoded = self.tokenizer(inputs_texts, padding=True, return_tensors="pt")
-        input_ids = encoded["input_ids"]
-        attention_mask = encoded["attention_mask"]  
-        
-        prompt_length = input_ids.shape[1]
-        
-        
-        decoded = self.tokenizer.batch_decode(input_ids, skip_special_tokens=False)
-        
-        outputs = []
-        
-        for prompt, completion in zip(decoded, completions):
-            outputs.append(prompt+completion)
-            
-        outputs = self.tokenizer(outputs, padding=True,padding_side="right", return_tensors="pt")["input_ids"]
-
-        input_ids = torch.repeat_interleave(input_ids, self.group_size, dim=0)
-        samples = [sample for _ in range(self.group_size) for sample in samples]
-        
-        decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=False)
-
-        loss_mask = torch.zeros(outputs.shape, dtype=torch.bool)
-
-        gen_tokens = outputs[:, prompt_length:]
-        valid_gen_mask = gen_tokens != self.tokenizer.pad_token_id
-        loss_mask[:, prompt_length:] = valid_gen_mask
-        
-        
         return outputs, torch.tensor(rewards, dtype=self.dtype).float(), loss_mask[:, 1:]
 
     def compute_rewards(self, samples, responses):
@@ -257,8 +195,8 @@ class GRPO:
                 self.metrics[f"reward_{func.__name__}"].append(r.item())
 
         prompt_lenghts = [[] for _ in range(self.batch_size)]
-        for idx, resp in enumerate(responses):
-            prompt_lenghts[idx % self.batch_size].append(len(resp))
+        for idx, sample in enumerate(samples):
+            prompt_lenghts[idx % self.batch_size].append(len(sample["prompt"]))
 
         for idx, pl in enumerate(prompt_lenghts):
             self.metrics[f"prompt_length"].append(sum(pl)/len(pl))
@@ -341,8 +279,3 @@ class GRPO:
             print(f"iter {idx}  >>> reward: {rewards.mean()}")
             print(f"Total time: {str(datetime.timedelta(seconds=int(time.perf_counter() - start_time)))}")
             self.log_metrics() 
-            
-            if idx % self.num_policy_updates == 0:
-                self.vllm_client.update_model_params(self.model)
-                self.vllm_client.empty_buffer()
-                self.vllm_client.fill_buffer()
