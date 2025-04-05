@@ -9,14 +9,14 @@ from transformers import AutoTokenizer
 import os
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 dataset_name = "AthenaAgent42/jee_papers"
 model_name = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 
 
-prefix = "give correct answer (not option) boxed\nQuestion:"
+prefix = "give correct answer boxed\nQuestion:"
 
 
 def format_prompt(row):
@@ -28,26 +28,69 @@ def format_prompt(row):
 
     message = [{"role": "user", "content": prompt}]
     row["text"] = tokenizer.apply_chat_template(message, tokenize=False)
+    if "MCQ" in row["Type"]:
+        option = row["correct_option"]
+        answer = {"1":"A","2":"B","3":"C","4":"D"}[option]
+    else:
+        answer = row["correct_answer"]
+    
+    row["answer"] = answer
     return row
 
 
 dataset = load_dataset(dataset_name, split="train")
 
 
-dataset = dataset.map(format_prompt)
-
+dataset = dataset.map(format_prompt).filter(lambda x: int(x["pass_rate"]) <= 8)
 print(dataset[0])
 
 
-def extract_boxed_values(output):
-    # Match \boxed{...} including nested braces using a balanced approach
-    pattern = r"\\boxed\s*{((?:[^{}]|{[^{}]*})*)}"
-    boxed_matches = re.findall(pattern, output)
-    return [match.replace("\n", "").replace("_", "").strip() for match in boxed_matches]
+import regex as re
+def find_boxes(text):
+    pattern = r"boxed\{((?:[^{}]+|(?R))*)\}"
+    matches = re.findall(pattern, text)
+    return matches 
+
+def reward_func(tokenizer, samples, completions, *args, **kwargs) -> list[float]:
+    OPEN_THINK = "<think>"
+    CLOSE_THINK = "</think>"
+    print(completions[0])
+    rewards = []
+    for sample, completion in zip(samples, completions):
+        reward = 0.0
+        text = completion
+        answer = sample["answer"]
+        if OPEN_THINK in text:
+            reward = 0.1
+            
+            if CLOSE_THINK in text:
+                reward += .01
+                output = text.split(CLOSE_THINK)[1]
+                
+                boxes = find_boxes(output)
+                if len(boxes) > 0:
+                    reward += 1.0
+                    box_value = boxes[-1]
+                    if box_value == answer:
+                        reward += 5.0
+                    else:
+                        reward -= 1.0   
+                else:
+                    reward -= 1.0
+            
+            else:
+                reward -= .01
+        else:
+            reward -= .01
+        
+        rewards.append(reward)
+
+            
+    return rewards
 
 
 def test_datasampler():
-    max_model_len = 8 * 1024
+    max_model_len = 1 * 1024
     config = DataSamplerConfig(
         model=model_name,
         revision="main",
@@ -57,7 +100,7 @@ def test_datasampler():
         dataset_feild="text",
         buffer_size=8,
         max_model_len=max_model_len,
-        gpu_memory_utilization=0.98,
+        gpu_memory_utilization=0.7,
         dtype="bfloat16",
         vllm_max_tokens=max_model_len,
         vllm_n=8,
@@ -71,11 +114,7 @@ def test_datasampler():
         # quantization="fp8",
     )
 
-    def reward_function_1(tokenizer, samples, completions, *args, **kwargs):
-        return [len(completion) for completion in completions]
-
-
-    server = DataSamplerServer(config, dataset, [reward_function_1])
+    server = DataSamplerServer(config, dataset, [reward_func])
     server.serve()
 
 

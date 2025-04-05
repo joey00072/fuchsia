@@ -18,9 +18,9 @@ file_name = "train_data_16k.jsonl"
 with open(file_name, "w") as f: 
     for idx, item in enumerate(dist_dataset):
         print(item)
-        f.write(json.dumps(item))
-        f.write("\n")
-        print(idx)
+        # f.write(json.dumps(item))
+        # f.write("\n")
+        # print(idx)
         time.sleep(4)
         if idx > 16:
             break

@@ -36,6 +36,7 @@ strategy = FSDPStrategy(
     sharding_strategy="HYBRID_SHARD",
     auto_wrap_policy=policy,
     activation_checkpointing_policy=activation_checkpointing_policy,
+    state_dict_type="sharded",
 )
 
 
@@ -90,7 +91,8 @@ class GRPO:
     ):
         self.config = config
         wandb_logger = WandbLogger(project=config.wandb_project)
-        self.fabric = Fabric(accelerator="cuda", precision="bf16-true", strategy=strategy, loggers=[wandb_logger])
+        self.fabric = Fabric(accelerator="cuda", precision="bf16-true",devices=2, strategy=strategy, loggers=[wandb_logger])
+        self.fabric.launch()
         self.device = self.fabric.device
 
         self.model = AutoModelForCausalLM.from_pretrained(model).to(torch.bfloat16)
@@ -103,6 +105,7 @@ class GRPO:
             )
         )
         self.model, self.optimizer = self.fabric.setup(self.model, self.optimizer)
+        self.epoch = 1
         
         self.ref_model = ref_model
         self.tokenizer = tokenizer
@@ -265,6 +268,7 @@ class GRPO:
         rewards = []
         for _ in range(self.batch_size):
             item = next(self.data_loader_iter)
+            self.epoch = item["epoch"]
             rewards.append(item["rewards"])
             for idx in range(len(item["completions"])):
                 samples.append(item)
@@ -364,6 +368,7 @@ class GRPO:
                         "tokens": idx * self.group_size * self.micro_group_size,
                         "lr": self.optimizer.param_groups[0]["lr"],
                         "time": elapsed_time,
+                        "epoch": self.epoch,
                     },
                     step=idx,
                 )
@@ -378,9 +383,18 @@ class GRPO:
             # self.log_metrics()
 
             if idx % self.num_policy_updates == 0 and self.fabric.is_global_zero:
-                self.vllm_client.update_model_params(self.model)
-                self.vllm_client.empty_buffer() 
-                self.vllm_client.fill_buffer()
+                if self.fabric.local_rank == 0:
+                    self.vllm_client.update_model_params(self.model)
+                    self.vllm_client.empty_buffer() 
+                    self.vllm_client.fill_buffer()
+                    
+            if idx % 1 == 0:
+                self.fabric.barrier()
+                
+                print(f"Saving checkpoint at {idx}")
+                state = {"model": self.model, "iter": idx}
+                self.fabric.save(f"/mnt/nvme0n1/checkpoint/ckpt_{idx}", state)
+                print(f"Saved checkpoint at {idx}")
 
 
 
@@ -554,6 +568,8 @@ class MockClient:
         return response.json()["sample"]
 
     def update_model_params(self, model):
+        for name, param in model.named_parameters():
+            print(name, param)
         pass
 
     def empty_buffer(self):
@@ -581,8 +597,8 @@ def main():
         print("[blue]Loading GSM8K dataset[/blue]")
         # dataset = load_dataset("openai/gsm8k", "main")["train"]
         # dataset = prepare_dataset(dataset)
-        vllm_client = MockClient()
-        # vllm_client = VLLMClient()
+        # vllm_client = MockClient()
+        vllm_client = VLLMClient()
         dataset = DatasetClient(vllm_client)
 
         # Configure GRPO
@@ -612,6 +628,7 @@ def main():
             reward_functions=[response_format_reward],
             config=grpo_config,
             vllm_client=vllm_client,
+            
         )
 
         print("[blue]Starting training[/blue]")

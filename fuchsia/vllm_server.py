@@ -632,6 +632,7 @@ class DataSamplerServer(VLLMServer):
             output["item"] = [item] * self.config.vllm_n
             output["completions"] = []
             output["completion_ids"] = []
+            output["epoch"] = self._epoch
             for idx in range(self.config.vllm_n):
                 g_completion = completions[g_idx * self.config.vllm_n + idx]
                 g_completion_id = completion_ids[g_idx * self.config.vllm_n + idx]
