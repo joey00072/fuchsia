@@ -5,16 +5,18 @@ from rich import print
 import re
 from typing import Optional
 from datasets import Dataset
-from transformers import AutoTokenizer,AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 import os
+
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-model_name = "unsloth/Llama-3.1-8B-Instruct"
+model_name = "unsloth/Llama-3.2-3B-Instruct"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(model_name).cpu()
 SYSTEM_PROMPT = "Respond in following format:<thinking>{step by step reasoning}</thinking><answer>{number}</answer>"
+
 
 def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
     """Improved reward function with better validation and scoring."""
@@ -23,12 +25,12 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
     END_HEADER_TOKEN = "<|end_header_id|>"
     ASSISTANT_TOKEN = "assistant"
     USER_TOKEN = "user"
-    
+
     START_THINKING_TOKEN = "<thinking>"
     END_THINKING_TOKEN = "</thinking>"
     START_ANSWER_TOKEN = "<answer>"
     END_ANSWER_TOKEN = "</answer>"
-    
+
     try:
         # Extract the actual response
         try:
@@ -45,7 +47,12 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
         correct_template = 0
 
         # Check format tags
-        required_tags = [START_THINKING_TOKEN, END_THINKING_TOKEN, START_ANSWER_TOKEN, END_ANSWER_TOKEN]
+        required_tags = [
+            START_THINKING_TOKEN,
+            END_THINKING_TOKEN,
+            START_ANSWER_TOKEN,
+            END_ANSWER_TOKEN,
+        ]
         for tag in required_tags:
             if tag in s:
                 format_reward += 0.15
@@ -55,7 +62,9 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
         # Validate thinking section
         if s.count("<thinking>") == 1:
             format_reward += 0.5
-            thinking_content = s.split(START_THINKING_TOKEN)[1].split(END_THINKING_TOKEN)[0].strip()
+            thinking_content = (
+                s.split(START_THINKING_TOKEN)[1].split(END_THINKING_TOKEN)[0].strip()
+            )
             if len(thinking_content) > 10:  # Basic content validation
                 content_reward += 0.5
         else:
@@ -64,7 +73,9 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
         # Validate answer section
         if "<answer>" in s and "</answer>" in s:
             format_reward += 0.4
-            answer_content = s.split(START_ANSWER_TOKEN)[1].split(END_ANSWER_TOKEN)[0].strip()
+            answer_content = (
+                s.split(START_ANSWER_TOKEN)[1].split(END_ANSWER_TOKEN)[0].strip()
+            )
             try:
                 answer_value = float(answer_content)
                 content_reward += 1.0
@@ -84,14 +95,17 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
         print(f"[yellow]Error in reward calculation: {e}[/yellow]")
         return -1.0
 
+
 def reward_function_1(tokenizer, samples, completions, *args, **kwargs):
     lst = []
     for sample, completion in zip(samples, completions):
         lst.append(response_format_reward(sample, completion))
     return lst
 
+
 def prepare_dataset(dataset) -> Dataset:
     """Prepare the GSM8K dataset with better error handling and validation."""
+
     def extract_hash_answer(text: str) -> Optional[str]:
         try:
             if "####" not in text:
@@ -123,7 +137,7 @@ def prepare_dataset(dataset) -> Dataset:
 
     try:
         dataset = dataset.map(
-            process_example, 
+            process_example,
             desc="Processing dataset",
         )
         dataset = dataset.filter(lambda x: x is not None)
@@ -158,7 +172,8 @@ def test_datasampler():
         quantization=None,
     )
     server = DataSamplerServer(config, dataset, [reward_function_1])
-    server.serve()  
-    
+    server.serve()
+
+
 if __name__ == "__main__":
     test_datasampler()

@@ -13,24 +13,28 @@ from fuchsia.vllm_client import VLLMClient
 
 
 import os
+
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 
 SYSTEM_PROMPT = "Respond in following format:<thinking>{step by step reasoning}</thinking><answer>{number}</answer>"
 
+
 def load_config(config_path: str) -> Dict[str, Any]:
     """Load configuration from YAML file."""
     try:
-        with open(config_path, 'r') as f:
+        with open(config_path, "r") as f:
             config = yaml.safe_load(f)
         return config
     except Exception as e:
         print(f"[red]Failed to load config from {config_path}: {e}[/red]")
         raise
 
+
 def prepare_dataset(dataset) -> Dataset:
     """Prepare the GSM8K dataset with better error handling and validation."""
+
     def extract_hash_answer(text: str) -> Optional[str]:
         try:
             if "####" not in text:
@@ -73,6 +77,7 @@ def prepare_dataset(dataset) -> Dataset:
         print(f"[red]Failed to prepare dataset: {e}[/red]")
         raise
 
+
 def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
     """Improved reward function with better validation and scoring."""
     END_OF_TEXT_TOKEN = "<|eot_id|>"
@@ -80,16 +85,18 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
     END_HEADER_TOKEN = "<|end_header_id|>"
     ASSISTANT_TOKEN = "assistant"
     USER_TOKEN = "user"
-    
+
     START_THINKING_TOKEN = "<thinking>"
     END_THINKING_TOKEN = "</thinking>"
     START_ANSWER_TOKEN = "<answer>"
     END_ANSWER_TOKEN = "</answer>"
-    
+
     try:
         # Extract the actual response
         try:
-            s = s.split(f"{END_OF_TEXT_TOKEN}{START_HEADER_TOKEN}{ASSISTANT_TOKEN}{END_HEADER_TOKEN}")[1]
+            s = s.split(
+                f"{END_OF_TEXT_TOKEN}{START_HEADER_TOKEN}{ASSISTANT_TOKEN}{END_HEADER_TOKEN}"
+            )[1]
         except IndexError:
             return -1.0
 
@@ -102,7 +109,12 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
         correct_template = 0
 
         # Check format tags
-        required_tags = [START_THINKING_TOKEN, END_THINKING_TOKEN, START_ANSWER_TOKEN, END_ANSWER_TOKEN]
+        required_tags = [
+            START_THINKING_TOKEN,
+            END_THINKING_TOKEN,
+            START_ANSWER_TOKEN,
+            END_ANSWER_TOKEN,
+        ]
         for tag in required_tags:
             if tag in s:
                 format_reward += 0.15
@@ -112,7 +124,9 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
         # Validate thinking section
         if s.count("<thinking>") == 1:
             format_reward += 0.5
-            thinking_content = s.split(START_THINKING_TOKEN)[1].split(END_THINKING_TOKEN)[0].strip()
+            thinking_content = (
+                s.split(START_THINKING_TOKEN)[1].split(END_THINKING_TOKEN)[0].strip()
+            )
             if len(thinking_content) > 10:  # Basic content validation
                 content_reward += 0.5
         else:
@@ -121,7 +135,9 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
         # Validate answer section
         if "<answer>" in s and "</answer>" in s:
             format_reward += 0.4
-            answer_content = s.split(START_ANSWER_TOKEN)[1].split(END_ANSWER_TOKEN)[0].strip()
+            answer_content = (
+                s.split(START_ANSWER_TOKEN)[1].split(END_ANSWER_TOKEN)[0].strip()
+            )
             try:
                 answer_value = float(answer_content)
                 content_reward += 1.0
@@ -141,25 +157,57 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
         print(f"[yellow]Error in reward calculation: {e}[/yellow]")
         return -1.0
 
+
+import requests
+
+
+class MockClient:
+    def __init__(self):
+        self.url = "http://localhost:8000/"
+
+    def get_sample(self):
+        url = self.url + "get_sample/"
+        response = requests.post(url)
+        return response.json()["sample"]
+
+    def update_model_params(self, model):
+        pass
+
+    def empty_buffer(self):
+        pass
+
+    def fill_buffer(self):
+        pass
+
+
 def main():
     try:
         # Load configuration
         config_path = Path(__file__).parent / "gsm8k_config.yaml"
         config = load_config(str(config_path))
-        
+
         # Initialize model and tokenizer
-        print(f"[blue]Loading model: {config['model_name']}[/blue]")
-        model = AutoModelForCausalLM.from_pretrained(config['model_name'])
-        tokenizer = AutoTokenizer.from_pretrained(config['model_name'])
+        # print(f"[blue]Loading model: {config['model_name']}[/blue]")
+        
+        model_name = "unsloth/Llama-3.2-3B-Instruct"
+        model = AutoModelForCausalLM.from_pretrained(model_name).to(
+            torch.bfloat16
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        optimizer = torch.optim.Adafactor(
+            model.parameters(), lr=float(config["grpo"]["lr"]), weight_decay=float(config["grpo"]["weight_decay"])
+        )
 
         # Configure LoRA
         lora_config = LoraConfig(
-            r=config['lora']['r'],
-            lora_alpha=config['lora']['alpha'],
-            target_modules=config['lora'].get('target_modules', None)
+            r=config["lora"]["r"],
+            lora_alpha=config["lora"]["alpha"],
+            target_modules=config["lora"].get("target_modules", None),
         )
-        model = get_peft_model(model, lora_config)
-        model = model.to(torch.bfloat16)
+        # model = get_peft_model(model, lora_config)
+
+        model.gradient_checkpointing_enable()
 
         # Load and prepare dataset
         print("[blue]Loading GSM8K dataset[/blue]")
@@ -170,16 +218,16 @@ def main():
 
         # Configure GRPO
         grpo_config = GRPOConfig(
-            group_size=config['grpo']['group_size'],
-            micro_group_size=config['grpo']['micro_group_size'],
-            batch_size=config['grpo']['batch_size'],
-            lr=float(config['grpo']['lr']),
-            weight_decay=float(config['grpo']['weight_decay']),
-            beta=float(config['grpo']['beta']),
-            dtype="bfloat16", 
-            log_wandb=config['grpo']['log_wandb'],
-            wandb_project=config['grpo']['wandb_project'],
-            # using_lora=True, 
+            group_size=config["grpo"]["group_size"],
+            micro_group_size=config["grpo"]["micro_group_size"],
+            batch_size=config["grpo"]["batch_size"],
+            lr=float(config["grpo"]["lr"]),
+            weight_decay=float(config["grpo"]["weight_decay"]),
+            beta=float(config["grpo"]["beta"]),
+            dtype="bfloat16",
+            log_wandb=config["grpo"]["log_wandb"],
+            wandb_project=config["grpo"]["wandb_project"],
+            # using_lora=True,
             dataset_feild="item",
             use_vllm=True,
             num_policy_updates=8,
@@ -192,9 +240,10 @@ def main():
             ref_model=None,
             tokenizer=tokenizer,
             dataset=dataset,
+            optimizer=optimizer,
             reward_functions=[response_format_reward],
             config=grpo_config,
-            vllm_client=vllm_client
+            vllm_client=vllm_client,
         )
 
         print("[blue]Starting training[/blue]")
@@ -204,5 +253,6 @@ def main():
         print(f"[red]Training failed: {e}[/red]")
         raise
 
+
 if __name__ == "__main__":
-    main() 
+    main()

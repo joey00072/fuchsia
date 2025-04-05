@@ -23,9 +23,9 @@ setup(
         "fabric>=2.1.0",
     ],
     python_requires=">=3.8",
-    author="Joey",
-    author_email="joey00072@gmail.com",
-    description="A collection of autoregressive model implementations and experiments",
+    author="Joey00072",
+    author_email="00shxf@gmail.com",
+    description="Fuchsia - A collection of autoregressive model implementations and experiments",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     url="https://github.com/joey00072/fuchsia",
@@ -44,4 +44,4 @@ setup(
         "Programming Language :: Python :: 3.10",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
-) 
+)

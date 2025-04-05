@@ -1,7 +1,7 @@
 # GSM8K Training Configuration
 
 # Model configuration
-model_name: "unsloth/Llama-3.1-8B-Instruct"
+model_name: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
 
 # LoRA configuration
 lora:
@@ -12,13 +12,13 @@ lora:
 # GRPO training configuration
 grpo:
   group_size: 8
-  micro_group_size: 2
+  micro_group_size: 1
   batch_size: 1
-  lr: 5e-6
+  lr: 5e-5
   weight_decay: 0.1
   beta: 0.00
   log_wandb: true
-  wandb_project: "fuchsia-grpo"
+  wandb_project: "fuchsia"
 
 # Dataset configuration
 dataset:

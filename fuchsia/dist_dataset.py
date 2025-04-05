@@ -5,13 +5,13 @@ import logging
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
+
 class DatasetClient:
-    def __init__(self, client: VLLMClient=None):
+    def __init__(self, client: VLLMClient = None):
         self.client = client if client is not None else VLLMClient()
         logger.info("DatasetClient initialized")
 
@@ -36,8 +36,10 @@ class DatasetClient:
                 wait *= 2
                 continue
             wait = 1
-    
+
+
 import time
+
 if __name__ == "__main__":
     logger.info("Starting main execution")
     client = VLLMClient()
@@ -46,5 +48,5 @@ if __name__ == "__main__":
     logger.info(f"Fetching {num_samples} samples")
     for idx, item in enumerate(dataset):
         logger.info(f"Processing sample {idx}")
-        print(item["completions"]) 
+        print(item["completions"])
         time.sleep(0.2)

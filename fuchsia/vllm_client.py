@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-
 import atexit
 import logging
 import time
@@ -33,12 +32,13 @@ from vllm.distributed.utils import StatelessProcessGroup
 
 logger = logging.getLogger(__name__)
 
+
 class VLLMClient:
     """
     A client class to interact with a vLLM server.
 
     This class provides methods to generate completions, initialize and manage weight update groups, and update model
-    weights in a distributed setting. Before using it, start the vLLM server with `foosha serve`.
+    weights in a distributed setting. Before using it, start the vLLM server with `Fuchsia serve`.
 
     Args:
         host (`str`, *optional*, defaults to `"0.0.0.0"`):
@@ -55,7 +55,7 @@ class VLLMClient:
         Run the vLLM server with the model `Qwen/Qwen2.5-7B`:
 
         ```
-        $ foosha serve --model Qwen/Qwen2.5-7B
+        $ Fuchsia serve --model Qwen/Qwen2.5-7B
         ...
         INFO:     Application startup complete.
         INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
@@ -64,7 +64,7 @@ class VLLMClient:
         Use the client to generate completions and update model weights:
 
         ```python
-        >>> from foosha.extras.vllm_client import VLLMClient
+        >>> from Fuchsia.extras.vllm_client import VLLMClient
         >>> client = VLLMClient()
         >>> client.generate(["Hello, AI!", "Tell me a joke"])
         [[2980, 498, 1492, 752, 448, 264, 13027, 8645, 30, 358, 2776, 4460, 311, 3270, 264, 2025],
@@ -77,7 +77,11 @@ class VLLMClient:
     """
 
     def __init__(
-        self, host: str = "0.0.0.0", server_port: int = 8000, group_port: int = 51216, connection_timeout: float = 0.0
+        self,
+        host: str = "0.0.0.0",
+        server_port: int = 8000,
+        group_port: int = 51216,
+        connection_timeout: float = 0.0,
     ):
         self.session = requests.Session()
         self.host = host
@@ -96,7 +100,7 @@ class VLLMClient:
                 response = self.session.get(url, **kwargs)
             else:
                 response = self.session.post(url, **kwargs)
-            
+
             if response.status_code == 200:
                 return response.json() if response.content else {}
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
@@ -126,7 +130,7 @@ class VLLMClient:
                 if elapsed_time >= total_timeout:
                     raise ConnectionError(
                         f"The vLLM server can't be reached at {self.host}:{self.server_port} after {total_timeout} "
-                        "seconds. Make sure the server is running by running `foosha serve`."
+                        "seconds. Make sure the server is running by running `Fuchsia serve`."
                     ) from exc
             else:
                 if response.status_code == 200:
@@ -134,7 +138,9 @@ class VLLMClient:
                     return None
 
             # Retry logic: wait before trying again
-            logger.info(f"Server is not up yet. Retrying in {retry_interval} seconds...")
+            logger.info(
+                f"Server is not up yet. Retrying in {retry_interval} seconds..."
+            )
             time.sleep(retry_interval)
 
     def generate(
@@ -187,14 +193,18 @@ class VLLMClient:
             "max_tokens": max_tokens,
             "guided_decoding_regex": guided_decoding_regex,
         }
-        return self._make_request("generate", method="post", json=params)["completion_ids"]
+        return self._make_request("generate", method="post", json=params)[
+            "completion_ids"
+        ]
 
     def init_communicator(self):
         """
         Initializes the weight update group in a distributed setup for model synchronization.
         """
         # Get the tensor parallel size from the server
-        tensor_parallel_size = self._make_request("get_tensor_parallel_size")["tensor_parallel_size"]
+        tensor_parallel_size = self._make_request("get_tensor_parallel_size")[
+            "tensor_parallel_size"
+        ]
         world_size = tensor_parallel_size + 1
         self.rank = tensor_parallel_size  # The client's rank is the last process
 
@@ -202,11 +212,13 @@ class VLLMClient:
         self._make_request(
             "init_communicator",
             method="post",
-            json={"host": "0.0.0.0", "port": self.group_port, "world_size": world_size}
+            json={"host": "0.0.0.0", "port": self.group_port, "world_size": world_size},
         )
 
         # Set up the communication group for weight broadcasting
-        pg = StatelessProcessGroup.create(host=self.host, port=self.group_port, rank=self.rank, world_size=world_size)
+        pg = StatelessProcessGroup.create(
+            host=self.host, port=self.group_port, rank=self.rank, world_size=world_size
+        )
         self.pynccl_comm = PyNcclCommunicator(pg, device="cuda:0")
 
     def update_named_param(self, name: str, weights: torch.Tensor):
@@ -222,11 +234,17 @@ class VLLMClient:
         self._make_request(
             "update_named_param",
             method="post",
-            json={"name": name, "dtype": str(weights.dtype), "shape": tuple(weights.shape)}
+            json={
+                "name": name,
+                "dtype": str(weights.dtype),
+                "shape": tuple(weights.shape),
+            },
         )
 
         # Broadcast the weights to the other processes
-        self.pynccl_comm.broadcast(weights, src=self.rank, stream=torch.cuda.current_stream())
+        self.pynccl_comm.broadcast(
+            weights, src=self.rank, stream=torch.cuda.current_stream()
+        )
         self.pynccl_comm.group.barrier()
 
     def update_model_params(self, model: nn.Module):
@@ -275,7 +293,7 @@ class VLLMClient:
         """
         return self._make_request("empty_buffer", method="post")
 
-    def fill_buffer(self, num_samples:int=None):
+    def fill_buffer(self, num_samples: int = None):
         """
         Fills the server's buffer with new samples.
 
@@ -290,7 +308,9 @@ class VLLMClient:
         if num_samples is None:
             return self._make_request("buffer_fill", method="post")
         else:
-            return self._make_request("buffer_fill", method="post", json={"num_samples": num_samples})
+            return self._make_request(
+                "buffer_fill", method="post", json={"num_samples": num_samples}
+            )
 
     def trigger_buffer_fill(self):
         """
@@ -312,5 +332,7 @@ if __name__ == "__main__":
     # Update model weights
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained("unsloth/Llama-3.2-3B-Instruct").to("cuda")
+    model = AutoModelForCausalLM.from_pretrained("unsloth/Llama-3.2-3B-Instruct").to(
+        "cuda"
+    )
     client.update_model_params(model)

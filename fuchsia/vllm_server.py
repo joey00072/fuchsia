@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-
 # derived from https://github.com/huggingface/trl/blob/main/trl/scripts/vllm_serve.py
 # from original pr of binary-husky (https://github.com/binary-husky) pr https://github.com/huggingface/trl/pull/3094
 
@@ -23,7 +22,7 @@ import logging
 import os
 import yaml
 from dataclasses import dataclass
-from typing import Optional, Sequence, Callable 
+from typing import Optional, Sequence, Callable
 
 import torch
 import torch.distributed as dist
@@ -33,11 +32,12 @@ import uvicorn
 from collections import defaultdict
 
 
-from datasets import Dataset,load_dataset
+from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
 
 
 import asyncio
+
 # Check CUDA availability
 try:
     ctypes.CDLL("libcuda.so.1")
@@ -67,39 +67,41 @@ import socket
 import psutil
 import numpy as np
 
+
 def get_ip_addresses():
     """Get all network IP addresses with detailed information"""
     ip_info = []
-    
+
     # Get hostname
     hostname = socket.gethostname()
-    ip_info.append({
-        "interface": "Hostname",
-        "ip": hostname,
-        "type": "System"
-    })
-    
+    ip_info.append({"interface": "Hostname", "ip": hostname, "type": "System"})
+
     # Get all network interfaces
     for interface, addrs in psutil.net_if_addrs().items():
         for addr in addrs:
             if addr.family == socket.AF_INET:  # IPv4 addresses
-                ip_info.append({
-                    "interface": interface,
-                    "ip": addr.address,
-                    "type": "IPv4",
-                    "netmask": addr.netmask,
-                    "broadcast": addr.broadcast if addr.broadcast else "N/A"
-                })
+                ip_info.append(
+                    {
+                        "interface": interface,
+                        "ip": addr.address,
+                        "type": "IPv4",
+                        "netmask": addr.netmask,
+                        "broadcast": addr.broadcast if addr.broadcast else "N/A",
+                    }
+                )
             elif addr.family == socket.AF_INET6:  # IPv6 addresses
-                ip_info.append({
-                    "interface": interface,
-                    "ip": addr.address,
-                    "type": "IPv6",
-                    "netmask": addr.netmask,
-                    "broadcast": "N/A"
-                })
-    
+                ip_info.append(
+                    {
+                        "interface": interface,
+                        "ip": addr.address,
+                        "type": "IPv6",
+                        "netmask": addr.netmask,
+                        "broadcast": "N/A",
+                    }
+                )
+
     return ip_info
+
 
 class WeightSyncWorker(Worker):
     """
@@ -134,13 +136,17 @@ class WeightSyncWorker(Worker):
         """
         if self.pynccl_comm is not None:
             raise RuntimeError("Weight update group already initialized")
-        
+
         rank = get_world_group().rank
-        pg = StatelessProcessGroup.create(host=host, port=port, rank=rank, world_size=world_size)
+        pg = StatelessProcessGroup.create(
+            host=host, port=port, rank=rank, world_size=world_size
+        )
         self.pynccl_comm = PyNcclCommunicator(pg, device=self.device)
         self.client_rank = world_size - 1
 
-    def update_named_param(self, name: str, dtype: torch.dtype, shape: Sequence[int]) -> None:
+    def update_named_param(
+        self, name: str, dtype: torch.dtype, shape: Sequence[int]
+    ) -> None:
         """
         Receives updated weights from the client process and updates the named parameter in the model.
 
@@ -156,7 +162,9 @@ class WeightSyncWorker(Worker):
             raise RuntimeError("Communicator not initialized")
 
         weight = torch.empty(shape, dtype=dtype, device=self.device)
-        self.pynccl_comm.broadcast(weight, src=self.client_rank, stream=torch.cuda.current_stream())
+        self.pynccl_comm.broadcast(
+            weight, src=self.client_rank, stream=torch.cuda.current_stream()
+        )
         self.pynccl_comm.group.barrier()
         self.model_runner.model.load_weights(weights=[(name, weight)])
 
@@ -184,16 +192,25 @@ class ServerConfig:
     max_model_len: Optional[int] = 512
     enable_prefix_caching: Optional[bool] = None
     quantization: Optional[str] = None
+
     def __init__(self, *args, **kwargs):
         known_fields = {
-            'model', 'revision', 'tensor_parallel_size', 'host', 'port',
-            'gpu_memory_utilization', 'dtype', 'max_model_len', 'enable_prefix_caching', 'quantization' 
+            "model",
+            "revision",
+            "tensor_parallel_size",
+            "host",
+            "port",
+            "gpu_memory_utilization",
+            "dtype",
+            "max_model_len",
+            "enable_prefix_caching",
+            "quantization",
         }
-        
+
         for field in known_fields:
             if field in kwargs:
                 setattr(self, field, kwargs.pop(field))
-        
+
         for key, value in kwargs.items():
             setattr(self, key, value)
 
@@ -269,7 +286,9 @@ class VLLMServer:
             {"tensor_parallel_size": 8}
             ```
             """
-            return {"tensor_parallel_size": self.llm.llm_engine.parallel_config.tensor_parallel_size}
+            return {
+                "tensor_parallel_size": self.llm.llm_engine.parallel_config.tensor_parallel_size
+            }
 
         @app.post("/generate/", response_model=GenerateResponse)
         async def generate(request: GenerateRequest):
@@ -296,7 +315,9 @@ class VLLMServer:
             """
             guided_decoding = None
             if request.guided_decoding_regex:
-                guided_decoding = GuidedDecodingParams(backend="outlines", regex=request.guided_decoding_regex)
+                guided_decoding = GuidedDecodingParams(
+                    backend="outlines", regex=request.guided_decoding_regex
+                )
 
             sampling_params = SamplingParams(
                 n=request.n,
@@ -308,12 +329,20 @@ class VLLMServer:
                 max_tokens=request.max_tokens,
                 guided_decoding=guided_decoding,
             )
-            all_outputs = self.llm.generate(request.prompts, sampling_params=sampling_params)
-            completion_ids = [list(output.token_ids) for outputs in all_outputs for output in outputs.outputs]
+            all_outputs = self.llm.generate(
+                request.prompts, sampling_params=sampling_params
+            )
+            completion_ids = [
+                list(output.token_ids)
+                for outputs in all_outputs
+                for output in outputs.outputs
+            ]
             return {"completion_ids": completion_ids}
 
         @app.post("/init_communicator/")
-        async def init_communicator(request: InitCommunicatorRequest, background_tasks: BackgroundTasks):
+        async def init_communicator(
+            request: InitCommunicatorRequest, background_tasks: BackgroundTasks
+        ):
             """
             Initializes the communicator for synchronizing model weights between a client and multiple server
             workers.
@@ -332,7 +361,9 @@ class VLLMServer:
             return {"message": "Request received, initializing communicator"}
 
         @app.post("/update_named_param/")
-        async def update_named_param(request: UpdateWeightsRequest, background_tasks: BackgroundTasks):
+        async def update_named_param(
+            request: UpdateWeightsRequest, background_tasks: BackgroundTasks
+        ):
             """
             Updates the model weights with the provided tensor.
 
@@ -346,9 +377,9 @@ class VLLMServer:
             """
             dtype = torch.__getattribute__(request.dtype.split(".")[-1])
             background_tasks.add_task(
-                self.llm.collective_rpc, 
-                "update_named_param", 
-                args=(request.name, dtype, request.shape)
+                self.llm.collective_rpc,
+                "update_named_param",
+                args=(request.name, dtype, request.shape),
             )
             return {"message": "Request received, updating named parameter"}
 
@@ -378,59 +409,70 @@ class VLLMServer:
         from rich.panel import Panel
         from rich.table import Table
         from rich.text import Text
-        
+
         console = Console()
-        
+
         # Create a table for IP addresses
-        table = Table(title="Server Network Information", show_header=True, header_style="bold magenta")
+        table = Table(
+            title="Server Network Information",
+            show_header=True,
+            header_style="bold magenta",
+        )
         table.add_column("Interface", style="cyan")
         table.add_column("URL", style="green")
-        
+
         # Filter and add only important interfaces (IPv4, excluding loopback)
         for ip_info in get_ip_addresses():
-            if ip_info['type'] == 'IPv4' and ip_info['interface'] != 'lo':
+            if ip_info["type"] == "IPv4" and ip_info["interface"] != "lo":
                 url = f"http://{ip_info['ip']}:{self.config.port}"
-                table.add_row(
-                    ip_info['interface'],
-                    url
-                )
-        
+                table.add_row(ip_info["interface"], url)
+
         # Create a panel for the server status
         status_text = Text()
         status_text.append("Server Status: ", style="bold")
         status_text.append("Starting...", style="green")
-        
+
         # Display the information
         console.print("\n")
         console.print(Panel(table, title="[bold]Available Network Interfaces[/bold]"))
         console.print(Panel(status_text, title="[bold]Server Configuration[/bold]"))
-        console.print(f"\n[bold blue]Server running on port {self.config.port}[/bold blue]\n")
-        
+        console.print(
+            f"\n[bold blue]Server running on port {self.config.port}[/bold blue]\n"
+        )
+
         uvicorn.run(self.app, host=self.config.host, port=self.config.port)
         dist.destroy_process_group()
 
 
-
 class DataSamplerConfig(ServerConfig):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)   
+        super().__init__(*args, **kwargs)
         self.dataset_feild = kwargs.get("dataset_feild", "text")
         self.buffer_size = kwargs.get("buffer_size", 32)
-        
-        self.vllm_n:int = kwargs.get("vllm_n", 1)
-        self.vllm_repetition_penalty:float = kwargs.get("vllm_repetition_penalty", 1.0)
-        self.vllm_temperature:float = kwargs.get("vllm_temperature", 0.9)
-        self.vllm_top_p:float = kwargs.get("vllm_top_p", 1.0)
-        self.vllm_top_k:int = kwargs.get("vllm_top_k", -1)
-        self.vllm_min_p:float = kwargs.get("vllm_min_p", 0.0)
-        self.vllm_max_tokens:int = kwargs.get("vllm_max_tokens", 1024)
-        self.guided_decoding:Optional[GuidedDecodingParams] = kwargs.get("guided_decoding", None)
-        self.generation_batch_size:int = kwargs.get("generation_batch_size", 1)
+
+        self.vllm_n: int = kwargs.get("vllm_n", 1)
+        self.vllm_repetition_penalty: float = kwargs.get("vllm_repetition_penalty", 1.0)
+        self.vllm_temperature: float = kwargs.get("vllm_temperature", 0.9)
+        self.vllm_top_p: float = kwargs.get("vllm_top_p", 1.0)
+        self.vllm_top_k: int = kwargs.get("vllm_top_k", -1)
+        self.vllm_min_p: float = kwargs.get("vllm_min_p", 0.0)
+        self.vllm_max_tokens: int = kwargs.get("vllm_max_tokens", 1024)
+        self.guided_decoding: Optional[GuidedDecodingParams] = kwargs.get(
+            "guided_decoding", None
+        )
+        self.generation_batch_size: int = kwargs.get("generation_batch_size", 1)
+
 
 class DataSamplerServer(VLLMServer):
-    def __init__(self, config: DataSamplerConfig, dataset: Dataset, reward_functions: list[Callable] = None):
-        self.config = config    
-        
+    def __init__(
+        self,
+        config: DataSamplerConfig,
+        dataset: Dataset,
+        reward_functions: list[Callable] = None,
+    ):
+        self.config = config
+        print(config)
+
         self.config = config
         self.llm = LLM(
             model=config.model,
@@ -442,15 +484,16 @@ class DataSamplerServer(VLLMServer):
             enable_prefix_caching=config.enable_prefix_caching,
             max_model_len=config.max_model_len,
             worker_cls="fuchsia.vllm_server.WeightSyncWorker",
+            # enable_lora=True,
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model)    
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model)
         self.dataset = dataset
         self.dataset_feild = config.dataset_feild
         self.reward_functions = reward_functions
         self.buffer_size = config.buffer_size
         self.buffer = []
         self.dataset_iter = iter(self.dataset)
-        self._epoch = 1  
+        self._epoch = 1
         self._generation_batch_size = config.generation_batch_size
         self._sampling_params = SamplingParams(
             n=config.vllm_n,
@@ -461,24 +504,22 @@ class DataSamplerServer(VLLMServer):
             min_p=config.vllm_min_p,
             max_tokens=config.vllm_max_tokens,
             guided_decoding=config.guided_decoding,
-        )   
-        
+        )
+
         self._is_filling = False  # Add this line to track fill status
         self.app = self._create_app()
-        
+
     def _create_app(self) -> FastAPI:
         app = super()._create_app()
-        
+
         self.buffer_fill()
-        
-        
+
         @app.post("/get_sample/")
         async def get_sample(background_tasks: BackgroundTasks):
             """
             Returns a sample from the buffer and triggers background buffer fill.
             """
             if len(self.buffer) == 0:
-                
                 await asyncio.sleep(5)
                 return {"sample": None}
             items = self.buffer.pop(0)
@@ -486,9 +527,9 @@ class DataSamplerServer(VLLMServer):
             if len(self.buffer) < self.buffer_size:
                 background_tasks.add_task(self.buffer_fill)
                 print("requesting buffer fill")
-                
+
             return {"sample": items}
-        
+
         @app.post("/buffer_fill/")
         async def buffer_fill(background_tasks: BackgroundTasks):
             """
@@ -496,7 +537,7 @@ class DataSamplerServer(VLLMServer):
             """
             if self._is_filling:
                 return {"message": "Buffer fill already in progress"}
-            
+
             background_tasks.add_task(self.buffer_fill)
             return {"message": "Buffer filling started"}
 
@@ -513,7 +554,7 @@ class DataSamplerServer(VLLMServer):
                 "current_size": len(self.buffer),
                 "max_size": self.buffer_size,
                 "is_filling": self._is_filling,
-                "epoch": self._epoch
+                "epoch": self._epoch,
             }
 
         @app.post("/empty_buffer/")
@@ -525,37 +566,39 @@ class DataSamplerServer(VLLMServer):
             self.buffer.clear()
             return {
                 "message": "Buffer emptied successfully",
-                "items_removed": items_removed
+                "items_removed": items_removed,
             }
 
         return app
-    
+
     def buffer_fill(self):
         if self._is_filling:
             return
-            
+
         self._is_filling = True
         try:
             while len(self.buffer) < self.buffer_size:
                 items = []
-                for _ in range(self._generation_batch_size):        
+                for _ in range(self._generation_batch_size):
                     try:
                         item = next(self.dataset_iter)
                         items.append(item)
                     except StopIteration:
                         self.dataset_iter = iter(self.dataset)
                         self._epoch += 1
-                
+                print("#" * 10)
+                print(f"items: {len(items)}")
+                print("#" * 10)
                 items_with_rewards = self.process_sample(items)
-                print("="*10)
-                print("="*10)
+                print("=" * 10)
+                print("=" * 10)
                 print(items_with_rewards)
-                print("="*10)
+                print("=" * 10)
                 self.buffer.extend(items_with_rewards)
                 print(f"buffer: {len(self.buffer[0]['completions'])}")
         finally:
             self._is_filling = False
-    
+
     def process_sample(self, items):
         prompts = [item[self.dataset_feild] for item in items]
         guided_decoding = None
@@ -569,43 +612,58 @@ class DataSamplerServer(VLLMServer):
             max_tokens=self.config.vllm_max_tokens,
             guided_decoding=guided_decoding,
         )
+        import time
+        start_time = time.perf_counter()
         all_outputs = self.llm.generate(prompts, sampling_params=sampling_params)
-        completion_ids = [list(output.token_ids) for outputs in all_outputs for output in outputs.outputs]
-        
+        end_time = time.perf_counter()
+        print(f"time taken: {end_time - start_time}")
+        # time.sleep(120)
+        completion_ids = [
+            list(output.token_ids)
+            for outputs in all_outputs
+            for output in outputs.outputs
+        ]
+
         completions = [self.tokenizer.decode(c) for c in completion_ids]
-        
+
         all_outputs = []
-        for g_idx,item in enumerate(items):
+        for g_idx, item in enumerate(items):
             output = {}
-            output["item"] = [item]*self.config.vllm_n
+            output["item"] = [item] * self.config.vllm_n
             output["completions"] = []
             output["completion_ids"] = []
             for idx in range(self.config.vllm_n):
-                g_completion = completions[g_idx*self.config.vllm_n + idx]
-                g_completion_id = completion_ids[g_idx*self.config.vllm_n + idx]
+                g_completion = completions[g_idx * self.config.vllm_n + idx]
+                g_completion_id = completion_ids[g_idx * self.config.vllm_n + idx]
                 output["inputs"] = item[self.dataset_feild]
                 output["completions"].append(g_completion)
                 output["completion_ids"].append(g_completion_id)
-            
-            output["all_rewards"], output["rewards"], output["mean"], output["std"] = self.calculate_rewards(output["item"], output["completions"], output["completion_ids"])
+
+            output["all_rewards"], output["rewards"], output["mean"], output["std"] = (
+                self.calculate_rewards(
+                    output["item"], output["completions"], output["completion_ids"]
+                )
+            )
             all_outputs.append(output)
-        
-        print(f"items: {len(items)}, completions: {len(completions)}")        
-        
+
+        print(f"items: {len(items)}, completions: {len(completions)}")
+
         # for output in all_outputs:
         #     print(output)
         #     print("-"*100)
         return all_outputs
-        
+
     def calculate_rewards(self, items, completions, completion_ids):
         all_rewards = {}
         for reward_function in self.reward_functions:
             print(f"reward_function: {reward_function.__name__}")
-            rewards = reward_function(self.tokenizer, items, completions, completion_ids)
+            rewards = reward_function(
+                self.tokenizer, items, completions, completion_ids
+            )
             all_rewards[reward_function.__name__] = rewards
-        
+
         lst = []
-        for key,value in all_rewards.items():
+        for key, value in all_rewards.items():
             lst.append(value)
         lst = np.array(lst)
         print(lst)
@@ -613,32 +671,37 @@ class DataSamplerServer(VLLMServer):
         print(lst)
         mean = total_rewards.mean()
         std = total_rewards.std()
-        
+
         # total reward to pytohn list
         total_rewards = total_rewards.tolist()
         mean = mean
         std = std.tolist()
-        
+
         return all_rewards, total_rewards, mean, std
-        
+
 
 def load_config_from_yaml(yaml_path: str) -> ServerConfig:
     """
     Load server configuration from a YAML file.
-    
+
     Args:
         yaml_path (str): Path to the YAML configuration file
-        
+
     Returns:
         ServerConfig: Configuration object populated from YAML
     """
-    with open(yaml_path, 'r') as f:
+    with open(yaml_path, "r") as f:
         config_dict = yaml.safe_load(f)
     return ServerConfig(**config_dict)
 
+
 def run_server():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, help="Model to load (e.g., HuggingFace model ID or local path)")
+    parser.add_argument(
+        "--model",
+        type=str,
+        help="Model to load (e.g., HuggingFace model ID or local path)",
+    )
     parser.add_argument("--revision", type=str)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--host", type=str, default="0.0.0.0")
@@ -647,25 +710,31 @@ def run_server():
     parser.add_argument("--dtype", type=str, default="auto")
     parser.add_argument("--max_model_len", default=1024, type=int)
     parser.add_argument("--enable_prefix_caching", default=False, type=bool)
-    parser.add_argument("--config", type=str, default="examples/vllm_server_config.yaml", 
-                       help="Path to YAML configuration file (default: examples/vllm_server_config.yaml)")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="examples/vllm_server_config.yaml",
+        help="Path to YAML configuration file (default: examples/vllm_server_config.yaml)",
+    )
 
     args = parser.parse_args()
-    
+
     # If config file is provided, load from YAML
     if args.config:
         config = load_config_from_yaml(args.config)
         # Override with any CLI arguments that were provided
         for key, value in vars(args).items():
-            if value is not None and key != 'config':
+            if value is not None and key != "config":
                 setattr(config, key, value)
     else:
         config = ServerConfig(**vars(args))
-    
+
     # Ensure model is specified either through config or CLI
     if not config.model:
-        parser.error("Model must be specified either through --model argument or in the config file")
-    
+        parser.error(
+            "Model must be specified either through --model argument or in the config file"
+        )
+
     server = VLLMServer(config)
     server.serve()
 
@@ -689,15 +758,16 @@ def test_datasampler():
         vllm_top_p=1.0,
         vllm_top_k=-1,
         vllm_min_p=0.0,
-        
         # quantization="fp8",
     )
-    ds = load_dataset("CK0607/2025-Jee-Mains-Question",split="train")
+    ds = load_dataset("CK0607/2025-Jee-Mains-Question", split="train")
+
     def reward_function(tokenizer, items, completions, completion_ids):
         return [len(completion) for completion in completions]
-    
+
     server = DataSamplerServer(config, ds, [reward_function])
-    server.serve()  
-    
+    server.serve()
+
+
 if __name__ == "__main__":
     test_datasampler()
