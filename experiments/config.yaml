@@ -1,0 +1,66 @@
+# Unified Configuration for JEE Training and Server
+
+# Model configuration
+model:
+  name: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+  revision: null
+  dtype: "bfloat16"
+  max_model_len: 8192
+
+# LoRA configuration
+lora:
+  enabled: true
+  r: 8
+  alpha: 16
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
+
+# GRPO training configuration
+grpo:
+  group_size: 16
+  micro_group_size: 1
+  batch_size: 1
+  lr: 0.0003
+  weight_decay: 0.1
+  beta: 0.00
+  epsilon: 0.2
+  log_wandb: true
+  wandb_project: "fuchsia-jee"
+  num_policy_updates: 8
+  lora_path: "/mnt/nvme0n1/joey/experiments/lora_weights3"
+
+# Server configuration
+server:
+  host: "0.0.0.0"
+  port: 8000
+  gpu_memory_utilization: 0.98
+  tensor_parallel_size: 1
+  enable_prefix_caching: false
+  buffer_size: 4
+  generation_batch_size: 4
+  quantization: null
+  vllm:
+    max_tokens: 8192
+    n: 16
+    temperature: 0.6
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
+
+# Dataset configuration
+dataset:
+  name: "AthenaAgent42/jee_papers"
+  split: "train"
+  max_samples: null
+  field: "text"
+
+# Training configuration
+training:
+  max_epochs: 1
+  max_iterations: 1000
+  save_steps: 100
+  eval_steps: 50
+  output_dir: "jee_output" 
+
+
+# 8k 246.2914233800002
+# 16k 537.8559579419998

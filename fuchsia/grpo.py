@@ -11,6 +11,9 @@ from typing import Optional, List, Callable, Any
 
 from fuchsia.vllm_client import VLLMClient
 
+from transformers import AutoModelForCausalLM
+from peft import PeftModel
+
 
 @dataclass
 class GRPOConfig:
@@ -24,11 +27,14 @@ class GRPOConfig:
     weight_decay: float = 0.0
     beta: float = 0.0
     epsilon: float = 0.2
-    using_lora: bool = False
+    epsilon_high: float = 0.4
     wandb_project: str = "fuchsia"
     use_vllm: bool = False
     dataset_feild: str = "prompt"
     num_policy_updates: int = 8
+    using_lora: bool = False
+    lora_path: str = "lora_weights"
+    ignore_imcomplete_samples: bool = True
 
     def __post_init__(self):
         dtype_map = {
@@ -64,8 +70,12 @@ class GRPO:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(model)
         self.config = config
+        if isinstance(model, str):
+            self.model_name = model
+        else:
+            self.model_name = model.name_or_path
 
-        self.model = model
+        self.model = AutoModelForCausalLM.from_pretrained(self.model_name) if isinstance(model, str) else model
         self.ref_model = ref_model
         self.tokenizer = tokenizer
         self.dataset = dataset
@@ -77,6 +87,7 @@ class GRPO:
         self.dtype = config.dtype
         self.beta = config.beta
         self.epsilon = config.epsilon
+        self.epsilon_high = config.epsilon_high
         self.optimizer = (
             optimizer
             if optimizer is not None
@@ -84,11 +95,19 @@ class GRPO:
                 self.model.parameters(), lr=config.lr, weight_decay=config.weight_decay
             )
         )
+        print(f"{config.lr=}")
         self.reward_functions: list = reward_functions
         self.dataset_feild = config.dataset_feild
         self.num_policy_updates = config.num_policy_updates
 
         self.using_lora = config.using_lora
+        self.lora_path = config.lora_path
+        self.ignore_imcomplete_samples = config.ignore_imcomplete_samples
+        
+        if not config.use_vllm and self.ignore_imcomplete_samples:
+            print("Warning: ignore_imcomplete_samples is set to True, but use_vllm is set to False. This will not have any effect.")
+            
+            
         if self.using_lora and self.beta > 0:
             self.ref_model = model
 
@@ -128,7 +147,7 @@ class GRPO:
         return logps
 
     def compute_loss(
-        self, inputs, old_policy_log_probs, reward, mean_rewards, std_rewards, loss_mask
+        self, inputs, old_policy_log_probs, reward, mean_rewards, std_rewards, loss_mask, ignore_sample
     ) -> Tensor:
         policy_log_probs = self.get_per_token_logps(self.model, inputs)
 
@@ -147,14 +166,19 @@ class GRPO:
         # advantage calculation
         advantage: Tensor = (reward - mean_rewards) / (std_rewards + 1e-6)
         advantage = advantage.reshape(-1, 1)
-
+        
         policy_ratio = torch.exp(policy_log_probs - old_policy_log_probs.detach())
 
         loss1 = policy_ratio * advantage
         loss2 = (
-            torch.clamp(policy_ratio, 1 - self.epsilon, 1 + self.epsilon) * advantage
+            torch.clamp(policy_ratio, 1 - self.epsilon, 1 + self.epsilon_high) * advantage
         )
         loss = -torch.min(loss1, loss2)
+        
+        if self.ignore_imcomplete_samples:
+            loss = loss*ignore_sample
+            kld = kld*ignore_sample
+        
         loss = (loss * loss_mask).sum(dim=-1) / (loss_mask.sum(dim=-1) + 1e-6)
         kld = (kld * loss_mask).sum(dim=-1) / (loss_mask.sum(dim=-1) + 1e-6)
 
@@ -203,8 +227,6 @@ class GRPO:
             outputs, skip_special_tokens=False
         )
 
-
-    
         rewards = self.compute_rewards(samples, decoded_outputs)
 
         loss_mask = torch.zeros(outputs.shape, dtype=torch.bool)
@@ -217,6 +239,7 @@ class GRPO:
             outputs,
             torch.tensor(rewards, dtype=self.dtype).float(),
             loss_mask[:, 1:],
+            torch.tensor([False] * len(outputs), dtype=torch.bool)
         )
 
     def distributed_sample_batch(self):
@@ -225,6 +248,7 @@ class GRPO:
         completions = []
         samples = []
         rewards = []
+        ignore_sample = []
         for _ in range(self.batch_size):
             item = next(self.data_loader_iter)
             rewards.append(item["rewards"])
@@ -233,7 +257,8 @@ class GRPO:
                 prompt = item["inputs"]
                 inputs_texts.append(prompt)
                 completions.append(item["completions"][idx])
-
+                ignore_sample.append(item["finish_reason"][idx] != "length")
+                
         encoded = self.tokenizer(inputs_texts, padding=True, return_tensors="pt")
         input_ids = encoded["input_ids"]
         attention_mask = encoded["attention_mask"]
@@ -243,6 +268,7 @@ class GRPO:
         decoded = self.tokenizer.batch_decode(input_ids, skip_special_tokens=False)
 
         outputs = []
+        self.metrics["samples"].append({"prompt": decoded, "completions": completions})
 
         for prompt, completion in zip(decoded, completions):
             outputs.append(prompt + completion)
@@ -274,6 +300,7 @@ class GRPO:
             outputs,
             torch.tensor(rewards, dtype=self.dtype).float(),
             loss_mask[:, 1:],
+            torch.tensor(ignore_sample, dtype=torch.bool).to(torch.int8)
         )
 
     def compute_rewards(self, samples, responses):
@@ -316,7 +343,9 @@ class GRPO:
         idx = 0
         start_time = time.perf_counter()
         while idx < max_iterations:
-            x_batch_inputs, rewards, loss_mask = self.sample_batch()
+            x_batch_inputs, rewards, loss_mask, ignore_samples = self.sample_batch()
+            
+            ignore_sample = torch.tensor(ignore_samples, dtype=torch.bool)
 
             batch_inputs = x_batch_inputs.reshape(
                 self.batch_size, self.group_size, *x_batch_inputs.shape[1:]
@@ -324,7 +353,11 @@ class GRPO:
             loss_mask = loss_mask.reshape(
                 self.batch_size, self.group_size, *loss_mask.shape[1:]
             )
-
+           
+            ignore_samples = ignore_samples.reshape(
+                self.batch_size, self.group_size
+            )
+            
             # offload to cpu to save vram
             batch_inputs = batch_inputs.cpu()
             rewards = rewards.cpu()
@@ -343,7 +376,8 @@ class GRPO:
                 b_old_policy_log_probs,
                 b_reward,
                 b_loss_mask,
-            ) in enumerate(zip(batch_inputs, pi_old, rewards, loss_mask)):
+                b_ignore_sample
+            ) in enumerate(zip(batch_inputs, pi_old, rewards, loss_mask, ignore_samples)):
                 idx += 1
                 reward = b_reward.to(self.device)
                 mean_rewards = reward.mean(dim=-1).unsqueeze(-1)
@@ -371,15 +405,21 @@ class GRPO:
                     self.micro_group_size,
                     *b_loss_mask.shape[1:],
                 ).cpu()
+                g_ignore_sample = b_ignore_sample.reshape(
+                    b_inputs.shape[0] // self.micro_group_size,
+                    self.micro_group_size,
+                    *b_ignore_sample.shape[1:],
+                ).cpu()
                 group_losses = []
 
-                for inputs, old_policy_log_probs, reward, loss_mask in zip(
-                    g_inputs, g_old_policy_log_probs, g_reward, g_loss_mask
+                for inputs, old_policy_log_probs, reward, loss_mask, ignore_sample in zip(
+                    g_inputs, g_old_policy_log_probs, g_reward, g_loss_mask, g_ignore_sample
                 ):
                     inputs = inputs.to(self.device)
                     old_policy_log_probs = old_policy_log_probs.to(self.device)
                     reward = reward.to(self.device)
                     loss_mask = loss_mask.to(self.device)
+                    ignore_sample = ignore_sample.unsqueeze(-1).to(self.device)
 
                     loss = self.compute_loss(
                         inputs,
@@ -388,9 +428,11 @@ class GRPO:
                         mean_rewards,
                         std_rewards,
                         loss_mask,
+                        ignore_sample
                     )
                     group_losses.append(loss.item())
                     loss.backward()
+                    torch.cuda.empty_cache()
 
                 self.optimizer.step()
                 self.optimizer.zero_grad()
@@ -401,7 +443,9 @@ class GRPO:
                 if self.log_wandb:
                     self.metrics["idx"].append(idx)
                     self.metrics["total_reward"].append(reward.mean().item())
+                    self.metrics["mean_group_reward"].append(g_reward.mean().item())
                     self.metrics["loss"].append(sum(group_losses) / len(group_losses))
+                    self.metrics["valid_samples"].append(g_ignore_sample.clone().detach().sum().item())
 
             print(f"iter {idx}  >>> reward: {rewards.mean()}")
             print(
@@ -410,6 +454,10 @@ class GRPO:
             self.log_metrics()
 
             if idx % self.num_policy_updates == 0:
-                self.vllm_client.update_model_params(self.model)
+                self.vllm_client.update_model_params(self.model,lora=self.using_lora)
                 self.vllm_client.empty_buffer()
                 self.vllm_client.fill_buffer()
+            
+            
+            if idx % 25 == 0:
+                self.model.save_pretrained(self.lora_path+f"/{idx}", adapter_name="grpo")

@@ -13,12 +13,12 @@ app = FastAPI()
 
 class MockServer:
     def __init__(self):
-        file_name = "train_data_8k.jsonl"
+        file_name = "train_data_16k.jsonl"
         with open(file_name, "r") as f:
             self.data = [json.loads(line) for line in f]
         print(type(self.data))
         self.dataset_iter = iter(self.data)
-        self.buffer_size = 32
+        self.buffer_size = 4
         self.buffer = []
         self._is_filling = False
         self._epoch = 1

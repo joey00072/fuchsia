@@ -47,6 +47,8 @@ except OSError:
 
 if libcuda_available:
     from vllm import LLM, SamplingParams
+    from vllm.lora.request import LoRARequest
+
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.distributed.parallel_state import get_world_group
     from vllm.distributed.utils import StatelessProcessGroup
@@ -449,7 +451,12 @@ class DataSamplerConfig(ServerConfig):
         super().__init__(*args, **kwargs)
         self.dataset_feild = kwargs.get("dataset_feild", "text")
         self.buffer_size = kwargs.get("buffer_size", 32)
-
+        
+        
+        self.enable_lora: bool = kwargs.get("enable_lora", False)
+        self.lora_path: str = kwargs.get("lora_path", "lora_weights")
+        
+        
         self.vllm_n: int = kwargs.get("vllm_n", 1)
         self.vllm_repetition_penalty: float = kwargs.get("vllm_repetition_penalty", 1.0)
         self.vllm_temperature: float = kwargs.get("vllm_temperature", 0.9)
@@ -461,10 +468,10 @@ class DataSamplerConfig(ServerConfig):
             "guided_decoding", None
         )
         self.generation_batch_size: int = kwargs.get("generation_batch_size", 1)
-
+        
 
 class DataSamplerServer(VLLMServer):
-    def __init__(
+    def __init__(   
         self,
         config: DataSamplerConfig,
         dataset: Dataset,
@@ -484,7 +491,6 @@ class DataSamplerServer(VLLMServer):
             enable_prefix_caching=config.enable_prefix_caching,
             max_model_len=config.max_model_len,
             worker_cls="fuchsia.vllm_server.WeightSyncWorker",
-            # enable_lora=True,
         )
         self.tokenizer = AutoTokenizer.from_pretrained(config.model)
         self.dataset = dataset
@@ -506,9 +512,14 @@ class DataSamplerServer(VLLMServer):
             guided_decoding=config.guided_decoding,
         )
 
+        self.enable_lora = config.enable_lora
+        self.lora_path = config.lora_path
+        
         self._is_filling = False  # Add this line to track fill status
         self.app = self._create_app()
-
+        
+        
+        
     def _create_app(self) -> FastAPI:
         app = super()._create_app()
 
@@ -586,13 +597,13 @@ class DataSamplerServer(VLLMServer):
                     except StopIteration:
                         self.dataset_iter = iter(self.dataset)
                         self._epoch += 1
-                print("#" * 10)
-                print(f"items: {len(items)}")
-                print("#" * 10)
+                # print("#" * 10)
+                # print(f"items: {len(items)}")
+                # print("#" * 10)
                 items_with_rewards = self.process_sample(items)
+                # print("=" * 10)
                 print("=" * 10)
-                print("=" * 10)
-                print(items_with_rewards)
+                print(items_with_rewards[0]["all_rewards"],items_with_rewards[0]["mean"],items_with_rewards[0]["std"])
                 print("=" * 10)
                 self.buffer.extend(items_with_rewards)
                 print(f"buffer: {len(self.buffer[0]['completions'])}")
@@ -617,13 +628,14 @@ class DataSamplerServer(VLLMServer):
         all_outputs = self.llm.generate(prompts, sampling_params=sampling_params)
         end_time = time.perf_counter()
         print(f"time taken: {end_time - start_time}")
-        # time.sleep(120)
+        # time.sleep(100)
         completion_ids = [
             list(output.token_ids)
             for outputs in all_outputs
             for output in outputs.outputs
         ]
-
+        stop_reason = [output.stop_reason for outputs in all_outputs for output in outputs.outputs]
+        finish_reason = [output.finish_reason for outputs in all_outputs for output in outputs.outputs]
         completions = [self.tokenizer.decode(c) for c in completion_ids]
 
         all_outputs = []
@@ -632,13 +644,20 @@ class DataSamplerServer(VLLMServer):
             output["item"] = [item] * self.config.vllm_n
             output["completions"] = []
             output["completion_ids"] = []
+            output["stop_reason"] = []
+            output["finish_reason"] = []
             output["epoch"] = self._epoch
             for idx in range(self.config.vllm_n):
                 g_completion = completions[g_idx * self.config.vllm_n + idx]
                 g_completion_id = completion_ids[g_idx * self.config.vllm_n + idx]
+                g_stop_reason = stop_reason[g_idx * self.config.vllm_n + idx]
+                g_finish_reason = finish_reason[g_idx * self.config.vllm_n + idx]
+                
                 output["inputs"] = item[self.dataset_feild]
                 output["completions"].append(g_completion)
                 output["completion_ids"].append(g_completion_id)
+                output["stop_reason"].append(g_stop_reason)
+                output["finish_reason"].append(g_finish_reason)
 
             output["all_rewards"], output["rewards"], output["mean"], output["std"] = (
                 self.calculate_rewards(
@@ -741,9 +760,9 @@ def run_server():
 
 
 def test_datasampler():
-    max_model_len = 1024 * 8
+    max_model_len = 1024 *1
     config = DataSamplerConfig(
-        model="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+        model="unsloth/Llama-3.2-3B-Instruct",
         revision="main",
         host="0.0.0.0",
         port=8000,

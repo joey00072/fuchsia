@@ -29,6 +29,7 @@ from requests import ConnectionError
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.utils import StatelessProcessGroup
 
+from peft import PeftModel
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +108,7 @@ class VLLMClient:
         except requests.exceptions.RequestException as e:
             raise ConnectionError(f"Failed to connect to {url}: {str(e)}")
 
-    def check_server(self, total_timeout: float = 0.0, retry_interval: float = 2.0):
+    def check_server(self, total_timeout: float = 180.0, retry_interval: float = 2.0):
         """
         Check server availability with retries on failure, within a total timeout duration. If the server is not up
         after the total timeout duration, raise a `ConnectionError`.
@@ -127,18 +128,18 @@ class VLLMClient:
             except requests.exceptions.RequestException as exc:
                 # Check if the total timeout duration has passed
                 elapsed_time = time.time() - start_time
-                if elapsed_time >= total_timeout:
+                if (elapsed_time - start_time) >= total_timeout:
                     raise ConnectionError(
                         f"The vLLM server can't be reached at {self.host}:{self.server_port} after {total_timeout} "
                         "seconds. Make sure the server is running by running `Fuchsia serve`."
                     ) from exc
             else:
                 if response.status_code == 200:
-                    logger.info("Server is up!")
+                    print("Server is up!")
                     return None
 
             # Retry logic: wait before trying again
-            logger.info(
+            print(
                 f"Server is not up yet. Retrying in {retry_interval} seconds..."
             )
             time.sleep(retry_interval)
@@ -247,7 +248,7 @@ class VLLMClient:
         )
         self.pynccl_comm.group.barrier()
 
-    def update_model_params(self, model: nn.Module):
+    def update_model_params(self, model: nn.Module,lora=False):
         """
         Updates all parameters of the given model by calling `update_named_param` for each parameter in the model.
 
@@ -255,6 +256,39 @@ class VLLMClient:
             model (`nn.Module`):
                 Model whose parameters (weights/biases) are to be updated.
         """
+        if lora:
+            if not isinstance(model, PeftModel):
+                raise ValueError("Model is not a PeftModel")
+            target_modules = model.peft_config["default"].target_modules
+            alpha = model.peft_config["default"].lora_alpha
+            r = model.peft_config["default"].r
+            print(target_modules)
+            # time.sleep(10)
+            weights = {}
+            for name, param in model.named_parameters():
+                weights[name] = param.data
+                
+            for name, param in model.named_parameters():
+                if "lora" in name:
+                    continue
+                if any(target in name for target in target_modules):
+                    if "lora" not in name:
+                        prefix = name.replace(".base_layer.weight","")
+                        A_name = f"{prefix}.lora_A.default.weight"
+                        B_name = f"{prefix}.lora_B.default.weight"
+                        # print(f"A_name: {weights[A_name].data}")
+                        # print(f"B_name: {weights[B_name].data}")
+                        # print(f"param: {param.data}")
+                        delta = (weights[B_name].data.clone() @ weights[A_name].data.clone()) * (alpha / r)
+                        new_wights = param.data.clone() + delta
+                        new_name = name.replace("base_model.model.","").replace(".base_layer.weight",".weight")
+                        
+                        # print(weights[name] - new_wights)
+                        self.update_named_param(new_name, new_wights)
+                
+            return
+                
+        
         for name, param in model.named_parameters():
             # Update each parameter individually
             self.update_named_param(name, param.data)
@@ -332,7 +366,7 @@ if __name__ == "__main__":
     # Update model weights
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained("unsloth/Llama-3.2-3B-Instruct").to(
+    model = AutoModelForCausalLM.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B").to(
         "cuda"
     )
     client.update_model_params(model)
