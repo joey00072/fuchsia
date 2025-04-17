@@ -131,6 +131,7 @@ def test_datasampler():
         vllm_repetition_penalty=config["server"]["vllm"].get("repetition_penalty", 1.0)
     )
     
+    print(server_config)
     # Create and start server
     print("[blue]Starting server...[/blue]")
     server = DataSamplerServer(
