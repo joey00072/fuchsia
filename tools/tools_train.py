@@ -134,13 +134,13 @@ def main():
             r=config["lora"]["r"],
             lora_alpha=config["lora"]["alpha"],
             target_modules=config["lora"]["target_modules"],
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM"
         )
         model = get_peft_model(model, lora_config)
         print("[green]LoRA configured successfully[/green]")
 
-    # print model
-    print("[blue]Model:[/blue]")
-    print(model)
 
     # Initialize VLLM client
     print("[blue]Initializing VLLM client...[/blue]")

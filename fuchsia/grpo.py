@@ -8,6 +8,7 @@ import datetime
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional, List, Callable, Any
+import logging
 
 from fuchsia.vllm_client import VLLMClient
 
@@ -17,6 +18,10 @@ from peft import PeftModel
 
 @dataclass
 class GRPOConfig:
+    """
+    Configuration for GRPO training and generation.
+    All parameters are user-configurable for maximum flexibility.
+    """
     group_size: int = 8
     micro_group_size: int = 2
     batch_size: int = 1
@@ -35,6 +40,18 @@ class GRPOConfig:
     using_lora: bool = False
     lora_path: str = "lora_weights"
     ignore_imcomplete_samples: bool = True
+    # Generation parameters
+    max_new_tokens: int = 512
+    temperature: float = 0.9
+    repetition_penalty: float = 1.1
+    top_p: float = 1.0
+    top_k: int = -1
+    min_p: float = 0.0
+    # Logging and saving
+    log_level: str = "INFO"
+    save_every: int = 25
+    # Device
+    device: Optional[str] = None  # If None, auto-detect
 
     def __post_init__(self):
         dtype_map = {
@@ -54,6 +71,10 @@ class GRPOConfig:
         if self.dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
             self.dtype = torch.float16
 
+        # Set up logging
+        logging.basicConfig(level=getattr(logging, self.log_level.upper(), logging.INFO))
+        self.logger = logging.getLogger("GRPO")
+
 
 class GRPO:
     def __init__(
@@ -67,9 +88,10 @@ class GRPO:
         config: GRPOConfig = None,
         vllm_client: VLLMClient = None,
     ):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(model)
         self.config = config
+        self.logger = getattr(config, "logger", logging.getLogger("GRPO"))
+        self.device = config.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.logger.info(f"Using device: {self.device}")
         if isinstance(model, str):
             self.model_name = model
         else:
@@ -95,7 +117,7 @@ class GRPO:
                 self.model.parameters(), lr=config.lr, weight_decay=config.weight_decay
             )
         )
-        print(f"{config.lr=}")
+        self.logger.info(f"Learning rate: {config.lr}")
         self.reward_functions: list = reward_functions
         self.dataset_feild = config.dataset_feild
         self.num_policy_updates = config.num_policy_updates
@@ -105,8 +127,7 @@ class GRPO:
         self.ignore_imcomplete_samples = config.ignore_imcomplete_samples
         
         if not config.use_vllm and self.ignore_imcomplete_samples:
-            print("Warning: ignore_imcomplete_samples is set to True, but use_vllm is set to False. This will not have any effect.")
-            
+            self.logger.warning("ignore_imcomplete_samples is set to True, but use_vllm is set to False. This will not have any effect.")
             
         if self.using_lora and self.beta > 0:
             self.ref_model = model
@@ -123,7 +144,7 @@ class GRPO:
             self.ref_model.to(self.device).to(config.dtype)
 
         if config.use_vllm:
-            print("Using VLLM")
+            self.logger.info("Using VLLM")
             self.vllm_client = vllm_client if vllm_client is not None else VLLMClient()
 
     def selective_log_softmax(self, logits, index):
@@ -213,15 +234,17 @@ class GRPO:
         samples = [sample for _ in range(self.group_size) for sample in samples]
 
         start_time = time.time()
-        max_new_tokens = 512
         outputs = self.model.generate(
             input_ids.to(self.device),
-            max_new_tokens=max_new_tokens,
-            temperature=0.9,
-            repetition_penalty=1.1,
+            max_new_tokens=self.config.max_new_tokens,
+            temperature=self.config.temperature,
+            repetition_penalty=self.config.repetition_penalty,
+            top_p=self.config.top_p,
+            top_k=self.config.top_k,
+            min_p=self.config.min_p,
         )
         end_time = time.time()
-        print(f"Time for generation: {end_time - start_time} seconds")
+        self.logger.info(f"Time for generation: {end_time - start_time} seconds")
 
         decoded_outputs = self.tokenizer.batch_decode(
             outputs, skip_special_tokens=False
@@ -286,7 +309,7 @@ class GRPO:
         
         print("\n\n\n")
         print("-" * 10)
-        print(decoded_outputs[0].replace("<|finetune_right_pad_id|>", ""))
+        print(decoded_outputs[0].replace("<|finetune_right_pad_id|>", "").replace("<|end_of_text|>", ""))
         print("-" * 10)
         print("\n\n\n")
         
@@ -453,11 +476,11 @@ class GRPO:
             )
             self.log_metrics()
 
-            if idx % self.num_policy_updates == 0:
+            if idx % self.num_policy_updates == 0 and self.distributed:
                 self.vllm_client.update_model_params(self.model,lora=self.using_lora)
-                self.vllm_client.empty_buffer()
+                # self.vllm_client.empty_buffer()
                 self.vllm_client.fill_buffer()
             
             
-            if idx % 25 == 0:
+            if idx % self.config.save_every == 0:
                 self.model.save_pretrained(self.lora_path+f"/{idx}", adapter_name="grpo")

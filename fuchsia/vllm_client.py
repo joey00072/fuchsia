@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# derived from https://github.com/huggingface/trl/blob/main/trl/extras/vllm_client.py
+# from original pr of binary-husky (https://github.com/binary-husky) pr https://github.com/huggingface/trl/pull/3094
+
 
 import atexit
 import logging
@@ -248,46 +251,52 @@ class VLLMClient:
         )
         self.pynccl_comm.group.barrier()
 
-    def update_model_params(self, model: nn.Module,lora=False):
+    def update_lora_params(self, model: PeftModel):
+        """
+        Updates parameters for a LoRA-enabled model by computing the effective weights
+        after applying LoRA adaptations.
+
+        Args:
+            model (`PeftModel`):
+                LoRA-enabled model whose parameters are to be updated.
+        """
+        if not isinstance(model, PeftModel):
+            raise ValueError("Model is not a PeftModel")
+            
+        target_modules = model.peft_config["default"].target_modules
+        alpha = model.peft_config["default"].lora_alpha
+        r = model.peft_config["default"].r
+        print(target_modules)
+        weights = {}
+        for name, param in model.named_parameters():
+            weights[name] = param.data
+            
+        for name, param in model.named_parameters():
+            if "lora" in name:
+                continue
+            if any(target in name for target in target_modules):
+                if "lora" not in name:
+                    prefix = name.replace(".base_layer.weight","")
+                    A_name = f"{prefix}.lora_A.default.weight"
+                    B_name = f"{prefix}.lora_B.default.weight"
+                    delta = (weights[B_name].data.clone() @ weights[A_name].data.clone()) * (alpha / r)
+                    new_wights = param.data.clone() + delta
+                    new_name = name.replace("base_model.model.","").replace(".base_layer.weight",".weight")
+                    self.update_named_param(new_name, new_wights)
+
+    def update_model_params(self, model: nn.Module, lora=False):
         """
         Updates all parameters of the given model by calling `update_named_param` for each parameter in the model.
 
         Args:
             model (`nn.Module`):
                 Model whose parameters (weights/biases) are to be updated.
+            lora (`bool`, *optional*, defaults to `False`):
+                Whether the model uses LoRA adaptations.
         """
         if lora:
-            if not isinstance(model, PeftModel):
-                raise ValueError("Model is not a PeftModel")
-            target_modules = model.peft_config["default"].target_modules
-            alpha = model.peft_config["default"].lora_alpha
-            r = model.peft_config["default"].r
-            print(target_modules)
-            # time.sleep(10)
-            weights = {}
-            for name, param in model.named_parameters():
-                weights[name] = param.data
-                
-            for name, param in model.named_parameters():
-                if "lora" in name:
-                    continue
-                if any(target in name for target in target_modules):
-                    if "lora" not in name:
-                        prefix = name.replace(".base_layer.weight","")
-                        A_name = f"{prefix}.lora_A.default.weight"
-                        B_name = f"{prefix}.lora_B.default.weight"
-                        # print(f"A_name: {weights[A_name].data}")
-                        # print(f"B_name: {weights[B_name].data}")
-                        # print(f"param: {param.data}")
-                        delta = (weights[B_name].data.clone() @ weights[A_name].data.clone()) * (alpha / r)
-                        new_wights = param.data.clone() + delta
-                        new_name = name.replace("base_model.model.","").replace(".base_layer.weight",".weight")
-                        
-                        # print(weights[name] - new_wights)
-                        self.update_named_param(new_name, new_wights)
-                
+            self.update_lora_params(model)
             return
-                
         
         for name, param in model.named_parameters():
             # Update each parameter individually

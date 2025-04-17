@@ -30,7 +30,7 @@ from fastapi import BackgroundTasks, FastAPI
 from pydantic import BaseModel
 import uvicorn
 from collections import defaultdict
-
+import time
 
 from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
@@ -194,27 +194,30 @@ class ServerConfig:
     max_model_len: Optional[int] = 512
     enable_prefix_caching: Optional[bool] = None
     quantization: Optional[str] = None
+    
+    # Data sampler specific configs
+    dataset_field: str = "text"
+    buffer_size: int = 32
+    enable_lora: bool = False
+    lora_path: str = "lora_weights"
+    vllm_n: int = 1
+    vllm_repetition_penalty: float = 1.0
+    vllm_temperature: float = 0.9
+    vllm_top_p: float = 1.0
+    vllm_top_k: int = -1
+    vllm_min_p: float = 0.0
+    vllm_max_tokens: int = 1024
+    generation_batch_size: int = 1
 
-    def __init__(self, *args, **kwargs):
-        known_fields = {
-            "model",
-            "revision",
-            "tensor_parallel_size",
-            "host",
-            "port",
-            "gpu_memory_utilization",
-            "dtype",
-            "max_model_len",
-            "enable_prefix_caching",
-            "quantization",
-        }
-
-        for field in known_fields:
-            if field in kwargs:
-                setattr(self, field, kwargs.pop(field))
-
+    def __post_init__(self,**kwargs):
+        # Allow for dynamic attribute setting from config files
+        for key, value in self.__dict__.items():
+            if not hasattr(self, key):
+                setattr(self, key, value)
+        
         for key, value in kwargs.items():
-            setattr(self, key, value)
+            if not hasattr(self, key):
+                setattr(self, key, value)
 
 
 # API Models
@@ -246,14 +249,22 @@ class UpdateWeightsRequest(BaseModel):
     shape: list[int]
 
 
-class VLLMServer:
-    def __init__(self, config: ServerConfig):
-        if not libcuda_available:
-            raise ImportError("CUDA is required to run the vLLM serve script")
-
+class DataSamplerServer:
+    def __init__(
+        self, 
+        config: ServerConfig,
+        dataset: Optional[Dataset] = None,
+        reward_functions: Optional[list[Callable]] = None,
+        pre_fill_buffer: bool = True,
+        stop: Optional[list[str]] = None,
+    ):
         self.config = config
+        logger.info(config)
+        self.stop = stop
+
         self.llm = LLM(
             model=config.model,
+            quantization=config.quantization,
             revision=config.revision,
             tensor_parallel_size=config.tensor_parallel_size,
             gpu_memory_utilization=config.gpu_memory_utilization,
@@ -262,6 +273,37 @@ class VLLMServer:
             max_model_len=config.max_model_len,
             worker_cls="fuchsia.vllm_server.WeightSyncWorker",
         )
+
+        # Data sampler specific initialization
+        self.dataset = dataset
+        self.is_data_sampler = dataset is not None
+        
+        if self.is_data_sampler:
+            self.tokenizer = AutoTokenizer.from_pretrained(config.model)
+            self.dataset_field = config.dataset_field
+            self.reward_functions = reward_functions or []
+            self.buffer_size = config.buffer_size
+            self.buffer = []
+            self.dataset_iter = iter(self.dataset)
+            self._epoch = 1
+            self._generation_batch_size = config.generation_batch_size
+            self._sampling_params = SamplingParams(
+                n=config.vllm_n,
+                repetition_penalty=config.vllm_repetition_penalty,
+                temperature=config.vllm_temperature,
+                top_p=config.vllm_top_p,
+                top_k=config.vllm_top_k,
+                min_p=config.vllm_min_p,
+                max_tokens=config.vllm_max_tokens,
+                stop=self.stop,
+            )
+            self.enable_lora = config.enable_lora
+            self.lora_path = config.lora_path
+            self._is_filling = False
+            
+            if pre_fill_buffer:
+                self.buffer_fill()
+
         self.app = self._create_app()
 
     def _create_app(self) -> FastAPI:
@@ -269,52 +311,19 @@ class VLLMServer:
 
         @app.get("/health/")
         async def health():
-            """
-            Health check endpoint to verify that the server is running.
-            """
+            """Health check endpoint to verify that the server is running."""
             return {"status": "ok"}
 
         @app.get("/get_tensor_parallel_size/")
         async def get_tensor_parallel_size():
-            """
-            Retrieves the tensor parallel size from the LLM engine.
-
-            Returns:
-                `dict`:
-                    A dictionary containing the tensor parallel size.
-
-            Example response:
-            ```json
-            {"tensor_parallel_size": 8}
-            ```
-            """
+            """Retrieves the tensor parallel size from the LLM engine."""
             return {
                 "tensor_parallel_size": self.llm.llm_engine.parallel_config.tensor_parallel_size
             }
 
         @app.post("/generate/", response_model=GenerateResponse)
         async def generate(request: GenerateRequest):
-            """
-            Generates completions for the provided prompts.
-
-            Args:
-                request (`GenerateRequest`):
-                    - `prompts` (list of `str`): A list of prompts (text strings) for the model to generate completions.
-
-            Returns:
-                `GenerateResponse`:
-                    - `completion_ids` (list of list of `int`): A list of lists of token IDs for each generated completion.
-
-            Example request:
-            ```json
-            {"prompts": ["Hello world", "What is AI?"]}
-            ```
-
-            Example response:
-            ```json
-            {"completion_ids": [[101, 102, 103], [201, 202, 203]]}
-            ```
-            """
+            """Generates completions for the provided prompts."""
             guided_decoding = None
             if request.guided_decoding_regex:
                 guided_decoding = GuidedDecodingParams(
@@ -330,6 +339,7 @@ class VLLMServer:
                 min_p=request.min_p,
                 max_tokens=request.max_tokens,
                 guided_decoding=guided_decoding,
+                stop=self.stop,
             )
             all_outputs = self.llm.generate(
                 request.prompts, sampling_params=sampling_params
@@ -345,16 +355,7 @@ class VLLMServer:
         async def init_communicator(
             request: InitCommunicatorRequest, background_tasks: BackgroundTasks
         ):
-            """
-            Initializes the communicator for synchronizing model weights between a client and multiple server
-            workers.
-
-            Args:
-                request (`InitCommunicatorRequest`):
-                    - `host` (`str`): Hostname or IP address of the master node.
-                    - `port` (`int`): Port number to be used for communication.
-                    - `world_size` (`int`): Total number of participating processes in the group.
-            """
+            """Initializes the communicator for weight synchronization."""
             background_tasks.add_task(
                 self.llm.collective_rpc,
                 "init_communicator",
@@ -366,17 +367,7 @@ class VLLMServer:
         async def update_named_param(
             request: UpdateWeightsRequest, background_tasks: BackgroundTasks
         ):
-            """
-            Updates the model weights with the provided tensor.
-
-            Once this endpoint is called, the client process should broadcast the updated weights to all server workers.
-
-            Args:
-                request (`UpdateWeightsRequest`):
-                    - `name` (`str`): Name of the weight tensor being updated.
-                    - `dtype` (`str`): Data type of the weight tensor (e.g., `"torch.float32"`).
-                    - `shape` (list of `int`): Shape of the weight
-            """
+            """Updates model weights with the provided tensor."""
             dtype = torch.__getattribute__(request.dtype.split(".")[-1])
             background_tasks.add_task(
                 self.llm.collective_rpc,
@@ -387,203 +378,63 @@ class VLLMServer:
 
         @app.post("/reset_prefix_cache/")
         async def reset_prefix_cache():
-            """
-            Resets the prefix cache for the model.
-            """
+            """Resets the prefix cache for the model."""
             success = self.llm.llm_engine.reset_prefix_cache()
             return {"message": f"Reset prefix cache status: {success}"}
 
         @app.post("/close_communicator/")
         async def close_communicator():
-            """
-            Closes the weight update group and cleans up associated resources.
-            """
+            """Closes the weight update group and cleans up resources."""
             self.llm.collective_rpc("close_communicator")
             return {"message": "Request received, closing communicator"}
 
-        return app
+        # Add data sampler specific endpoints if in data sampler mode
+        if self.is_data_sampler:
+            @app.post("/get_sample/")
+            async def get_sample(background_tasks: BackgroundTasks):
+                """Returns a sample from the buffer and triggers background buffer fill."""
+                if len(self.buffer) == 0:
+                    await asyncio.sleep(5)
+                    return {"sample": None}
+                items = self.buffer.pop(0)
+                if len(self.buffer) < self.buffer_size:
+                    background_tasks.add_task(self.buffer_fill)
+                    logger.info("requesting buffer fill")
+                return {"sample": items}
 
-    def serve(self):
-        """
-        Starts the FastAPI server with the configured host and port.
-        """
-        from rich.console import Console
-        from rich.panel import Panel
-        from rich.table import Table
-        from rich.text import Text
-
-        console = Console()
-
-        # Create a table for IP addresses
-        table = Table(
-            title="Server Network Information",
-            show_header=True,
-            header_style="bold magenta",
-        )
-        table.add_column("Interface", style="cyan")
-        table.add_column("URL", style="green")
-
-        # Filter and add only important interfaces (IPv4, excluding loopback)
-        for ip_info in get_ip_addresses():
-            if ip_info["type"] == "IPv4" and ip_info["interface"] != "lo":
-                url = f"http://{ip_info['ip']}:{self.config.port}"
-                table.add_row(ip_info["interface"], url)
-
-        # Create a panel for the server status
-        status_text = Text()
-        status_text.append("Server Status: ", style="bold")
-        status_text.append("Starting...", style="green")
-
-        # Display the information
-        console.print("\n")
-        console.print(Panel(table, title="[bold]Available Network Interfaces[/bold]"))
-        console.print(Panel(status_text, title="[bold]Server Configuration[/bold]"))
-        console.print(
-            f"\n[bold blue]Server running on port {self.config.port}[/bold blue]\n"
-        )
-
-        uvicorn.run(self.app, host=self.config.host, port=self.config.port)
-        dist.destroy_process_group()
-
-
-class DataSamplerConfig(ServerConfig):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.dataset_feild = kwargs.get("dataset_feild", "text")
-        self.buffer_size = kwargs.get("buffer_size", 32)
-        
-        
-        self.enable_lora: bool = kwargs.get("enable_lora", False)
-        self.lora_path: str = kwargs.get("lora_path", "lora_weights")
-        
-        
-        self.vllm_n: int = kwargs.get("vllm_n", 1)
-        self.vllm_repetition_penalty: float = kwargs.get("vllm_repetition_penalty", 1.0)
-        self.vllm_temperature: float = kwargs.get("vllm_temperature", 0.9)
-        self.vllm_top_p: float = kwargs.get("vllm_top_p", 1.0)
-        self.vllm_top_k: int = kwargs.get("vllm_top_k", -1)
-        self.vllm_min_p: float = kwargs.get("vllm_min_p", 0.0)
-        self.vllm_max_tokens: int = kwargs.get("vllm_max_tokens", 1024)
-        self.guided_decoding: Optional[GuidedDecodingParams] = kwargs.get(
-            "guided_decoding", None
-        )
-        self.generation_batch_size: int = kwargs.get("generation_batch_size", 1)
-        
-
-class DataSamplerServer(VLLMServer):
-    def __init__(   
-        self,
-        config: DataSamplerConfig,
-        dataset: Dataset,
-        reward_functions: list[Callable] = None,
-    ):
-        self.config = config
-        print(config)
-
-        self.config = config
-        self.llm = LLM(
-            model=config.model,
-            quantization=config.quantization,
-            revision=config.revision,
-            tensor_parallel_size=config.tensor_parallel_size,
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            dtype=config.dtype,
-            enable_prefix_caching=config.enable_prefix_caching,
-            max_model_len=config.max_model_len,
-            worker_cls="fuchsia.vllm_server.WeightSyncWorker",
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model)
-        self.dataset = dataset
-        self.dataset_feild = config.dataset_feild
-        self.reward_functions = reward_functions
-        self.buffer_size = config.buffer_size
-        self.buffer = []
-        self.dataset_iter = iter(self.dataset)
-        self._epoch = 1
-        self._generation_batch_size = config.generation_batch_size
-        self._sampling_params = SamplingParams(
-            n=config.vllm_n,
-            repetition_penalty=config.vllm_repetition_penalty,
-            temperature=config.vllm_temperature,
-            top_p=config.vllm_top_p,
-            top_k=config.vllm_top_k,
-            min_p=config.vllm_min_p,
-            max_tokens=config.vllm_max_tokens,
-            guided_decoding=config.guided_decoding,
-        )
-
-        self.enable_lora = config.enable_lora
-        self.lora_path = config.lora_path
-        
-        self._is_filling = False  # Add this line to track fill status
-        self.app = self._create_app()
-        
-        
-        
-    def _create_app(self) -> FastAPI:
-        app = super()._create_app()
-
-        self.buffer_fill()
-
-        @app.post("/get_sample/")
-        async def get_sample(background_tasks: BackgroundTasks):
-            """
-            Returns a sample from the buffer and triggers background buffer fill.
-            """
-            if len(self.buffer) == 0:
-                await asyncio.sleep(5)
-                return {"sample": None}
-            items = self.buffer.pop(0)
-            # Add buffer fill task to run in background after response
-            if len(self.buffer) < self.buffer_size:
+            @app.post("/buffer_fill/")
+            async def buffer_fill(background_tasks: BackgroundTasks):
+                """Fills the buffer with new samples if not already filling."""
+                if self._is_filling:
+                    return {"message": "Buffer fill already in progress"}
                 background_tasks.add_task(self.buffer_fill)
-                print("requesting buffer fill")
+                return {"message": "Buffer filling started"}
 
-            return {"sample": items}
+            @app.get("/buffer_status/")
+            async def buffer_status():
+                """Returns the current status of the buffer."""
+                return {
+                    "current_size": len(self.buffer),
+                    "max_size": self.buffer_size,
+                    "is_filling": self._is_filling,
+                    "epoch": self._epoch,
+                }
 
-        @app.post("/buffer_fill/")
-        async def buffer_fill(background_tasks: BackgroundTasks):
-            """
-            Fills the buffer with new samples if not already filling.
-            """
-            if self._is_filling:
-                return {"message": "Buffer fill already in progress"}
-
-            background_tasks.add_task(self.buffer_fill)
-            return {"message": "Buffer filling started"}
-
-        @app.get("/buffer_status/")
-        async def buffer_status():
-            """
-            Returns the current status of the buffer including:
-            - Current buffer size
-            - Maximum buffer size
-            - Whether buffer is currently being filled
-            - Current epoch number
-            """
-            return {
-                "current_size": len(self.buffer),
-                "max_size": self.buffer_size,
-                "is_filling": self._is_filling,
-                "epoch": self._epoch,
-            }
-
-        @app.post("/empty_buffer/")
-        async def empty_buffer():
-            """
-            Empties the buffer and returns the number of items that were removed.
-            """
-            items_removed = len(self.buffer)
-            self.buffer.clear()
-            return {
-                "message": "Buffer emptied successfully",
-                "items_removed": items_removed,
-            }
+            @app.post("/empty_buffer/")
+            async def empty_buffer():
+                """Empties the buffer and returns the number of items removed."""
+                items_removed = len(self.buffer)
+                self.buffer.clear()
+                return {
+                    "message": "Buffer emptied successfully",
+                    "items_removed": items_removed,
+                }
 
         return app
 
     def buffer_fill(self):
-        if self._is_filling:
+        """Fills the buffer with new samples."""
+        if not self.is_data_sampler or self._is_filling:
             return
 
         self._is_filling = True
@@ -597,38 +448,30 @@ class DataSamplerServer(VLLMServer):
                     except StopIteration:
                         self.dataset_iter = iter(self.dataset)
                         self._epoch += 1
-                # print("#" * 10)
-                # print(f"items: {len(items)}")
-                # print("#" * 10)
+
+                start_time = time.perf_counter()
                 items_with_rewards = self.process_sample(items)
-                # print("=" * 10)
-                print("=" * 10)
-                print(items_with_rewards[0]["all_rewards"],items_with_rewards[0]["mean"],items_with_rewards[0]["std"])
-                print("=" * 10)
+                end_time = time.perf_counter()
+                print(f"time taken: {end_time - start_time}")
+                print("==========")
+                for item in items_with_rewards:
+                    print(f"{item['all_rewards']}")
+                    print(f"{item['mean']} {item['std']}")
+                    print("-"*10)
+                logger.debug("==========")
                 self.buffer.extend(items_with_rewards)
-                print(f"buffer: {len(self.buffer[0]['completions'])}")
+                logger.debug(f"buffer: {len(self.buffer[0]['completions'])}")
         finally:
             self._is_filling = False
 
     def process_sample(self, items):
-        prompts = [item[self.dataset_feild] for item in items]
-        guided_decoding = None
-        sampling_params = SamplingParams(
-            n=self.config.vllm_n,
-            repetition_penalty=self.config.vllm_repetition_penalty,
-            temperature=self.config.vllm_temperature,
-            top_p=self.config.vllm_top_p,
-            top_k=self.config.vllm_top_k,
-            min_p=self.config.vllm_min_p,
-            max_tokens=self.config.vllm_max_tokens,
-            guided_decoding=guided_decoding,
-        )
-        import time
-        start_time = time.perf_counter()
-        all_outputs = self.llm.generate(prompts, sampling_params=sampling_params)
-        end_time = time.perf_counter()
-        print(f"time taken: {end_time - start_time}")
-        # time.sleep(100)
+        """Processes samples and calculates rewards."""
+        if not self.is_data_sampler:
+            return []
+
+        prompts = [item[self.dataset_field] for item in items]
+        all_outputs = self.llm.generate(prompts, sampling_params=self._sampling_params)
+        
         completion_ids = [
             list(output.token_ids)
             for outputs in all_outputs
@@ -640,24 +483,22 @@ class DataSamplerServer(VLLMServer):
 
         all_outputs = []
         for g_idx, item in enumerate(items):
-            output = {}
-            output["item"] = [item] * self.config.vllm_n
-            output["completions"] = []
-            output["completion_ids"] = []
-            output["stop_reason"] = []
-            output["finish_reason"] = []
-            output["epoch"] = self._epoch
+            output = {
+                "item": [item] * self.config.vllm_n,
+                "completions": [],
+                "completion_ids": [],
+                "stop_reason": [],
+                "finish_reason": [],
+                "epoch": self._epoch,
+                "inputs": item[self.dataset_field]
+            }
+            
             for idx in range(self.config.vllm_n):
-                g_completion = completions[g_idx * self.config.vllm_n + idx]
-                g_completion_id = completion_ids[g_idx * self.config.vllm_n + idx]
-                g_stop_reason = stop_reason[g_idx * self.config.vllm_n + idx]
-                g_finish_reason = finish_reason[g_idx * self.config.vllm_n + idx]
-                
-                output["inputs"] = item[self.dataset_feild]
-                output["completions"].append(g_completion)
-                output["completion_ids"].append(g_completion_id)
-                output["stop_reason"].append(g_stop_reason)
-                output["finish_reason"].append(g_finish_reason)
+                base_idx = g_idx * self.config.vllm_n + idx
+                output["completions"].append(completions[base_idx])
+                output["completion_ids"].append(completion_ids[base_idx])
+                output["stop_reason"].append(stop_reason[base_idx])
+                output["finish_reason"].append(finish_reason[base_idx])
 
             output["all_rewards"], output["rewards"], output["mean"], output["std"] = (
                 self.calculate_rewards(
@@ -666,50 +507,68 @@ class DataSamplerServer(VLLMServer):
             )
             all_outputs.append(output)
 
-        print(f"items: {len(items)}, completions: {len(completions)}")
-
-        # for output in all_outputs:
-        #     print(output)
-        #     print("-"*100)
         return all_outputs
 
     def calculate_rewards(self, items, completions, completion_ids):
+        """Calculates rewards for generated completions."""
+        if not self.is_data_sampler:
+            return {}, [], 0.0, 0.0
+
         all_rewards = {}
         for reward_function in self.reward_functions:
-            print(f"reward_function: {reward_function.__name__}")
             rewards = reward_function(
                 self.tokenizer, items, completions, completion_ids
             )
             all_rewards[reward_function.__name__] = rewards
 
-        lst = []
-        for key, value in all_rewards.items():
-            lst.append(value)
-        lst = np.array(lst)
-        print(lst)
-        total_rewards = lst.sum(axis=0)
-        print(lst)
-        mean = total_rewards.mean()
-        std = total_rewards.std()
+        reward_values = np.array([list(rewards) for rewards in all_rewards.values()])
+        total_rewards = reward_values.sum(axis=0)
+        mean = float(total_rewards.mean())
+        std = float(total_rewards.std())
 
-        # total reward to pytohn list
-        total_rewards = total_rewards.tolist()
-        mean = mean
-        std = std.tolist()
+        return all_rewards, total_rewards.tolist(), mean, std
 
-        return all_rewards, total_rewards, mean, std
+    def serve(self):
+        """Starts the FastAPI server with rich console output."""
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.table import Table
+
+        console = Console()
+
+        # Create network info table
+        table = Table(
+            title="Server Network Information",
+            show_header=True,
+            header_style="bold magenta",
+        )
+        table.add_column("Interface", style="cyan")
+        table.add_column("URL", style="green")
+
+        for ip_info in get_ip_addresses():
+            if ip_info["type"] == "IPv4" and ip_info["interface"] != "lo":
+                url = f"http://{ip_info['ip']}:{self.config.port}"
+                table.add_row(ip_info["interface"], url)
+
+        # Create server status panel
+        mode = "Data Sampler" if self.is_data_sampler else "Standard VLLM"
+        status_text = f"Mode: {mode}\nModel: {self.config.model}\nPort: {self.config.port}"
+        if self.is_data_sampler:
+            status_text += f"\nBuffer Size: {self.buffer_size}"
+            status_text += f"\nDataset Field: {self.dataset_field}"
+
+        # Display information
+        console.print("\n")
+        console.print(Panel(table, title="[bold]Available Network Interfaces[/bold]"))
+        console.print(Panel(status_text, title="[bold]Server Configuration[/bold]"))
+        console.print(f"\n[bold blue]Server running on port {self.config.port}[/bold blue]\n")
+
+        uvicorn.run(self.app, host=self.config.host, port=self.config.port)
+        dist.destroy_process_group()
 
 
 def load_config_from_yaml(yaml_path: str) -> ServerConfig:
-    """
-    Load server configuration from a YAML file.
-
-    Args:
-        yaml_path (str): Path to the YAML configuration file
-
-    Returns:
-        ServerConfig: Configuration object populated from YAML
-    """
+    """Load server configuration from a YAML file."""
     with open(yaml_path, "r") as f:
         config_dict = yaml.safe_load(f)
     return ServerConfig(**config_dict)
@@ -717,11 +576,7 @@ def load_config_from_yaml(yaml_path: str) -> ServerConfig:
 
 def run_server():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model",
-        type=str,
-        help="Model to load (e.g., HuggingFace model ID or local path)",
-    )
+    parser.add_argument("--model", type=str, help="Model to load")
     parser.add_argument("--revision", type=str)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--host", type=str, default="0.0.0.0")
@@ -730,43 +585,33 @@ def run_server():
     parser.add_argument("--dtype", type=str, default="auto")
     parser.add_argument("--max_model_len", default=1024, type=int)
     parser.add_argument("--enable_prefix_caching", default=False, type=bool)
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="examples/vllm_server_config.yaml",
-        help="Path to YAML configuration file (default: examples/vllm_server_config.yaml)",
-    )
+    parser.add_argument("--config", type=str, default="examples/vllm_server_config.yaml")
 
     args = parser.parse_args()
 
-    # If config file is provided, load from YAML
     if args.config:
         config = load_config_from_yaml(args.config)
-        # Override with any CLI arguments that were provided
         for key, value in vars(args).items():
             if value is not None and key != "config":
                 setattr(config, key, value)
     else:
         config = ServerConfig(**vars(args))
 
-    # Ensure model is specified either through config or CLI
     if not config.model:
-        parser.error(
-            "Model must be specified either through --model argument or in the config file"
-        )
+        parser.error("Model must be specified either through --model argument or in config file")
 
     server = VLLMServer(config)
     server.serve()
 
 
 def test_datasampler():
-    max_model_len = 1024 *1
-    config = DataSamplerConfig(
+    max_model_len = 1024
+    config = ServerConfig(
         model="unsloth/Llama-3.2-3B-Instruct",
         revision="main",
         host="0.0.0.0",
         port=8000,
-        dataset_feild="Question Text",
+        dataset_field="Question Text",
         buffer_size=4,
         max_model_len=max_model_len,
         gpu_memory_utilization=0.7,
@@ -778,14 +623,13 @@ def test_datasampler():
         vllm_top_p=1.0,
         vllm_top_k=-1,
         vllm_min_p=0.0,
-        # quantization="fp8",
     )
     ds = load_dataset("CK0607/2025-Jee-Mains-Question", split="train")
 
     def reward_function(tokenizer, items, completions, completion_ids):
         return [len(completion) for completion in completions]
 
-    server = DataSamplerServer(config, ds, [reward_function])
+    server = DataSamplerServer(config, dataset=ds, reward_functions=[reward_function])
     server.serve()
 
 

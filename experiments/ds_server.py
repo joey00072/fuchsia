@@ -1,4 +1,4 @@
-from fuchsia.vllm_server import DataSamplerServer, DataSamplerConfig
+from fuchsia.vllm_server import DataSamplerServer, ServerConfig
 from datasets import load_dataset
 import json
 from rich import print
@@ -10,6 +10,7 @@ import yaml
 from pathlib import Path
 import regex
 import os
+
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -31,7 +32,7 @@ def initialize_model(config):
     model = AutoModelForCausalLM.from_pretrained(model_name).cpu()
     return tokenizer, model
 
-prefix = "give correct answer boxed\nQuestion:"
+prefix = "give correct option/answer boxed\nQuestion:"
 
 def format_prompt(row):
     prompt = prefix + row["question"]
@@ -40,7 +41,13 @@ def format_prompt(row):
         for option in options:
             prompt += f"\n{option['identifier']}. {option['content']}"
 
-    message = [{"role": "user", "content": prompt}]
+    message = [
+        {
+        "role": "system",
+        "content": "You are a deep thinking AI, you may use extremely long chains of thought to deeply consider the problem and deliberate with yourself via systematic reasoning processes to help come to a correct solution prior to answering. You should enclose your thoughts and internal monologue inside <think> </think> tags, and then provide your solution or response to the problem."
+        },
+        {"role": "user", "content": prompt}
+        ]
     row["text"] = tokenizer.apply_chat_template(message, tokenize=False)
     if "MCQ" in row["Type"]:
         option = row["correct_option"]
@@ -64,17 +71,21 @@ def reward_func(tokenizer, samples, completions, *args, **kwargs) -> list[float]
     for sample, completion in zip(samples, completions):
         reward = 0.0
         boxes = find_boxes(completion)
+        if "boxed{" in completion:
+            reward += 0.001
         if not boxes:
             rewards.append(reward)
             continue
-        
         last_box = boxes[-1]
         if last_box.strip() == sample["answer"]:
-            reward = 7.0
+            reward += 10.0
         else:
-            reward = -1.0
+            reward -= 0.0
             
         rewards.append(reward)
+    max_completion_len = max(len(completion) for completion in completions)
+    for idx,(reward,completion) in enumerate(zip(rewards,completions)):
+        rewards[idx] = reward + (1 - (len(completion) / max_completion_len)) *0.1
     return rewards
 
 def test_datasampler():
@@ -94,11 +105,11 @@ def test_datasampler():
     # Format prompts and filter
     print("[blue]Formatting prompts...[/blue]")
     dataset = dataset.map(format_prompt)
-    dataset = dataset.filter(lambda x: int(x["pass_rate"]) <= 12)
+    # dataset = dataset.filter(lambda x: int(x["pass_rate"]) <= 12)
     print(f"[green]Filtered dataset to {len(dataset)} examples[/green]")
     
     # Create server config
-    server_config = DataSamplerConfig(
+    server_config = ServerConfig(
         model=config["model"]["name"],
         host=config["server"]["host"],
         port=config["server"]["port"],
