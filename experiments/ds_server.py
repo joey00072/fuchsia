@@ -90,7 +90,7 @@ def reward_func(tokenizer, samples, completions, *args, **kwargs) -> list[float]
 
 def test_datasampler():
     # Load configuration
-    config_path = Path(__file__).parent / "config.yaml"
+    config_path = Path(__file__).parent / "ds_config.yaml"
     config = load_config(str(config_path))
     
     # Initialize model and tokenizer

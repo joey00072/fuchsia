@@ -86,6 +86,7 @@ class VLLMClient:
         server_port: int = 8000,
         group_port: int = 51216,
         connection_timeout: float = 0.0,
+        init_communicator: bool = True,
     ):
         self.session = requests.Session()
         self.host = host
@@ -93,8 +94,9 @@ class VLLMClient:
         self.group_port = group_port
         self._base_url = f"http://{self.host}:{self.server_port}"
         self.check_server(connection_timeout)
-        self.init_communicator()
-        atexit.register(self.close_communicator)
+        if init_communicator:
+            self.init_communicator()
+            atexit.register(self.close_communicator)
 
     def _make_request(self, endpoint: str, method: str = "get", **kwargs) -> dict:
         """Helper method to make HTTP requests and handle responses."""

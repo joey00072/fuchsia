@@ -32,12 +32,12 @@ grpo:
 server:
   host: "0.0.0.0"
   port: 8000
-  gpu_memory_utilization: 0.10
+  gpu_memory_utilization: 0.90
   tensor_parallel_size: 1
   enable_prefix_caching: false
   buffer_size: 1
   generation_batch_size: 1
-  quantization: null
+  quantization: bitsandbytes
   vllm:
     max_tokens: 2048
     n: 8

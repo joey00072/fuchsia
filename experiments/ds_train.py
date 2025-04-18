@@ -107,7 +107,7 @@ def main():
     global tokenizer
 
     # Load configuration
-    config_path = Path(__file__).parent / "config.yaml"
+    config_path = Path(__file__).parent / "ds_config.yaml"
     config = load_config(str(config_path))
 
     # Initialize model and tokenizer

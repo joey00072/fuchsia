@@ -53,14 +53,14 @@ SPECIAL_TOKENS = [
 
 prefix = """Online function calling is avalible while thinking.
 function call format:
-<function_call>
-    <request>
-    ...
-    </request>
-    <response>
-    ...
-    </response>
-</function_call>
+<tool_call>
+<request tool_type="function_call" index=0 input_type="json">
+...
+</request>
+<response tool_type="function_call" index=0 output_type="json">
+...
+</response>
+</tool_call>
 Available functions:
 
 """
@@ -154,6 +154,7 @@ class ToolsSamplerServer(DataSamplerServer):
         self.buffer_fill()
         
     def process_sample(self, items):
+        TOOLS_CALL_TOKEN = "<tool_call>"
         prompts = [item[self.dataset_field] for item in items]
         sampling_params = SamplingParams(
             n=self.config.vllm_n,
@@ -163,9 +164,11 @@ class ToolsSamplerServer(DataSamplerServer):
             top_k=self.config.vllm_top_k,
             min_p=self.config.vllm_min_p,
             max_tokens=self.config.vllm_max_tokens,
-            stop=["<function_call>"]
+            stop=[TOOLS_CALL_TOKEN]
         )
         output_buffer = [["" for _ in range(self.config.vllm_n)] for _ in range(len(items))]
+        stop_reason_buffer = [[None for _ in range(self.config.vllm_n)] for _ in range(len(items))]
+        finished_buffer = [[None for _ in range(self.config.vllm_n)] for _ in range(len(items))]
         
         import time
         start_time = time.perf_counter()
@@ -182,27 +185,30 @@ class ToolsSamplerServer(DataSamplerServer):
             top_k=self.config.vllm_top_k,
             min_p=self.config.vllm_min_p,
             max_tokens=self.config.vllm_max_tokens,
-            stop=["<function_call>"]
+            stop=[TOOLS_CALL_TOKEN]
         )
         finished = True
         unfinished = {}
+        stop_reason_check = {}
+        finished_check = {}
         
         for sidx, (prompt, outputs) in enumerate(zip(prompts, vllm_outputs)):
             for gidx, output in enumerate(outputs.outputs):
-                if output.stop_reason == "<function_call>":
+                if output.stop_reason == TOOLS_CALL_TOKEN:
                     finished = False
                     unfinished[(sidx, gidx)] = (prompt, output.text)
                 else:
                     output_buffer[sidx][gidx]+=output.text
-
-
+                stop_reason_check[(sidx, gidx)] = output.stop_reason
+                finished_check[(sidx, gidx)] = output.finish_reason
+                
         while not finished:
             finished = True
             inputs = []
             
             for key, value in unfinished.items():
                 prompt, text = value
-                unfinished[key] = (prompt, text+"<function_call>")
+                unfinished[key] = (prompt, text+TOOLS_CALL_TOKEN)
             
             for key, value in unfinished.items():
                 prompt, text = value
@@ -212,7 +218,7 @@ class ToolsSamplerServer(DataSamplerServer):
             finished_idx = []
             for idx,(key, value)in enumerate(unfinished.items()):
                 output =  vllm_outputs[idx].outputs[0]
-                if output.stop_reason == "<function_call>":
+                if output.stop_reason == TOOLS_CALL_TOKEN:
                     finished = False
                     prompt, text = value
                     text+=output.text
@@ -221,9 +227,17 @@ class ToolsSamplerServer(DataSamplerServer):
                     x, y = key
                     output_buffer[x][y]+=value[1]+output.text
                     finished_idx.append(key)
+                stop_reason_check[key] = output.stop_reason
+                finished_check[key] = output.finish_reason
+                
             for idx in finished_idx:
                 unfinished.pop(idx)
-
+                
+        for x, y in stop_reason_check.keys():
+            stop_reason_buffer[x][y] = stop_reason_check[(x, y)]
+        for x, y in finished_check.keys():
+            finished_buffer[x][y] = finished_check[(x, y)]
+            
         for output in output_buffer:
             for o in output:
                 print("+"*100)
@@ -235,31 +249,30 @@ class ToolsSamplerServer(DataSamplerServer):
             for outputs in vllm_outputs
             for output in outputs.outputs
         ]
-        stop_reason = [output.stop_reason for outputs in vllm_outputs for output in outputs.outputs]
-        finish_reason = [output.finish_reason for outputs in vllm_outputs for output in outputs.outputs]
+        
         completions = [self.tokenizer.decode(c) for c in completion_ids]
 
         all_outputs = []
-        for g_idx, item in enumerate(items):
+        for g_idx, (item,completions) in enumerate(zip(items,completions)):
             print(item)
             output = {}
             output["item"] = [item] * self.config.vllm_n
-            output["completions"] = []
-            output["completion_ids"] = []
-            output["stop_reason"] = []
-            output["finish_reason"] = []
+            output["completions"] = completions
+            output["completion_ids"] = [self.tokenizer.encode(c) for c in completions]
+            output["stop_reason"] = stop_reason_buffer[g_idx]
+            output["finish_reason"] = finished_buffer[g_idx]
             output["epoch"] = self._epoch
-            for idx in range(self.config.vllm_n):
-                g_completion = completions[g_idx * self.config.vllm_n + idx]
-                g_completion_id = completion_ids[g_idx * self.config.vllm_n + idx]
-                g_stop_reason = stop_reason[g_idx * self.config.vllm_n + idx]
-                g_finish_reason = finish_reason[g_idx * self.config.vllm_n + idx]
+            # for idx in range(self.config.vllm_n):
+            #     g_completion = completions[g_idx * self.config.vllm_n + idx]
+            #     g_completion_id = completion_ids[g_idx * self.config.vllm_n + idx]
+            #     g_stop_reason = stop_reason[g_idx * self.config.vllm_n + idx]
+            #     g_finish_reason = finish_reason[g_idx * self.config.vllm_n + idx]
                 
-                output["inputs"] = item[self.dataset_feild]
-                output["completions"].append(g_completion)
-                output["completion_ids"].append(g_completion_id)
-                output["stop_reason"].append(g_stop_reason)
-                output["finish_reason"].append(g_finish_reason)
+            #     output["inputs"] = item[self.dataset_field]
+            #     output["completions"].append(g_completion)
+            #     output["completion_ids"].append(g_completion_id)
+            #     output["stop_reason"].append(g_stop_reason)
+            #     output["finish_reason"].append(g_finish_reason)
 
             output["all_rewards"], output["rewards"], output["mean"], output["std"] = (
                 self.calculate_rewards(

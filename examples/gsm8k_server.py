@@ -1,4 +1,4 @@
-from fuchsia.vllm_server import DataSamplerServer, DataSamplerConfig
+from fuchsia.vllm_server import DataSamplerServer, ServerConfig
 from datasets import load_dataset
 import json
 from rich import print
@@ -6,6 +6,7 @@ import re
 from typing import Optional
 from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
+import yaml
 
 import os
 
@@ -14,7 +15,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 model_name = "unsloth/Llama-3.2-3B-Instruct"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(model_name).cpu()
+model = AutoModelForCausalLM.from_pretrained(model_name)
 SYSTEM_PROMPT = "Respond in following format:<thinking>{step by step reasoning}</thinking><answer>{number}</answer>"
 
 
@@ -103,7 +104,7 @@ def reward_function_1(tokenizer, samples, completions, *args, **kwargs):
     return lst
 
 
-def prepare_dataset(dataset) -> Dataset:
+def prepare_dataset(dataset, tokenizer=tokenizer) -> Dataset:
     """Prepare the GSM8K dataset with better error handling and validation."""
 
     def extract_hash_answer(text: str) -> Optional[str]:
@@ -148,30 +149,41 @@ def prepare_dataset(dataset) -> Dataset:
         raise
 
 
+def load_config(config_path: str = "examples/gsm8k_config.yaml") -> dict:
+    """Load configuration from YAML file."""
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
 def test_datasampler():
-    max_model_len = 512
-    dataset = load_dataset("openai/gsm8k", "main")["train"]
-    dataset = prepare_dataset(dataset)
-    config = DataSamplerConfig(
-        model=model_name,
-        host="0.0.0.0",
-        port=8000,
-        dataset_feild="text",
-        buffer_size=4,
-        max_model_len=max_model_len,
-        gpu_memory_utilization=0.98,
-        dtype="bfloat16",
-        vllm_max_tokens=max_model_len,
-        vllm_n=8,  # Number of sequences to generate
-        vllm_temperature=1.0,  # Temperature for sampling
-        vllm_top_p=1.0,  # Nucleus sampling parameter
-        vllm_top_k=-1,  # Top-k sampling parameter (-1 means disabled)
-        vllm_min_p=0.0,  # Minimum probability threshold
-        enable_prefix_caching=False,
-        generation_batch_size=4,
-        quantization=None,
+    config = load_config()
+    
+    server_config = ServerConfig(
+        model=config['model']['name'],
+        host=config['server']['host'],
+        port=config['server']['port'],
+        dataset_field=config['dataset']['field'],
+        buffer_size=config['server']['buffer_size'],
+        max_model_len=config['model']['max_model_len'],
+        gpu_memory_utilization=config['server']['gpu_memory_utilization'],
+        dtype=config['model']['dtype'],
+        vllm_max_tokens=config['server']['vllm']['max_tokens'],
+        vllm_n=config['server']['vllm']['n'],
+        vllm_temperature=config['server']['vllm']['temperature'],
+        vllm_top_p=config['server']['vllm']['top_p'],
+        vllm_top_k=config['server']['vllm']['top_k'],
+        vllm_min_p=config['server']['vllm']['min_p'],
+        enable_prefix_caching=config['server']['enable_prefix_caching'],
+        generation_batch_size=config['server']['generation_batch_size'],
+        quantization=config['server']['quantization'],
     )
-    server = DataSamplerServer(config, dataset, [reward_function_1])
+    
+    dataset = load_dataset(config['dataset']['name'], config['dataset']['split'])
+    if config['dataset']['max_samples']:
+        dataset = dataset.select(range(min(config['dataset']['max_samples'], len(dataset))))
+    dataset = prepare_dataset(dataset)
+    
+    server = DataSamplerServer(server_config, dataset, [reward_function_1])
     server.serve()
 
 
