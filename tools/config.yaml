@@ -36,7 +36,7 @@ server:
   tensor_parallel_size: 1
   enable_prefix_caching: false
   buffer_size: 1
-  generation_batch_size: 1
+  generation_batch_size: 4
   quantization: bitsandbytes
   vllm:
     max_tokens: 2048

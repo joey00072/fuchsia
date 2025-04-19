@@ -53,14 +53,14 @@ SPECIAL_TOKENS = [
 
 prefix = """Online function calling is avalible while thinking.
 function call format:
-<tool_call>
-<request tool_type="function_call" index=0 input_type="json">
+<function_call>
+<request>
 ...
 </request>
-<response tool_type="function_call" index=0 output_type="json">
+<response>
 ...
 </response>
-</tool_call>
+</function_call>
 Available functions:
 
 """
@@ -135,16 +135,6 @@ class PicoThinkingFunctionCalling:
     
 
 
-def reward_func(tokenizer, samples, completions, *args, **kwargs) -> list[float]:
-    rewards = []
-    for sample, completion in zip(samples, completions):
-        reward = 0.0
-        thinking = completion.split(CLOSE_THINK)[0]
-        for tok in SPECIAL_TOKENS:
-            if tok in thinking:
-                reward += 0.2    
-        rewards.append(reward)
-    return rewards
 
 class ToolsSamplerServer(DataSamplerServer):
     
@@ -154,7 +144,7 @@ class ToolsSamplerServer(DataSamplerServer):
         self.buffer_fill()
         
     def process_sample(self, items):
-        TOOLS_CALL_TOKEN = "<tool_call>"
+        TOOLS_CALL_TOKEN = OPEN_FUNCTION_CALL
         prompts = [item[self.dataset_field] for item in items]
         sampling_params = SamplingParams(
             n=self.config.vllm_n,
@@ -238,8 +228,11 @@ class ToolsSamplerServer(DataSamplerServer):
         for x, y in finished_check.keys():
             finished_buffer[x][y] = finished_check[(x, y)]
             
+
+        completions = []
         for output in output_buffer:
             for o in output:
+                completions.append(o)
                 print("+"*100)
                 print(o)
                 print("-"*100)
@@ -250,15 +243,17 @@ class ToolsSamplerServer(DataSamplerServer):
             for output in outputs.outputs
         ]
         
-        completions = [self.tokenizer.decode(c) for c in completion_ids]
+        
 
         all_outputs = []
-        for g_idx, (item,completions) in enumerate(zip(items,completions)):
+        for g_idx, (item,g_completion) in enumerate(zip(items,output_buffer)):
             print(item)
             output = {}
             output["item"] = [item] * self.config.vllm_n
-            output["completions"] = completions
-            output["completion_ids"] = [self.tokenizer.encode(c) for c in completions]
+            output["completions"] = g_completion
+            if "text" in output["item"][0]:
+                output["completions"][0] = "<think>"+output["item"][0]["text"].split("<think>")[1]
+            output["completion_ids"] = [self.tokenizer.encode(c) for c in output["completions"]]
             output["stop_reason"] = stop_reason_buffer[g_idx]
             output["finish_reason"] = finished_buffer[g_idx]
             output["epoch"] = self._epoch
@@ -283,6 +278,24 @@ class ToolsSamplerServer(DataSamplerServer):
         return all_outputs
     
     
+def reward_func(tokenizer, samples, completions, *args, **kwargs) -> list[float]:
+    rewards = []
+    for sample, completion in zip(samples, completions):
+        reward = 0.0
+        if CLOSE_THINK in completion and completion.count(CLOSE_THINK) == 1:
+            thinking, response = completion.split(CLOSE_THINK)
+            for tok in SPECIAL_TOKENS:
+                if tok in thinking:
+                    reward += 0.3
+                if tok in response:
+                    reward -= 0.2
+                if "```" in response:
+                    reward -= 0.1
+        else:
+            reward = 0.0
+        rewards.append(reward)
+    return rewards
+
 def test_datasampler():
     # Load configuration
     config_path = Path(__file__).parent / "config.yaml"
