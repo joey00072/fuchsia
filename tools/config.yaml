@@ -1,11 +1,21 @@
 # Unified Configuration for JEE Training and Server
 
+# Generation configuration (shared parameters)
+generation: &generation
+  max_len: &max_len 2048
+  group_size: &group_size 8
+  temperature: &temperature 0.6
+  top_k: &top_k -1
+  top_p: &top_p 1.0
+  min_p: &min_p 0.0
+  batch_size: &generation_batch_size 4
+
 # Model configuration
 model:
   name: "NousResearch/DeepHermes-3-Llama-3-3B-Preview"
   revision: null
   dtype: "bfloat16"
-  max_model_len: 2048
+  max_model_len: *max_len
 
 # LoRA configuration
 lora:
@@ -16,15 +26,15 @@ lora:
 
 # GRPO training configuration
 grpo:
-  group_size: 8
+  group_size: *group_size
   micro_group_size: 1
   batch_size: 1
-  lr: 0.00003
+  lr: 0.000005
   weight_decay: 0.1
-  beta: 0.00
+  beta: 0.0
   epsilon: 0.2
   log_wandb: true
-  wandb_project: "fuchsia-jee"
+  wandb_project: "fuchsia-jee-deephermes"
   num_policy_updates: 8
   lora_path: "/mnt/nvme0n1/joey/experiments/lora_weights3"
 
@@ -32,23 +42,24 @@ grpo:
 server:
   host: "0.0.0.0"
   port: 8000
-  gpu_memory_utilization: 0.90
+  gpu_memory_utilization: 0.98
   tensor_parallel_size: 1
   enable_prefix_caching: false
-  buffer_size: 1
-  generation_batch_size: 4
-  quantization: bitsandbytes
+  buffer_size: 4
+  generation_batch_size: *generation_batch_size
+  quantization: null
   vllm:
-    max_tokens: 2048
-    n: 8
-    temperature: 0.6
-    top_p: 1.0
-    top_k: -1
-    min_p: 0.0
+    max_tokens: *max_len
+    n: *group_size
+    temperature: *temperature
+    top_p: *top_p
+    top_k: *top_k
+    min_p: *min_p
+    kv_quantization: true
 
 # Dataset configuration
 dataset:
-  name: "AthenaAgent42/jee_papers"
+  name: ""
   split: "train"
   max_samples: null
   field: "prompt"

@@ -22,6 +22,8 @@ wheels/
 
 .dev
 
+mock*
+notebook*
 # Virtual Environment
 venv/
 env/

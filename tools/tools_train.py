@@ -86,12 +86,16 @@ import requests
 
 class MockClient:
     def __init__(self):
-        self.buffer = []
+        with open("mock_dataset.jsonl", "r") as f:
+            self.buffer = [json.loads(line) for line in f]
+        self.iter = iter(self.buffer)
     
     def get_sample(self):
-        if not self.buffer:
-            return None
-        return self.buffer.pop(0)
+        try:
+            return next(self.iter)
+        except StopIteration:
+            self.iter = iter(self.buffer)
+            return next(self.iter)
     
     def update_model_params(self, model):
         pass
@@ -141,10 +145,12 @@ def main():
         model = get_peft_model(model, lora_config)
         print("[green]LoRA configured successfully[/green]")
 
+    model = model.to(torch.bfloat16)
 
     # Initialize VLLM client
     print("[blue]Initializing VLLM client...[/blue]")
     vllm_client = VLLMClient()
+    # vllm_client = MockClient()
     
     # Initialize dataset client
     print("[blue]Initializing dataset client...[/blue]")

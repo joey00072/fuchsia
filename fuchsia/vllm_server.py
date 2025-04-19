@@ -207,7 +207,9 @@ class ServerConfig:
     vllm_top_k: int = -1
     vllm_min_p: float = 0.0
     vllm_max_tokens: int = 1024
+    vllm_kv_quantization: bool = False
     generation_batch_size: int = 1
+       
 
     def __post_init__(self,**kwargs):
         # Allow for dynamic attribute setting from config files
@@ -261,6 +263,11 @@ class DataSamplerServer:
         self.config = config
         logger.info(config)
         self.stop = stop
+        
+        kwargs = {}
+        if config.vllm_kv_quantization:
+            kwargs["kv_cache_dtype"] = "fp8"
+            kwargs["calculate_kv_scales"] = True
 
         self.llm = LLM(
             model=config.model,
@@ -272,6 +279,7 @@ class DataSamplerServer:
             enable_prefix_caching=config.enable_prefix_caching,
             max_model_len=config.max_model_len,
             worker_cls="fuchsia.vllm_server.WeightSyncWorker",
+            **kwargs
         )
 
         # Data sampler specific initialization

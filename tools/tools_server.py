@@ -19,6 +19,7 @@ from rich import print
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["VLLM_ATTENTION_BACKEND"] = "XFORMERS"
 
 def load_config(config_path: str) -> dict:
     """Load configuration from YAML file."""
@@ -228,14 +229,14 @@ class ToolsSamplerServer(DataSamplerServer):
         for x, y in finished_check.keys():
             finished_buffer[x][y] = finished_check[(x, y)]
             
-
+        print(f"Total Time taken: {time.perf_counter() - start_time} seconds")
         completions = []
         for output in output_buffer:
             for o in output:
                 completions.append(o)
-                print("+"*100)
-                print(o)
-                print("-"*100)
+                # print("+"*100)
+                # print(o)
+                # print("-"*100)
 
         completion_ids = [
             list(output.token_ids)
@@ -250,6 +251,7 @@ class ToolsSamplerServer(DataSamplerServer):
             print(item)
             output = {}
             output["item"] = [item] * self.config.vllm_n
+            output["inputs"] = [item[self.dataset_field] for item in items]
             output["completions"] = g_completion
             if "text" in output["item"][0]:
                 output["completions"][0] = "<think>"+output["item"][0]["text"].split("<think>")[1]
@@ -257,13 +259,14 @@ class ToolsSamplerServer(DataSamplerServer):
             output["stop_reason"] = stop_reason_buffer[g_idx]
             output["finish_reason"] = finished_buffer[g_idx]
             output["epoch"] = self._epoch
-            # for idx in range(self.config.vllm_n):
+            
+            for idx in range(self.config.vllm_n):
             #     g_completion = completions[g_idx * self.config.vllm_n + idx]
             #     g_completion_id = completion_ids[g_idx * self.config.vllm_n + idx]
             #     g_stop_reason = stop_reason[g_idx * self.config.vllm_n + idx]
             #     g_finish_reason = finish_reason[g_idx * self.config.vllm_n + idx]
                 
-            #     output["inputs"] = item[self.dataset_field]
+                output["inputs"] = item[self.dataset_field]
             #     output["completions"].append(g_completion)
             #     output["completion_ids"].append(g_completion_id)
             #     output["stop_reason"].append(g_stop_reason)
@@ -329,9 +332,12 @@ def test_datasampler():
         vllm_top_k=config["server"]["vllm"]["top_k"],
         vllm_min_p=config["server"]["vllm"]["min_p"],
         vllm_max_tokens=config["server"]["vllm"]["max_tokens"],
-        vllm_repetition_penalty=config["server"]["vllm"].get("repetition_penalty", 1.0)
+        vllm_repetition_penalty=config["server"]["vllm"].get("repetition_penalty", 1.0),
+        vllm_kv_quantization=config["server"]["vllm"].get("kv_quantization", False),
+        
     )
     
+    print(server_config )
     # Create and start server
     print("[blue]Starting server...[/blue]")
     server = ToolsSamplerServer(
