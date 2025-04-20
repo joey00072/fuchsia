@@ -121,7 +121,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     print("[green]Model and tokenizer loaded successfully[/green]")
     
-    optimizer = torch.optim.Adafactor(
+    optimizer = torch.optim.AdamW(
         model.parameters(), 
         lr=float(config["grpo"]["lr"]), 
         weight_decay=float(config["grpo"]["weight_decay"])

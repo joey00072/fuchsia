@@ -100,7 +100,7 @@ class GRPO:
         self.optimizer = (
             optimizer
             if optimizer is not None
-            else torch.optim.AdamW(
+            else torch.optim.Adam(
                 self.model.parameters(), lr=config.lr, weight_decay=config.weight_decay
             )
         )
