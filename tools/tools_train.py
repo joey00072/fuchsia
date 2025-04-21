@@ -188,7 +188,8 @@ def main():
         config=grpo_config,
         vllm_client=vllm_client
     )
-
+    model.push_to_hub("joey00072/exp-tool-thinker02")
+    
     print("[blue]Starting training...[/blue]")
     grpo.train()
 

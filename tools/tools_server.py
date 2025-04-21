@@ -14,22 +14,14 @@ from vllm import LLM, SamplingParams
 from datasets import load_dataset
 from rich import print
 
-
-
+from picothinking_dataset import PicoThinkingFunctionCalling, load_config
+    
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["VLLM_ATTENTION_BACKEND"] = "XFORMERS"
 
-def load_config(config_path: str) -> dict:
-    """Load configuration from YAML file."""
-    try:
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
-        return config
-    except Exception as e:
-        print(f"[red]Failed to load config from {config_path}: {e}[/red]")
-        raise
+
 
 
 
@@ -52,88 +44,6 @@ SPECIAL_TOKENS = [
 ]
 
 
-prefix = """Online function calling is avalible while thinking.
-function call format:
-<function_call>
-<request>
-...
-</request>
-<response>
-...
-</response>
-</function_call>
-Available functions:
-
-"""
-
-
-
-
-class PicoThinkingFunctionCalling:
-    def __init__(self, tokenizer=None):
-        seed_dataset_name = "joey00072/pico_thinking_function_calling"
-        self.seed_dataset = load_dataset(seed_dataset_name)["train"]
-        def prepare(example):
-            prompt = prefix+example["schema"]+"\n\n"+example["question"]
-            example["tools"] = example["schema"]
-            if tokenizer is not None:
-                messages = [
-                            {
-                                "role": "system",
-                                "content": "You are a deep thinking AI, you may use extremely long chains of thought to deeply consider the problem and deliberate with yourself via systematic reasoning processes to help come to a correct solution prior to answering. You should enclose your thoughts and internal monologue inside <think> </think> tags, and then provide your solution or response to the problem."
-                            },
-                            {
-                                "role": "user",
-                                "content": prompt
-                            }
-                        ]
-                example["prompt"] = tokenizer.apply_chat_template(messages, tokenize=False)
-            return example
-        
-        self.seed_dataset = self.seed_dataset.map(prepare)
-        main_dataset_name = "Salesforce/xlam-function-calling-60k"
-        self.main_dataset = load_dataset(main_dataset_name)["train"]
-        def prepare(example):
-            prompt = prefix+example["tools"]+"\n\n"+example["query"]
-            if tokenizer is not None:
-                messages = [
-                            {
-                                "role": "system",
-                                "content": "You are a deep thinking AI, you may use extremely long chains of thought to deeply consider the problem and deliberate with yourself via systematic reasoning processes to help come to a correct solution prior to answering. You should enclose your thoughts and internal monologue inside <think> </think> tags, and then provide your solution or response to the problem."
-                            },
-                            {
-                                "role": "user",
-                                "content": prompt
-                            }
-                        ]
-                example["prompt"] = tokenizer.apply_chat_template(messages, tokenize=False)
-            return example
-        self.main_dataset = self.main_dataset.map(prepare)
-        
-        
-        self._seed_len = len(self.seed_dataset)
-        self._main_len = len(self.main_dataset)
-        
-    def __len__(self):
-        return self._seed_len + self._main_len
-    
-    def __iter__(self):
-        for item in self.seed_dataset:
-            yield item
-        for item in self.main_dataset:
-            yield item
-
-    def __getitem__(self, idx):
-        if idx < self._seed_len:
-            return self.seed_dataset[idx]
-        else:
-            return self.main_dataset[idx - self._seed_len]
-        
-    def shuffle(self, seed=42):
-        self.seed_dataset = self.seed_dataset.shuffle(seed=seed)
-        self.main_dataset = self.main_dataset.shuffle(seed=seed)
-        return self
-    
 
 
 
