@@ -43,7 +43,7 @@ server:
   gpu_memory_utilization: 0.50
   tensor_parallel_size: 1
   enable_prefix_caching: false
-  buffer_size: 4
+  buffer_size: *generation_batch_size
   generation_batch_size: *generation_batch_size
   quantization: null
   vllm:
@@ -56,7 +56,7 @@ server:
 
 # Dataset configuration
 dataset:
-  name: "AthenaAgent42/jee_papers"
+  name: "openai/gsm8k"
   split: "train"
   max_samples: null
   field: "text"
@@ -67,7 +67,7 @@ training:
   max_iterations: 1000
   save_steps: 100
   eval_steps: 50
-  output_dir: "jee_output" 
+  output_dir: "gsm8k_output" 
 
 
 # 8k 246.2914233800002

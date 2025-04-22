@@ -125,13 +125,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     print("[green]Model and tokenizer loaded successfully[/green]")
     
-    optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=float(config["grpo"]["lr"]), 
-        weight_decay=float(config["grpo"]["weight_decay"])
-    )
-
-    # Configure LoRA if enabled
+    # Configure LoRA if enabled BEFORE optimizer
     if config["lora"]["enabled"]:
         print("[blue]Configuring LoRA...[/blue]")
         lora_config = LoraConfig(
@@ -144,6 +138,13 @@ def main():
         )
         model = get_peft_model(model, lora_config)
         print("[green]LoRA configured successfully[/green]")
+
+    # Now create optimizer after LoRA is applied
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=float(config["grpo"]["lr"]),
+        weight_decay=float(config["grpo"]["weight_decay"])
+    )
 
     model = model.to(torch.bfloat16)
 

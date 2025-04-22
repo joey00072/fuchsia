@@ -45,7 +45,7 @@ server:
   gpu_memory_utilization: 0.98
   tensor_parallel_size: 1
   enable_prefix_caching: false
-  buffer_size: 4
+  buffer_size: *generation_batch_size
   generation_batch_size: *generation_batch_size
   quantization: null
   vllm:

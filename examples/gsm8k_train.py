@@ -189,23 +189,25 @@ def main():
         # Initialize model and tokenizer
         # print(f"[blue]Loading model: {config['model_name']}[/blue]")
         
-        model_name = "unsloth/Llama-3.2-3B-Instruct"
-        model = AutoModelForCausalLM.from_pretrained(model_name).to(
-            torch.bfloat16
-        )
+        model_name = config["model"]["name"]
+        model = AutoModelForCausalLM.from_pretrained(model_name).to(torch.bfloat16)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=float(config["grpo"]["lr"]), weight_decay=float(config["grpo"]["weight_decay"])
-        )
 
-        # Configure LoRA
+        # Configure and apply LoRA BEFORE optimizer
         lora_config = LoraConfig(
             r=config["lora"]["r"],
             lora_alpha=config["lora"]["alpha"],
             target_modules=config["lora"].get("target_modules", None),
         )
-        # model = get_peft_model(model, lora_config)
+        if config["lora"].get("enabled", True):
+            model = get_peft_model(model, lora_config)
+
+        # Now create optimizer after LoRA is applied
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=float(config["grpo"]["lr"]),
+            weight_decay=float(config["grpo"]["weight_decay"])
+        )
 
         model.gradient_checkpointing_enable()
 
