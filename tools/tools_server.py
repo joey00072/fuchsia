@@ -108,8 +108,22 @@ class ToolsSamplerServer(DataSamplerServer):
             inputs = []
             
             for key, value in unfinished.items():
+                b_indx, g_indx = key
                 prompt, text = value
-                unfinished[key] = (prompt, text+TOOLS_CALL_TOKEN)
+                if CLOSE_THINK not in text and OPEN_FUNCTION_CALL not in text: 
+                    patch = ( 
+                             OPEN_FUNCTION_CALL
+                             +OPEN_REQUEST
+                             +items[b_indx]["request"]
+                             +CLOSE_REQUEST
+                            +OPEN_RESPONSE
+                            +items[b_indx]["response"]
+                            +CLOSE_RESPONSE
+                            +CLOSE_FUNCTION_CALL
+                            )
+                else:
+                    patch = OPEN_FUNCTION_CALL
+                unfinished[key] = (prompt, text+patch)
             
             for key, value in unfinished.items():
                 prompt, text = value
@@ -242,7 +256,7 @@ def test_datasampler():
         vllm_top_k=config["server"]["vllm"]["top_k"],
         vllm_min_p=config["server"]["vllm"]["min_p"],
         vllm_max_tokens=config["server"]["vllm"]["max_tokens"],
-        vllm_repetition_penalty=config["server"]["vllm"].get("repetition_penalty", 1.0),
+        vllm_repetition_penalty=config["server"]["vllm"].get("repetition_penalty", 0.9),
         vllm_kv_quantization=config["server"]["vllm"].get("kv_quantization", False),
         
     )

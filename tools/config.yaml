@@ -3,12 +3,12 @@
 # Generation configuration (shared parameters)
 generation: &generation
   max_len: &max_len 2048
-  group_size: &group_size 8
+  group_size: &group_size 16
   temperature: &temperature 0.6
   top_k: &top_k -1
   top_p: &top_p 1.0
   min_p: &min_p 0.0
-  batch_size: &generation_batch_size 4
+  batch_size: &generation_batch_size 2
 
 # Model configuration
 model:
@@ -45,7 +45,7 @@ server:
   gpu_memory_utilization: 0.98
   tensor_parallel_size: 1
   enable_prefix_caching: false
-  buffer_size: 4
+  buffer_size: 1000
   generation_batch_size: *generation_batch_size
   quantization: null
   vllm:

@@ -87,7 +87,7 @@ class PicoThinkingFunctionCalling:
 
     def __iter__(self) -> Iterator[dict]:
         """Iterate over all examples in both datasets."""
-        # yield from self.seed_dataset
+        yield from self.seed_dataset
         yield from self.main_dataset
 
     def __getitem__(self, idx: int) -> dict:
