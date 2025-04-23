@@ -103,11 +103,11 @@ class ToolsSamplerServer(DataSamplerServer):
                 stop_reason_check[(sidx, gidx)] = output.stop_reason
                 finished_check[(sidx, gidx)] = output.finish_reason
         
-        idx = 0
+        call_idx = 0
         while not finished:
             finished = True
             inputs = []
-            if idx > 10:
+            if call_idx > 10:
                 break
             
             for key, value in unfinished.items():
