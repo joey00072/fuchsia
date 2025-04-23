@@ -102,10 +102,13 @@ class ToolsSamplerServer(DataSamplerServer):
                     output_buffer[sidx][gidx]+=output.text
                 stop_reason_check[(sidx, gidx)] = output.stop_reason
                 finished_check[(sidx, gidx)] = output.finish_reason
-                
+        
+        idx = 0
         while not finished:
             finished = True
             inputs = []
+            if idx > 10:
+                break
             
             for key, value in unfinished.items():
                 b_indx, g_indx = key
@@ -209,17 +212,25 @@ def reward_func(tokenizer, samples, completions, *args, **kwargs) -> list[float]
     rewards = []
     for sample, completion in zip(samples, completions):
         reward = 0.0
+        if completion.strip().startswith(OPEN_THINK):
+            reward += 0.3
+            if completion.count(OPEN_THINK)==1:
+                reward += 0.2
+
         if CLOSE_THINK in completion and completion.count(CLOSE_THINK) == 1:
             thinking, response = completion.split(CLOSE_THINK)
+            tokens_in_think = []
             for tok in SPECIAL_TOKENS:
                 if tok in thinking:
                     reward += 0.3
+                    tokens_in_think.append(tok)
                 if tok in response:
                     reward -= 0.2
-                if "```" in response:
-                    reward -= 0.1
+            
+            if all(tok in tokens_in_think for tok in SPECIAL_TOKENS) and len(tokens_in_think) == len(SPECIAL_TOKENS):
+                reward += 0.3
         else:
-            reward = 0.0
+            reward -= 0.0
         rewards.append(reward)
     return rewards
 

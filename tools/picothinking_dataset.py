@@ -39,7 +39,7 @@ class PicoThinkingFunctionCalling:
     def __init__(
         self,
         tokenizer: Optional[Any] = None,
-        seed_dataset_name: str = "joey00072/pico_thinking_function_calling",
+        seed_dataset_name: str = "joey00072/seeder_pico_thinking_function_calling",
         main_dataset_name: str = "joey00072/exp-tool-calls-multiturn",
     ):
         self.tokenizer = tokenizer
