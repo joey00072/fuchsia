@@ -107,6 +107,7 @@ class ToolsSamplerServer(DataSamplerServer):
         while not finished:
             finished = True
             inputs = []
+            call_idx += 1
             if call_idx > 10:
                 break
             
