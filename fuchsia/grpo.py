@@ -50,6 +50,10 @@ class GRPOConfig:
     # Logging and saving
     log_level: str = "INFO"
     save_every: int = 25
+
+
+    async_buffer_fill: bool = True
+    
     # Device
     device: Optional[str] = None  # If None, auto-detect
 
@@ -125,6 +129,7 @@ class GRPO:
         self.using_lora = config.using_lora
         self.lora_path = config.lora_path
         self.ignore_imcomplete_samples = config.ignore_imcomplete_samples
+        self.async_buffer_fill = config.async_buffer_fill
         
         if not config.use_vllm and self.ignore_imcomplete_samples:
             self.logger.warning("ignore_imcomplete_samples is set to True, but use_vllm is set to False. This will not have any effect.")
@@ -478,7 +483,8 @@ class GRPO:
 
             if idx % self.num_policy_updates == 0 and self.distributed:
                 self.vllm_client.update_model_params(self.model,lora=self.using_lora)
-                # self.vllm_client.empty_buffer()
+                if not self.async_buffer_fill:
+                    self.vllm_client.empty_buffer()
                 self.vllm_client.fill_buffer()
             
             

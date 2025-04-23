@@ -2,7 +2,7 @@
 
 # Generation configuration (shared parameters)
 generation: &generation
-  max_len: &max_len 2048
+  max_len: &max_len 4096
   group_size: &group_size 8
   temperature: &temperature 0.6
   top_k: &top_k -1
@@ -31,12 +31,12 @@ grpo:
   batch_size: 1
   lr: 0.00005
   weight_decay: 0.1
-  beta: 0.0
+  beta: 0.04
   epsilon: 0.2
   log_wandb: true
   wandb_project: "fuchsia-tool-thinker"
   num_policy_updates: 8
-  lora_path: "/mnt/nvme0n1/joey/experiments/lora_weights3"
+  lora_path: "tool_thinker/lora_weights"
 
 # Server configuration
 server:
