@@ -113,16 +113,20 @@ def prepare_dataset(dataset, tokenizer=tokenizer) -> Dataset:
                 return None
             answer = text.split("####")[1].strip()
             # Validate that the answer is a number
+            answer = answer.replace(",", "").strip()
             answer = float(answer)
             return answer
         except (ValueError, IndexError):
             return None
 
     def process_example(example: dict) -> Optional[dict]:
+        # print(f"{example=}")
         try:
             answer = extract_hash_answer(example["answer"])
             example["correct_answer"] = answer
             if answer is None:
+                print("FUCKKKKKKKKK.")
+                print(f"{example['answer']=}")
                 return None
             example["text"] = tokenizer.apply_chat_template(
                 [
@@ -178,9 +182,12 @@ def test_datasampler():
         quantization=config['server']['quantization'],
     )
     
-    dataset = load_dataset(config['dataset']['name'], config['dataset']['split'])
-    if config['dataset']['max_samples']:
-        dataset = dataset.select(range(min(config['dataset']['max_samples'], len(dataset))))
+    dataset = load_dataset(config['dataset']['name'], config['dataset']['split'])["train"]
+    print(dataset)
+    # if config['dataset']['max_samples']:
+    #     dataset = dataset.select(range(min(config['dataset']['max_samples'], len(dataset))))
+
+    
     dataset = prepare_dataset(dataset)
     
     server = DataSamplerServer(server_config, dataset, [reward_function_1])

@@ -6,7 +6,7 @@ generation: &generation
   top_k: &top_k -1
   top_p: &top_p 1.0
   min_p: &min_p 0.0
-  batch_size: &generation_batch_size 4
+  batch_size: &generation_batch_size 8
 
 # Model configuration
 model:
@@ -25,15 +25,15 @@ lora:
 # GRPO training configuration
 grpo:
   group_size: *group_size
-  micro_group_size: 1
-  batch_size: 1
+  micro_group_size: 8
+  batch_size: 8
   lr: 0.000005
   weight_decay: 0.1
   beta: 0.0
   epsilon: 0.2
   log_wandb: true
   wandb_project: "fuchsia-jee-deephermes"
-  num_policy_updates: 8
+  num_policy_updates: 1
   lora_path: "/mnt/nvme0n1/joey/experiments/lora_weights3"
 
 # Server configuration
@@ -56,8 +56,8 @@ server:
 
 # Dataset configuration
 dataset:
-  name: "openai/gsm8k"
-  split: "train"
+  name: "gsm8k"
+  split: "main"
   max_samples: null
   field: "text"
 
