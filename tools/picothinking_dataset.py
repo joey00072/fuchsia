@@ -18,18 +18,19 @@ def load_config(config_path: str) -> dict:
     except Exception as e:
         print(f"[red]Failed to load config from {config_path}: {e}[/red]")
         raise
+
+# SYSTEM_PROMPT = (
+
     
+# )
     
 PREFIX = (
     "Online function calling is available while thinking.\n"
-    "function call format:\n<function_call>\n<request>\n...\n</request>\n<response>\n...\n</response>\n</function_call>\nAvailable functions:\n\n"
-)
-SYSTEM_PROMPT = (
-    "You are a deep thinking AI, you may use extremely long chains of thought "
-    "to deeply consider the problem and deliberate with yourself via systematic reasoning "
-    "processes to help come to a correct solution prior to answering. You should enclose your thoughts "
-    "and internal monologue inside <think> </think> tags, and then provide your solution or response to the problem."
-)
+    "use <think> to think about problem and <function_call> to call a function if needed </think> finally give answer"
+    "function call format:\n<function_call>\n<request>\n...\n</request>\n<response>\n...\n</response>\n</function_call>"
+    "only use function call inside <think> and </think> tags"
+    "Available functions:\n\n"
+    )
 
 class PicoThinkingFunctionCalling:
     """
@@ -60,7 +61,7 @@ class PicoThinkingFunctionCalling:
             assert tokenizer is not None, "must provide tokenizer"
             if tokenizer is not None:
                 messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    # {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": prompt}
                 ]
                 example["prompt"] = tokenizer.apply_chat_template(messages, tokenize=False)
@@ -70,7 +71,7 @@ class PicoThinkingFunctionCalling:
             prompt = PREFIX + example["schema"] + "\n\n" + example["question"]
             if tokenizer is not None:
                 messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    # {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": prompt}
                 ]
                 example["prompt"] = tokenizer.apply_chat_template(messages, tokenize=False)
@@ -88,7 +89,13 @@ class PicoThinkingFunctionCalling:
     def __iter__(self) -> Iterator[dict]:
         """Iterate over all examples in both datasets."""
         yield from self.seed_dataset
-        yield from self.main_dataset
+        # yield from self.main_dataset
+        
+        # for idx,item in enumerate(self.main_dataset):
+        #     if idx%16 == 0:
+        #         for s in self.seed_dataset:
+        #             yield s
+        #     yield item
 
     def __getitem__(self, idx: int) -> dict:
         """Get an item by global index."""

@@ -78,16 +78,7 @@ class ToolsSamplerServer(DataSamplerServer):
         print(f"Time taken: {end_time - start_time} seconds")
 
 
-        sampling_params = SamplingParams(
-            n=1,
-            repetition_penalty=self.config.vllm_repetition_penalty,
-            temperature=self.config.vllm_temperature,
-            top_p=self.config.vllm_top_p,
-            top_k=self.config.vllm_top_k,
-            min_p=self.config.vllm_min_p,
-            max_tokens=self.config.vllm_max_tokens,
-            stop=[TOOLS_CALL_TOKEN]
-        )
+
         finished = True
         unfinished = {}
         stop_reason_check = {}
@@ -95,35 +86,60 @@ class ToolsSamplerServer(DataSamplerServer):
         
         for sidx, (prompt, outputs) in enumerate(zip(prompts, vllm_outputs)):
             for gidx, output in enumerate(outputs.outputs):
+                text = output.text
+                if not text.strip().startswith(OPEN_THINK):
+                    text = "\n" + OPEN_THINK + "\n" + text
+                    
                 if output.stop_reason == TOOLS_CALL_TOKEN:
                     finished = False
-                    unfinished[(sidx, gidx)] = (prompt, output.text)
+                    unfinished[(sidx, gidx)] = (prompt, text)
                 else:
-                    output_buffer[sidx][gidx]+=output.text
+                    output_buffer[sidx][gidx]+=text
                 stop_reason_check[(sidx, gidx)] = output.stop_reason
                 finished_check[(sidx, gidx)] = output.finish_reason
         
         call_idx = 0
-        while not finished:
+        max_calls = 5  
+        stop = [CLOSE_FUNCTION_CALL]
+        while not finished and call_idx < max_calls:
             finished = True
             inputs = []
             call_idx += 1
-            if call_idx > 10:
-                break
-            
+            if call_idx-1 == max_calls-1:
+                stop = None
+            sampling_params = SamplingParams(
+                                            n=1,
+                                            repetition_penalty=self.config.vllm_repetition_penalty,
+                                            temperature=self.config.vllm_temperature,
+                                            top_p=self.config.vllm_top_p,
+                                            top_k=self.config.vllm_top_k,
+                                            min_p=self.config.vllm_min_p,
+                                            max_tokens=self.config.vllm_max_tokens,
+                                            stop=stop
+                                        )
+                                            
             for key, value in unfinished.items():
                 b_indx, g_indx = key
                 prompt, text = value
                 if CLOSE_THINK not in text and OPEN_FUNCTION_CALL not in text: 
-                    patch = ( 
-                             OPEN_FUNCTION_CALL
+                    patch = (
+                             "\n" 
+                             +OPEN_FUNCTION_CALL
+                             + "\n" 
                              +OPEN_REQUEST
+                             + "\n" 
                              +items[b_indx]["request"]
+                             + "\n" 
                              +CLOSE_REQUEST
-                            +OPEN_RESPONSE
-                            +items[b_indx]["response"]
-                            +CLOSE_RESPONSE
-                            +CLOSE_FUNCTION_CALL
+                             + "\n" 
+                             +OPEN_RESPONSE
+                             + "\n" 
+                             +items[b_indx]["response"]
+                             + "\n" 
+                             +CLOSE_RESPONSE
+                             + "\n" 
+                             +CLOSE_FUNCTION_CALL
+                             + "\n" 
                             )
                 else:
                     patch = OPEN_FUNCTION_CALL
@@ -213,6 +229,8 @@ def reward_func(tokenizer, samples, completions, *args, **kwargs) -> list[float]
     rewards = []
     for sample, completion in zip(samples, completions):
         reward = 0.0
+        if completion.count(CLOSE_THINK) == 1:
+            reward += 0.3
         if completion.strip().startswith(OPEN_THINK):
             reward += 0.3
             if completion.count(OPEN_THINK)==1:
@@ -223,15 +241,34 @@ def reward_func(tokenizer, samples, completions, *args, **kwargs) -> list[float]
             tokens_in_think = []
             for tok in SPECIAL_TOKENS:
                 if tok in thinking:
-                    reward += 0.3
+                    reward += 0.5
                     tokens_in_think.append(tok)
                 if tok in response:
                     reward -= 0.2
+                if tok not in response:
+                    reward += 0.2
+                    
+            chunk  = thinking.split(CLOSE_FUNCTION_CALL)
+            if len(chunk) > 1 and len(chunk[1].strip()) > 0:
+                reward += 0.3
+                
+            chunk = response.split(OPEN_FUNCTION_CALL)
+            if len(chunk) > 1 and len(chunk[1].strip()) > 0:
+                reward += 0.3
             
+            if "```" in response:
+                reward -= 0.2
+            if '<' in response:
+                reward -= 0.1
+            if ">" in response:
+                reward -= 0.1
+                
             if all(tok in tokens_in_think for tok in SPECIAL_TOKENS) and len(tokens_in_think) == len(SPECIAL_TOKENS):
                 reward += 0.3
+        elif OPEN_THINK in completion and OPEN_FUNCTION_CALL in completion:
+            reward += 0.3
         else:
-            reward -= 0.0
+            reward -= 4
         rewards.append(reward)
     return rewards
 
