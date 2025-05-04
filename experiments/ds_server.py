@@ -10,7 +10,7 @@ import yaml
 from pathlib import Path
 import regex
 import os
-
+import random
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -35,28 +35,60 @@ def initialize_model(config):
 prefix = "give correct option/answer boxed\nQuestion:"
 
 def format_prompt(row):
-    prompt = prefix + row["question"]
-    if row["Type"] == "MCQ":
-        options = json.loads(row["options"])
-        for option in options:
-            prompt += f"\n{option['identifier']}. {option['content']}"
+    prompt = prefix + row["Prompt"]
+    # if row["Type"] == "MCQ":
+    #     options = json.loads(row["options"])
+    #     for option in options:
+    #         prompt += f"\n{option['identifier']}. {option['content']}"
 
+    STAG = "<xxx>"
+            
     message = [
-        {
-        "role": "system",
-        "content": "You are a deep thinking AI, you may use extremely long chains of thought to deeply consider the problem and deliberate with yourself via systematic reasoning processes to help come to a correct solution prior to answering. You should enclose your thoughts and internal monologue inside <think> </think> tags, and then provide your solution or response to the problem."
-        },
-        {"role": "user", "content": prompt}
+        # {
+        # "role": "system",
+        # "content": "You are a deep thinking AI, you may use extremely long chains of thought to deeply consider the problem and deliberate with yourself via systematic reasoning processes to help come to a correct solution prior to answering. You should enclose your thoughts and internal monologue inside <think> </think> tags, and then provide your solution or response to the problem."
+        # },
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": STAG}
         ]
-    row["text"] = tokenizer.apply_chat_template(message, tokenize=False)
-    if "MCQ" in row["Type"]:
-        option = row["correct_option"]
-        answer = {"1":"A","2":"B","3":"C","4":"D"}[option]
-    else:
-        answer = row["correct_answer"]
+    row["text"] = tokenizer.apply_chat_template(message, tokenize=False).split(STAG)[0]
+    # if "MCQ" in row["Type"]:
+    #     option = row["correct_option"]
+    #     answer = {"1":"A","2":"B","3":"C","4":"D"}[option]
+    # else:
+    #     answer = row["correct_answer"]
     
-    row["answer"] = answer
+    # row["answer"] = answer
     return row
+
+
+def clean_tags(text):
+    """Remove all XML-like tags while preserving content structure."""
+    # Remove </think> tags
+    cleaned = re.sub(r'<\/think>', '', text)
+    
+    # Replace question tags with nothing but preserve content
+    cleaned = re.sub(r'<question>([\s\S]*?)<\/question>', r'\1', cleaned)
+    
+    # Replace options tags but preserve content
+    cleaned = re.sub(r'<options>([\s\S]*?)<\/options>', r'\1', cleaned)
+    
+    # Remove any remaining tags
+    cleaned = re.sub(r'<\/?[^>]+(>|$)', '', cleaned)
+    
+    return cleaned.strip()
+
+def clean_dataset(dataset):
+    """Clean all questions in the dataset."""
+    
+    def clean_example(example):
+        example['cleaned_question'] = clean_tags(example['formatted_question'])
+        return example
+    cleaned_dataset = {}
+    for split in dataset:
+        cleaned_dataset[split] = dataset[split].map(clean_example)
+    
+    return cleaned_dataset
 
 def find_boxes(text):
     pattern = r"boxed\{((?:[^{}]+|(?R))*)\}"
@@ -69,10 +101,8 @@ def find_boxes(text):
 def reward_func(tokenizer, samples, completions, *args, **kwargs) -> list[float]:
     rewards = []
     for sample, completion in zip(samples, completions):
-        reward = 0.0
+        reward = 0.0 + random.random()
         boxes = find_boxes(completion)
-        if "boxed{" in completion:
-            reward += 0.001
         if not boxes:
             rewards.append(reward)
             continue
@@ -85,7 +115,7 @@ def reward_func(tokenizer, samples, completions, *args, **kwargs) -> list[float]
         rewards.append(reward)
     max_completion_len = max(len(completion) for completion in completions)
     for idx,(reward,completion) in enumerate(zip(rewards,completions)):
-        rewards[idx] = reward + (1 - (len(completion) / max_completion_len)) *0.1
+        rewards[idx] = reward 
     return rewards
 
 def test_datasampler():
@@ -101,10 +131,24 @@ def test_datasampler():
     print("[blue]Loading dataset...[/blue]")
     dataset = load_dataset(config["dataset"]["name"], split=config["dataset"]["split"])
     print(f"[green]Loaded dataset with {len(dataset)} examples[/green]")
-    
+     
     # Format prompts and filter
     print("[blue]Formatting prompts...[/blue]")
     dataset = dataset.map(format_prompt)
+
+    
+    def wrapper():
+        count = 0
+        def filter_func(x):
+            nonlocal count
+            count += 1
+            if count > 50:
+                return False
+            return True
+        return filter_func
+    
+    dataset = dataset.filter(wrapper())
+    
     # dataset = dataset.filter(lambda x: int(x["pass_rate"]) <= 12)
     print(f"[green]Filtered dataset to {len(dataset)} examples[/green]")
     
