@@ -31,6 +31,92 @@ from pathlib import Path
 from typing import Optional
 
 
+def get_default_config_dict() -> dict:
+    """
+    Returns the default configuration dictionary for Fuchsia.
+
+    This dictionary includes settings for generation, model, LoRA, GRPO training,
+    server, dataset, and training parameters. Shared values are defined as common
+    Python objects to enable YAML anchor/alias generation if dumped.
+    """
+    # Define shared values as common Python objects to enable YAML anchors/aliases
+    max_len_val = 512
+    group_size_val = 8
+    temperature_val = 0.6
+    top_k_val = -1
+    top_p_val = 1.0
+    min_p_val = 0.0
+    generation_batch_size_val = 4
+
+    return {
+        "generation": {
+            "max_len": max_len_val,
+            "group_size": group_size_val,
+            "temperature": temperature_val,
+            "top_k": top_k_val,
+            "top_p": top_p_val,
+            "min_p": min_p_val,
+            "batch_size": generation_batch_size_val
+        },
+        "model": {
+            "name": "joey00072/Llama-3.2-1B-Instruct-cold-start-ft2",
+            "revision": None,
+            "dtype": "bfloat16",
+            "max_model_len": max_len_val  # Reference to shared object
+        },
+        "lora": {
+            "enabled": True,
+            "r": 8,
+            "alpha": 16,
+            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
+        },
+        "grpo": {
+            "group_size": group_size_val,  # Reference to shared object
+            "micro_group_size": 1,
+            "batch_size": 1,
+            "lr": 0.000005,
+            "weight_decay": 0.1,
+            "beta": 0.0,
+            "epsilon": 0.2,
+            "log_wandb": True,
+            "wandb_project": "fuchsia-jee-deephermes",
+            "num_policy_updates": 8,
+            "lora_path": "/mnt/nvme0n1/joey/experiments/lora_weights3"
+        },
+        "server": {
+            "host": "0.0.0.0",
+            "port": 8000,
+            "gpu_memory_utilization": 0.50,
+            "tensor_parallel_size": 1,
+            "enable_prefix_caching": False,
+            "buffer_size": 4,
+            "generation_batch_size": generation_batch_size_val,  # Reference to shared object
+            "quantization": None,
+            "vllm": {
+                "max_tokens": max_len_val,       # Reference
+                "n": group_size_val,            # Reference
+                "temperature": temperature_val, # Reference
+                "top_p": top_p_val,             # Reference
+                "top_k": top_k_val,             # Reference
+                "min_p": min_p_val              # Reference
+            }
+        },
+        "dataset": {
+            "name": "AthenaAgent42/jee_papers",
+            "split": "train",
+            "max_samples": None,
+            "field": "text"
+        },
+        "training": {
+            "max_epochs": 1,
+            "max_iterations": 1000,
+            "save_steps": 100,
+            "eval_steps": 50,
+            "output_dir": "jee_output"
+        }
+    }
+
+
 def create_default_config(output_path: str = "config.yaml") -> None:
     """
     Create a default configuration file with predefined values.
@@ -52,164 +138,29 @@ def create_default_config(output_path: str = "config.yaml") -> None:
         - Dataset configuration
         - Training parameters
     """
-    # Create a custom YAML dumper that preserves anchors
+    # Create a custom YAML dumper.
+    # Note: This AnchorDumper's anchor_node method is not automatically used by yaml.dump
+    # in a way that replicates the original hand-crafted YAML's specific anchor names
+    # or comments. PyYAML will generate its own anchors if objects are reused.
+    # Comments and specific anchor names like '&generation:' from the original yaml_doc
+    # will be lost.
     class AnchorDumper(yaml.SafeDumper):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            self.anchors = {}
+            # The self.anchors dictionary here was likely for a custom representer setup,
+            # which is not fully implemented for this use case.
+            # We'll leave the class structure as is, but it won't replicate original comments/anchor names.
 
-        def anchor_node(self, node):
-            if node in self.anchors:
-                return self.anchors[node]
-            anchor = f"anchor_{len(self.anchors)}"
-            self.anchors[node] = anchor
-            return anchor
+    default_config = get_default_config_dict()
 
-    # Define the config with anchors
-    default_config = {
-        "generation": {
-            "max_len": 512,
-            "group_size": 8,
-            "temperature": 0.6,
-            "top_k": -1,
-            "top_p": 1.0,
-            "min_p": 0.0,
-            "batch_size": 4
-        },
-        "model": {
-            "name": "joey00072/Llama-3.2-1B-Instruct-cold-start-ft2",
-            "revision": None,
-            "dtype": "bfloat16",
-            "max_model_len": 512
-        },
-        "lora": {
-            "enabled": True,
-            "r": 8,
-            "alpha": 16,
-            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
-        },
-        "grpo": {
-            "group_size": 8,
-            "micro_group_size": 1,
-            "batch_size": 1,
-            "lr": 0.000005,
-            "weight_decay": 0.1,
-            "beta": 0.0,
-            "epsilon": 0.2,
-            "log_wandb": True,
-            "wandb_project": "fuchsia-jee-deephermes",
-            "num_policy_updates": 8,
-            "lora_path": "/mnt/nvme0n1/joey/experiments/lora_weights3"
-        },
-        "server": {
-            "host": "0.0.0.0",
-            "port": 8000,
-            "gpu_memory_utilization": 0.50,
-            "tensor_parallel_size": 1,
-            "enable_prefix_caching": False,
-            "buffer_size": 4,
-            "generation_batch_size": 4,
-            "quantization": None,
-            "vllm": {
-                "max_tokens": 512,
-                "n": 8,
-                "temperature": 0.6,
-                "top_p": 1.0,
-                "top_k": -1,
-                "min_p": 0.0
-            }
-        },
-        "dataset": {
-            "name": "AthenaAgent42/jee_papers",
-            "split": "train",
-            "max_samples": None,
-            "field": "text"
-        },
-        "training": {
-            "max_epochs": 1,
-            "max_iterations": 1000,
-            "save_steps": 100,
-            "eval_steps": 50,
-            "output_dir": "jee_output"
-        }
-    }
-
-    # Create a YAML document with anchors
-    yaml_doc = """# Generation configuration (shared parameters)
-generation: &generation
-  max_len: &max_len 512
-  group_size: &group_size 8
-  temperature: &temperature 0.6
-  top_k: &top_k -1
-  top_p: &top_p 1.0
-  min_p: &min_p 0.0
-  batch_size: &generation_batch_size 4
-
-# Model configuration
-model:
-  name: "joey00072/Llama-3.2-1B-Instruct-cold-start-ft2"
-  revision: null
-  dtype: "bfloat16"
-  max_model_len: *max_len
-
-# LoRA configuration
-lora:
-  enabled: true
-  r: 8
-  alpha: 16
-  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
-
-# GRPO training configuration
-grpo:
-  group_size: *group_size
-  micro_group_size: 1
-  batch_size: 1
-  lr: 0.000005
-  weight_decay: 0.1
-  beta: 0.0
-  epsilon: 0.2
-  log_wandb: true
-  wandb_project: "fuchsia-jee-deephermes"
-  num_policy_updates: 8
-  lora_path: "/mnt/nvme0n1/joey/experiments/lora_weights3"
-
-# Server configuration
-server:
-  host: "0.0.0.0"
-  port: 8000
-  gpu_memory_utilization: 0.50
-  tensor_parallel_size: 1
-  enable_prefix_caching: false
-  buffer_size: 4
-  generation_batch_size: *generation_batch_size
-  quantization: null
-  vllm:
-    max_tokens: *max_len
-    n: *group_size
-    temperature: *temperature
-    top_p: *top_p
-    top_k: *top_k
-    min_p: *min_p
-
-# Dataset configuration
-dataset:
-  name: "AthenaAgent42/jee_papers"
-  split: "train"
-  max_samples: null
-  field: "text"
-
-# Training configuration
-training:
-  max_epochs: 1
-  max_iterations: 1000
-  save_steps: 100
-  eval_steps: 50
-  output_dir: "jee_output"
-"""
-
-    # Write the YAML document to file
+    # Write the config dictionary to file using yaml.dump
+    # Using sort_keys=False to preserve insertion order as much as possible.
+    # The AnchorDumper class is passed, but standard object reuse in default_config
+    # is what will trigger anchor/alias creation by PyYAML.
+    # Comments and specific anchor names from the original yaml_doc cannot be
+    # easily replicated with this approach.
     with open(output_path, "w") as f:
-        f.write(yaml_doc)
+        yaml.dump(default_config, f, Dumper=AnchorDumper, sort_keys=False, indent=2, default_flow_style=None)
 
     print(f"Created default config file at {output_path}")
 
