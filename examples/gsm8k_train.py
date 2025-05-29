@@ -1,28 +1,29 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import Dataset, load_dataset
-from peft import LoraConfig, get_peft_model
-import torch
-from rich import print
+import os
 import math
-import yaml
 from pathlib import Path
 from typing import Optional, Dict, Any
-from fuchsia.grpo import GRPO, GRPOConfig
+
+import torch
+import yaml
+from rich import print
+from datasets import Dataset, load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model
+
+from fuchsia.grpo import GRPO
+from fuchsia.grpo_config import GRPOConfig
 from fuchsia.dist_dataset import DatasetClient
 from fuchsia.vllm_client import VLLMClient
+# from fuchsia.cpu_offloding import apply_unsloth_offloaded_gradient_checkpoint_monkey_patch
 
-
-import os
-
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-
+# os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# apply_unsloth_offloaded_gradient_checkpoint_monkey_patch()
 
 SYSTEM_PROMPT = "Respond in following format:<thinking>{step by step reasoning}</thinking><answer>{number}</answer>"
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
-    """Load configuration from YAML file."""
     try:
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
@@ -79,20 +80,19 @@ def prepare_dataset(dataset) -> Dataset:
 
 
 def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
-    """Improved reward function with better validation and scoring."""
-    END_OF_TEXT_TOKEN = "<|eot_id|>"
-    START_HEADER_TOKEN = "<|start_header_id|>"
-    END_HEADER_TOKEN = "<|end_header_id|>"
-    ASSISTANT_TOKEN = "assistant"
-    USER_TOKEN = "user"
+    
+    END_OF_TEXT_TOKEN     =  "<|eot_id|>"
+    START_HEADER_TOKEN    =  "<|start_header_id|>"
+    END_HEADER_TOKEN      =  "<|end_header_id|>"
+    ASSISTANT_TOKEN       =  "assistant"
+    USER_TOKEN            =  "user"
 
-    START_THINKING_TOKEN = "<thinking>"
-    END_THINKING_TOKEN = "</thinking>"
-    START_ANSWER_TOKEN = "<answer>"
-    END_ANSWER_TOKEN = "</answer>"
+    START_THINKING_TOKEN  =  "<thinking>"
+    END_THINKING_TOKEN    =  "</thinking>"
+    START_ANSWER_TOKEN    =  "<answer>"
+    END_ANSWER_TOKEN      =  "</answer>"
 
     try:
-        # Extract the actual response
         try:
             s = s.split(
                 f"{END_OF_TEXT_TOKEN}{START_HEADER_TOKEN}{ASSISTANT_TOKEN}{END_HEADER_TOKEN}"
@@ -103,12 +103,10 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
         if END_OF_TEXT_TOKEN in s:
             s = s.split(END_OF_TEXT_TOKEN)[0]
 
-        # Initialize reward components
         format_reward = 0.0
         content_reward = 0.0
         correct_template = 0
 
-        # Check format tags
         required_tags = [
             START_THINKING_TOKEN,
             END_THINKING_TOKEN,
@@ -121,7 +119,6 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
                 if s.count(tag) > 1:
                     format_reward -= s.count(tag) * 0.01
 
-        # Validate thinking section
         if s.count("<thinking>") == 1:
             format_reward += 0.5
             thinking_content = (
@@ -132,7 +129,6 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
         else:
             format_reward -= 0.1
 
-        # Validate answer section
         if "<answer>" in s and "</answer>" in s:
             format_reward += 0.4
             answer_content = (
@@ -147,7 +143,6 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
             except ValueError:
                 content_reward -= 0.1
 
-        # Bonus for perfect format
         if correct_template == 1:
             format_reward += 2.0
 
@@ -182,18 +177,19 @@ class MockClient:
 
 def main():
     try:
-        # Load configuration
+        
+        print("CUDA AVAILABLE:", torch.cuda.is_available())
         config_path = Path(__file__).parent / "gsm8k_config.yaml"
         config = load_config(str(config_path))
 
-        # Initialize model and tokenizer
-        # print(f"[blue]Loading model: {config['model_name']}[/blue]")
-        
         model_name = config["model"]["name"]
-        model = AutoModelForCausalLM.from_pretrained(model_name).to(torch.bfloat16)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="cuda",
+            load_in_4bit=True,
+        )
         tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-        # Configure and apply LoRA BEFORE optimizer
         lora_config = LoraConfig(
             r=config["lora"]["r"],
             lora_alpha=config["lora"]["alpha"],
@@ -201,8 +197,8 @@ def main():
         )
         if config["lora"].get("enabled", True):
             model = get_peft_model(model, lora_config)
+            model.gradient_checkpointing_enable()
 
-        # Now create optimizer after LoRA is applied
         optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, model.parameters()),
             lr=float(config["grpo"]["lr"]),
@@ -210,15 +206,15 @@ def main():
         )
 
         model.gradient_checkpointing_enable()
+        model._prepare_model_for_gradient_checkpointing(model)
+        model.enable_input_require_grads()
 
-        # Load and prepare dataset
         print("[blue]Loading GSM8K dataset[/blue]")
-        # dataset = load_dataset("openai/gsm8k", "main")["train"]
-        # dataset = prepare_dataset(dataset)
-        vllm_client = VLLMClient()
+        dataset = load_dataset("openai/gsm8k", "main")["train"]
+        dataset = prepare_dataset(dataset)
+        vllm_client = VLLMClient(init_communicator=False)
         dataset = DatasetClient(vllm_client)
 
-        # Configure GRPO
         grpo_config = GRPOConfig(
             group_size=config["grpo"]["group_size"],
             micro_group_size=config["grpo"]["micro_group_size"],
@@ -228,14 +224,13 @@ def main():
             beta=float(config["grpo"]["beta"]),
             dtype="bfloat16",
             log_wandb=config["grpo"]["log_wandb"],
-            wandb_project=config["grpo"]["wandb_project"],
-            # using_lora=True,
+            wandb_project=config["grpo"]["wandb_project"],  
             dataset_feild="item",
             use_vllm=True,
-            num_policy_updates=8,
+            num_policy_updates=config["grpo"]["num_policy_updates"],
+            single_gpu=config["grpo"]["single_gpu"],
         )
 
-        # Initialize and train GRPO
         print("[blue]Initializing GRPO trainer[/blue]")
         grpo = GRPO(
             model=model,

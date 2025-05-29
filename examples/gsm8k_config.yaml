@@ -1,16 +1,16 @@
 # Generation configuration (shared parameters)
 generation: &generation
-  max_len: &max_len 512
+  max_len: &max_len 1024
   group_size: &group_size 8
   temperature: &temperature 0.6
   top_k: &top_k -1
   top_p: &top_p 1.0
   min_p: &min_p 0.0
-  batch_size: &generation_batch_size 8
+  batch_size: &generation_batch_size 4
 
 # Model configuration
 model:
-  name: "joey00072/Llama-3.2-1B-Instruct-cold-start-ft2"
+  name: "unsloth/Llama-3.2-3B-Instruct" #"joey00072/Llama-3.2-1B-Instruct-cold-start-ft2"
   revision: null
   dtype: "bfloat16"
   max_model_len: *max_len
@@ -25,16 +25,17 @@ lora:
 # GRPO training configuration
 grpo:
   group_size: *group_size
-  micro_group_size: 8
-  batch_size: 8
-  lr: 0.000005
+  micro_group_size: 1
+  batch_size: *generation_batch_size
+  lr: 0.00005
   weight_decay: 0.1
   beta: 0.0
   epsilon: 0.2
   log_wandb: true
-  wandb_project: "fuchsia-jee-deephermes"
+  wandb_project: "fuchsia-single-gpu-qlora"
   num_policy_updates: 1
-  lora_path: "/mnt/nvme0n1/joey/experiments/lora_weights3"
+  lora_path: "./lora_weights"
+  single_gpu: true
 
 # Server configuration
 server:
@@ -45,7 +46,7 @@ server:
   enable_prefix_caching: false
   buffer_size: *generation_batch_size
   generation_batch_size: *generation_batch_size
-  quantization: null
+  quantization: bitsandbytes
   vllm:
     max_tokens: *max_len
     n: *group_size

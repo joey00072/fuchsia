@@ -97,6 +97,9 @@ class VLLMClient:
         if init_communicator:
             self.init_communicator()
             atexit.register(self.close_communicator)
+        else:
+            self.rank = 0
+            self.pynccl_comm = None
 
     def _make_request(self, endpoint: str, method: str = "get", **kwargs) -> dict:
         """Helper method to make HTTP requests and handle responses."""
@@ -246,12 +249,13 @@ class VLLMClient:
                 "shape": tuple(weights.shape),
             },
         )
-
-        # Broadcast the weights to the other processes
-        self.pynccl_comm.broadcast(
-            weights, src=self.rank, stream=torch.cuda.current_stream()
-        )
-        self.pynccl_comm.group.barrier()
+        
+        if self.pynccl_comm is not None:            
+            # Broadcast the weights to the other processes
+            self.pynccl_comm.broadcast(
+                weights, src=self.rank, stream=torch.cuda.current_stream()
+            )
+            self.pynccl_comm.group.barrier()
 
     def update_lora_params(self, model: PeftModel):
         """
@@ -286,7 +290,7 @@ class VLLMClient:
                     new_name = name.replace("base_model.model.","").replace(".base_layer.weight",".weight")
                     self.update_named_param(new_name, new_wights)
 
-    def update_model_params(self, model: nn.Module, lora=False):
+    def update_model_params(self, model: nn.Module, lora=False, single_gpu=False,lora_path=None):
         """
         Updates all parameters of the given model by calling `update_named_param` for each parameter in the model.
 
@@ -296,6 +300,15 @@ class VLLMClient:
             lora (`bool`, *optional*, defaults to `False`):
                 Whether the model uses LoRA adaptations.
         """
+        
+        if single_gpu:
+            for name, param in model.named_parameters():
+                if "lora" in name:
+                    print(f"{param.data.sum()}")
+                    
+               
+            model.save_pretrained(lora_path,adapter_name="grpo")
+            return
         if lora:
             self.update_lora_params(model)
             return
@@ -362,6 +375,28 @@ class VLLMClient:
         Triggers the server to start filling its buffer with new samples.
         """
         return self._make_request("buffer_fill", method="post")
+
+    def sleep(self):
+        """
+        Puts the LLM engine to sleep, offloading weights to CPU and clearing KV cache.
+        
+        Returns:
+            `dict`:
+                A dictionary containing the status of the operation.
+        """
+        return self._make_request("sleep", method="post")
+
+    def wake_up(self):
+        """
+        Wakes up the LLM engine from sleep mode.
+        
+        Returns:
+            `dict`:
+                A dictionary containing the status of the operation.
+        """
+        res = self._make_request("wake_up", method="post")
+        time.sleep(5)
+        return res
 
 
 # Example usage

@@ -10,8 +10,8 @@ import yaml
 
 import os
 
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 model_name = "unsloth/Llama-3.2-3B-Instruct"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -180,6 +180,8 @@ def test_datasampler():
         enable_prefix_caching=config['server']['enable_prefix_caching'],
         generation_batch_size=config['server']['generation_batch_size'],
         quantization=config['server']['quantization'],
+        lora_path=config['grpo']['lora_path'],
+        single_gpu=config['grpo']['single_gpu'],
     )
     
     dataset = load_dataset(config['dataset']['name'], config['dataset']['split'])["train"]

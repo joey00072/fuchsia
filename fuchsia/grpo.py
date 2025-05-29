@@ -6,78 +6,14 @@ import time
 import wandb
 import datetime
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Optional, List, Callable, Any
+from typing import List, Callable, Any
 import logging
 
 from fuchsia.vllm_client import VLLMClient
+from fuchsia.grpo_config import GRPOConfig
 
 from transformers import AutoModelForCausalLM
 from peft import PeftModel
-
-
-@dataclass
-class GRPOConfig:
-    """
-    Configuration for GRPO training and generation.
-    All parameters are user-configurable for maximum flexibility.
-    """
-    group_size: int = 8
-    micro_group_size: int = 2
-    batch_size: int = 1
-    max_iterations: int = 1000
-    log_wandb: bool = False
-    dtype: str = "bfloat16"
-    lr: float = 5e-6
-    weight_decay: float = 0.0
-    beta: float = 0.0
-    epsilon: float = 0.2
-    epsilon_high: float = 0.4
-    wandb_project: str = "fuchsia"
-    use_vllm: bool = False
-    dataset_feild: str = "prompt"
-    num_policy_updates: int = 8
-    using_lora: bool = False
-    lora_path: str = "lora_weights"
-    ignore_imcomplete_samples: bool = True
-    # Generation parameters
-    max_new_tokens: int = 512
-    temperature: float = 0.9
-    repetition_penalty: float = 1.1
-    top_p: float = 1.0
-    top_k: int = -1
-    min_p: float = 0.0
-    # Logging and saving
-    log_level: str = "INFO"
-    save_every: int = 25
-
-
-    async_buffer_fill: bool = True
-    
-    # Device
-    device: Optional[str] = None  # If None, auto-detect
-
-    def __post_init__(self):
-        dtype_map = {
-            "bfloat16": torch.bfloat16,
-            "float16": torch.float16,
-            "float32": torch.float32,
-            "float64": torch.float64,
-        }
-
-        if self.dtype not in dtype_map:
-            raise ValueError(
-                f"Unsupported dtype: {self.dtype}. Supported values are: {list(dtype_map.keys())}"
-            )
-
-        self.dtype = dtype_map[self.dtype]
-
-        if self.dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
-            self.dtype = torch.float16
-
-        # Set up logging
-        logging.basicConfig(level=getattr(logging, self.log_level.upper(), logging.INFO))
-        self.logger = logging.getLogger("GRPO")
 
 
 class GRPO:
@@ -114,6 +50,7 @@ class GRPO:
         self.beta = config.beta
         self.epsilon = config.epsilon
         self.epsilon_high = config.epsilon_high
+        self.single_gpu = config.single_gpu
         self.optimizer = (
             optimizer
             if optimizer is not None
@@ -151,6 +88,9 @@ class GRPO:
         if config.use_vllm:
             self.logger.info("Using VLLM")
             self.vllm_client = vllm_client if vllm_client is not None else VLLMClient()
+            
+        if self.single_gpu:
+            self.model.save_pretrained(self.lora_path)
 
     def selective_log_softmax(self, logits, index):
         per_token_logps = []
@@ -165,8 +105,8 @@ class GRPO:
         per_token_logps = torch.stack(per_token_logps)
         return per_token_logps
 
-    def get_per_token_logps(self, model, input_ids) -> Tensor:
-        logits = model(input_ids=input_ids).logits
+    def get_per_token_logps(self, model, input_ids, training=False) -> Tensor:
+        logits = model(input_ids=input_ids, training=training).logits
         logits = logits[:, :-1, :]  # Shape: [2, 660, 128256]
         input_ids = input_ids[:, 1:]
         logps = self.selective_log_softmax(logits, input_ids)
@@ -175,7 +115,7 @@ class GRPO:
     def compute_loss(
         self, inputs, old_policy_log_probs, reward, mean_rewards, std_rewards, loss_mask, ignore_sample
     ) -> Tensor:
-        policy_log_probs = self.get_per_token_logps(self.model, inputs)
+        policy_log_probs = self.get_per_token_logps(self.model, inputs, training=True)
 
         kld = 0
         if self.beta != 0:
@@ -366,6 +306,27 @@ class GRPO:
                 metrics[f"train/{k}"] = v[idx] if len(v) >= idx else v[-1]
 
             wandb.log(metrics)
+            
+    
+    def offload_to_cpu(self):
+        self.model.to("cpu")
+        if self.ref_model is not None:  
+            self.ref_model.to("cpu")
+        
+        # for param in self.optimizer.parameters():
+        #     param.data = param.data.cpu()
+            
+        self.logger.info("Offloaded to CPU")
+        torch.cuda.empty_cache()
+    
+    def offload_to_gpu(self):
+        self.model.to(self.device)
+        if self.ref_model is not None:
+            self.ref_model.to(self.device)
+        
+        # for param in self.optimizer.parameters():
+        #     param.data = param.data.to(self.device)
+            
 
     def train(self, epochs=1, max_iterations=1000):
         idx = 0
@@ -411,8 +372,6 @@ class GRPO:
                 mean_rewards = reward.mean(dim=-1).unsqueeze(-1)
                 std_rewards = reward.std(dim=-1).unsqueeze(-1)
 
-                # even grop are too big for vram
-                # so we split them into micro groups (its same as micro batching)
                 g_inputs = b_inputs.reshape(
                     b_inputs.shape[0] // self.micro_group_size,
                     self.micro_group_size,
@@ -482,10 +441,24 @@ class GRPO:
             self.log_metrics()
 
             if idx % self.num_policy_updates == 0 and self.distributed:
-                self.vllm_client.update_model_params(self.model,lora=self.using_lora)
+                self.vllm_client.update_model_params(self.model,lora=self.using_lora,single_gpu=self.single_gpu,lora_path=self.lora_path)
                 if not self.async_buffer_fill:
                     self.vllm_client.empty_buffer()
+                    
+                if self.single_gpu:
+                    self.logger.info("Offloading model to CPU")
+                    self.offload_to_cpu()
+                    self.logger.info("Waking up VLLM client")
+                    self.vllm_client.wake_up()
+                    
+                self.logger.info("Filling buffer")
                 self.vllm_client.fill_buffer()
+                
+                if self.single_gpu:
+                    self.logger.info("Putting VLLM client to sleep")
+                    self.vllm_client.sleep()
+                    self.logger.info("Offloading model back to GPU")
+                    self.offload_to_gpu()
             
             
             if idx % self.config.save_every == 0:

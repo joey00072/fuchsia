@@ -7,7 +7,8 @@ import math
 import yaml
 from pathlib import Path
 from typing import Optional, Dict, Any
-from fuchsia.grpo import GRPO, GRPOConfig
+from fuchsia.grpo import GRPO
+from fuchsia.grpo_config import GRPOConfig
 from fuchsia.dist_dataset import DatasetClient
 from fuchsia.vllm_client import VLLMClient
 import json
