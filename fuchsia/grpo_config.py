@@ -42,6 +42,7 @@ class GRPOConfig:
     save_every: int = 25
 
     async_buffer_fill: bool = True
+    debug: bool = True
     
     single_gpu: bool = False
     # Device

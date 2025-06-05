@@ -6,11 +6,11 @@ generation: &generation
   top_k: &top_k -1
   top_p: &top_p 1.0
   min_p: &min_p 0.0
-  batch_size: &generation_batch_size 4
+  batch_size: &generation_batch_size 8
 
 # Model configuration
 model:
-  name: "unsloth/Llama-3.2-3B-Instruct" #"joey00072/Llama-3.2-1B-Instruct-cold-start-ft2"
+  name: "joey00072/Llama-3.2-1B-Instruct-cold-start-ft2"
   revision: null
   dtype: "bfloat16"
   max_model_len: *max_len
@@ -41,12 +41,12 @@ grpo:
 server:
   host: "0.0.0.0"
   port: 8000
-  gpu_memory_utilization: 0.50
+  gpu_memory_utilization: 0.8
   tensor_parallel_size: 1
   enable_prefix_caching: false
   buffer_size: *generation_batch_size
   generation_batch_size: *generation_batch_size
-  quantization: bitsandbytes
+  quantization: 
   vllm:
     max_tokens: *max_len
     n: *group_size

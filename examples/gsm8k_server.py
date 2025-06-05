@@ -5,7 +5,7 @@ from rich import print
 import re
 from typing import Optional
 from datasets import Dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
 import yaml
 
 import os
@@ -15,12 +15,12 @@ import os
 
 model_name = "unsloth/Llama-3.2-3B-Instruct"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(model_name)
 SYSTEM_PROMPT = "Respond in following format:<thinking>{step by step reasoning}</thinking><answer>{number}</answer>"
 
 
 def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
     """Improved reward function with better validation and scoring."""
+    START_OF_TEXT_TOKEN = "<|im_start|>"
     END_OF_TEXT_TOKEN = "<|eot_id|>"
     START_HEADER_TOKEN = "<|start_header_id|>"
     END_HEADER_TOKEN = "<|end_header_id|>"
@@ -79,14 +79,12 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
             )
             try:
                 answer_value = float(answer_content)
-                content_reward += 1.0
-                if answer_value == float(sample["answer"]):
-                    content_reward += 2.0
-                    correct_template += 1
+                correct_template += 1
+                if answer_value == float(sample["correct_answer"]):
+                    content_reward += 3
             except ValueError:
                 content_reward -= 0.1
 
-        # Bonus for perfect format
         if correct_template == 1:
             format_reward += 2.0
 

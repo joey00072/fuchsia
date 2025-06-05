@@ -274,6 +274,7 @@ class DataSamplerServer:
         if config.vllm_kv_quantization:
             kwargs["kv_cache_dtype"] = "fp8"
             kwargs["calculate_kv_scales"] = True
+        print(config)
 
         self.llm = LLM(
             model=config.model,
@@ -435,20 +436,22 @@ class DataSamplerServer:
             """Puts the LLM engine to sleep, offloading weights to CPU and clearing KV cache."""
             try:
                 if self.is_data_sampler:
-                    # Signal that sleep has been requested
-                    self._sleep_requested = True
-                    logger.info("Sleep requested - waiting for ongoing generation to complete...")
+                    # Check if generation is currently in progress without blocking
+                    generation_in_progress = not self._generation_lock.acquire(blocking=False)
+                    if generation_in_progress:
+                        logger.info("Generation in progress - cannot sleep now")
+                        return {
+                            "message": "Generation in progress - cannot sleep now", 
+                            "sleep": False
+                        }
                     
-                    # Wait for any ongoing generation to complete using threading lock
-                    def wait_for_generation():
-                        with self._generation_lock:
-                            logger.info("All generation operations completed, proceeding with sleep...")
-                            self._is_sleeping = True
-                    
-                    # Run the blocking operation in a thread pool
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        await asyncio.get_event_loop().run_in_executor(executor, wait_for_generation)
+                    try:
+                        # Signal that sleep has been requested
+                        self._sleep_requested = True
+                        logger.info("Sleep requested - proceeding with sleep...")
+                        self._is_sleeping = True
+                    finally:
+                        self._generation_lock.release()
                 
                 self.llm.sleep(level=1)  # Level 1: offload weights to CPU & clear KV cache
                 torch.cuda.empty_cache()  # Clear CUDA cache after sleep
@@ -456,13 +459,19 @@ class DataSamplerServer:
                 if self.is_data_sampler:
                     self._sleep_requested = False  # Reset the flag
                     
-                return {"message": "LLM engine has been put to sleep successfully"}
+                return {
+                    "message": "LLM engine has been put to sleep successfully", 
+                    "sleep": True
+                }
             except Exception as e:
                 logger.error(f"Failed to put LLM to sleep: {e}")
                 if self.is_data_sampler:
                     self._sleep_requested = False  # Reset the flag on error
                     self._is_sleeping = False
-                return {"error": f"Failed to put LLM to sleep: {str(e)}"}
+                return {
+                    "error": f"Failed to put LLM to sleep: {str(e)}", 
+                    "sleep": False
+                }
 
         @app.post("/wake_up/")
         async def wake_up():

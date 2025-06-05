@@ -1,3 +1,5 @@
+# derived from https://github.com/unslothai/
+
 # Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,79 +19,45 @@ import transformers
 import inspect
 
 
-class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
-    """
-    Saves VRAM by smartly offloading to RAM.
-    Tiny hit to performance, since we mask the movement via non blocking calls.
-    """
-
+class CPUGradientCheckpointer(torch.autograd.Function):
     @staticmethod
-    @torch.cuda.amp.custom_fwd
-    def forward(ctx, forward_function, hidden_states, *args):
-        print("cpu offloading forward")
-        saved_hidden_states = hidden_states.to("cpu", non_blocking=True)
+    @torch.amp.custom_fwd(device_type='cuda')
+    def forward(ctx, forward_fn, activations, *kwargs):
+        
         with torch.no_grad():
-            output = forward_function(hidden_states, *args)
-        ctx.save_for_backward(saved_hidden_states)
-        ctx.forward_function = forward_function
-        ctx.args = args
+            output = forward_fn(activations, *kwargs)
+            
+        cpu_activations = activations.to("cpu", non_blocking=True)
+        
+        ctx.save_for_backward(cpu_activations)
+        ctx.forward_fn = forward_fn
+        ctx.kwargs = kwargs
 
         return output
 
-    pass
-
     @staticmethod
-    @torch.cuda.amp.custom_bwd
-    def backward(ctx, dY):
-        (hidden_states,) = ctx.saved_tensors
-        hidden_states = hidden_states.to("cuda", non_blocking=True).detach()
-        hidden_states.requires_grad = True
+    @torch.amp.custom_bwd(device_type='cuda')
+    def backward(ctx, grad_output):
+        
+        (cpu_activations,) = ctx.saved_tensors
+        
+        gpu_activations = cpu_activations.to("cuda", non_blocking=True).detach()
+        gpu_activations.requires_grad = True
+        
         with torch.enable_grad():
-            (output,) = ctx.forward_function(hidden_states, *ctx.args)
-        torch.autograd.backward(output, dY)
-        return (
-            None,
-            hidden_states.grad,
-        ) + (
-            None,
-        ) * len(ctx.args)
-
-    pass
+            (output,) = ctx.forward_fn(gpu_activations, *ctx.kwargs)
+            
+        torch.autograd.backward(output, grad_output)
+        
+        return (None, gpu_activations.grad,) + (None,) * len(ctx.kwargs)
 
 
-pass
 
 
-def new_gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-    assert gradient_checkpointing_kwargs == None
-    if not self.supports_gradient_checkpointing:
-        raise ValueError(
-            f"{self.__class__.__name__} does not support gradient checkpointing."
-        )
+def apply_cpu_gradient_checkpoint_monkey_patch():
+    def new_gradient_checkpointing_enable(self):
+        self._set_gradient_checkpointing(enable=True, gradient_checkpointing_func=CPUGradientCheckpointer.apply)
 
-    gradient_checkpointing_func = Unsloth_Offloaded_Gradient_Checkpointer.apply
-    # For old GC format (transformers < 4.35.0) for models that live on the Hub
-    # we will fall back to the overwritten `_set_gradient_checkpointing` method
-    _is_using_old_format = (
-        "value" in inspect.signature(self._set_gradient_checkpointing).parameters
-    )
-
-    if not _is_using_old_format:
-        self._set_gradient_checkpointing(
-            enable=True, gradient_checkpointing_func=gradient_checkpointing_func
-        )
-    else:
-        raise NotImplementedError()
-
-    if getattr(self, "_hf_peft_config_loaded", False):
-        # When using PEFT + gradient checkpointing + Trainer we need to make sure the input has requires_grad=True
-        # we do it also on PEFT: https://github.com/huggingface/peft/blob/85013987aa82aa1af3da1236b6902556ce3e483e/src/peft/peft_model.py#L334
-        # When training with PEFT, only LoRA layers will have requires grad set to True, but the output of frozen layers need to propagate
-        # the gradients to make sure the gradient flows.
-        self.enable_input_require_grads()
-
-
-def apply_unsloth_offloaded_gradient_checkpoint_monkey_patch():
-    transformers.modeling_utils.PreTrainedModel.gradient_checkpointing_enable = (
-        new_gradient_checkpointing_enable
-    )
+        if getattr(self, "_hf_peft_config_loaded", False):
+            self.enable_input_require_grads()
+    transformers.modeling_utils.PreTrainedModel.gradient_checkpointing_enable = new_gradient_checkpointing_enable

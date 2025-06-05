@@ -38,48 +38,6 @@ logger = logging.getLogger(__name__)
 
 
 class VLLMClient:
-    """
-    A client class to interact with a vLLM server.
-
-    This class provides methods to generate completions, initialize and manage weight update groups, and update model
-    weights in a distributed setting. Before using it, start the vLLM server with `Fuchsia serve`.
-
-    Args:
-        host (`str`, *optional*, defaults to `"0.0.0.0"`):
-            IP address of the vLLM server.
-        server_port (`int`, *optional*, defaults to `8000`):
-            Port number of the vLLM server.
-        group_port (`int`, *optional*, defaults to `51216`):
-            Port number for the weight update group.
-        connection_timeout (`float`, *optional*, defaults to `0.0`):
-            Total timeout duration in seconds to wait for the server to be up. If the server is not up after the
-            timeout, a `ConnectionError` is raised.
-
-    Examples:
-        Run the vLLM server with the model `Qwen/Qwen2.5-7B`:
-
-        ```
-        $ Fuchsia serve --model Qwen/Qwen2.5-7B
-        ...
-        INFO:     Application startup complete.
-        INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-        ```
-
-        Use the client to generate completions and update model weights:
-
-        ```python
-        >>> from Fuchsia.extras.vllm_client import VLLMClient
-        >>> client = VLLMClient()
-        >>> client.generate(["Hello, AI!", "Tell me a joke"])
-        [[2980, 498, 1492, 752, 448, 264, 13027, 8645, 30, 358, 2776, 4460, 311, 3270, 264, 2025],
-         [911, 7988, 1251, 382, 3838, 653, 498, 1618, 4325, 879, 2581, 20027, 264, 21428, 30, 362]]
-
-        >>> from transformers import AutoModelForCausalLM
-        >>> model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B", device_map="cuda")
-        >>> client.update_model_params(model)
-        ```
-    """
-
     def __init__(
         self,
         host: str = "0.0.0.0",
@@ -93,40 +51,80 @@ class VLLMClient:
         self.server_port = server_port
         self.group_port = group_port
         self._base_url = f"http://{self.host}:{self.server_port}"
-        self.check_server(connection_timeout)
+        self._init_communicator = init_communicator
+        self._connection_timeout = connection_timeout
+        
+        # Try to connect with retries
+        self._connect_with_retries()
+        
         if init_communicator:
-            self.init_communicator()
+            self._init_communicator_with_retries()
             atexit.register(self.close_communicator)
         else:
             self.rank = 0
             self.pynccl_comm = None
 
-    def _make_request(self, endpoint: str, method: str = "get", **kwargs) -> dict:
-        """Helper method to make HTTP requests and handle responses."""
-        url = f"{self._base_url}/{endpoint.strip('/')}/"
-        try:
-            if method.lower() == "get":
-                response = self.session.get(url, **kwargs)
-            else:
-                response = self.session.post(url, **kwargs)
+    def _connect_with_retries(self):
+        """Connect to server with automatic retries."""
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                self.check_server(self._connection_timeout)
+                return
+            except Exception as e:
+                logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
+                if attempt < max_attempts - 1:
+                    logger.info(f"Retrying connection in 5 seconds...")
+                    time.sleep(5)
+                else:
+                    logger.error("Failed to connect to VLLM server. Training will continue but VLLM operations may fail.")
 
-            if response.status_code == 200:
-                return response.json() if response.content else {}
-            raise Exception(f"Request failed: {response.status_code}, {response.text}")
-        except requests.exceptions.RequestException as e:
-            raise ConnectionError(f"Failed to connect to {url}: {str(e)}")
+    def _init_communicator_with_retries(self):
+        """Initialize communicator with automatic retries."""
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                self.init_communicator()
+                return
+            except Exception as e:
+                logger.warning(f"Communicator init attempt {attempt + 1} failed: {e}")
+                if attempt < max_attempts - 1:
+                    logger.info(f"Retrying communicator init in 3 seconds...")
+                    time.sleep(3)
+                else:
+                    logger.error("Failed to initialize communicator. Some operations may not work.")
+                    self.rank = 0
+                    self.pynccl_comm = None
+
+    def _make_request(self, endpoint: str, method: str = "get", max_retries: int = 3, retry_delay: float = 2.0, **kwargs) -> dict:
+        url = f"{self._base_url}/{endpoint.strip('/')}/"
+        
+        for attempt in range(max_retries + 1):
+            try:
+                if method.lower() == "get":
+                    response = self.session.get(url, **kwargs)
+                else:
+                    response = self.session.post(url, **kwargs)
+
+                if response.status_code == 200:
+                    return response.json() if response.content else {}
+                raise Exception(f"Request failed: {response.status_code}, {response.text}")
+                
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries:
+                    logger.warning(f"Connection failed (attempt {attempt + 1}/{max_retries + 1}): {str(e)}")
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    # Exponential backoff
+                    retry_delay *= 1.5
+                else:
+                    logger.error(f"Failed to connect after {max_retries + 1} attempts: {str(e)}")
+                    raise ConnectionError(f"Failed to connect to {url}: {str(e)}")
+        
+        # This should never be reached, but just in case
+        raise ConnectionError(f"Unexpected error connecting to {url}")
 
     def check_server(self, total_timeout: float = 180.0, retry_interval: float = 2.0):
-        """
-        Check server availability with retries on failure, within a total timeout duration. If the server is not up
-        after the total timeout duration, raise a `ConnectionError`.
-
-        Args:
-            retry_interval (`float`, *optional*, defaults to `2.0`):
-                Interval in seconds between retries.
-            total_timeout (`float`, *optional*, defaults to `0.0`):
-                Total timeout duration in seconds.
-        """
         url = f"http://{self.host}:{self.server_port}/health/"
         start_time = time.time()  # Record the start time
 
@@ -145,11 +143,7 @@ class VLLMClient:
                 if response.status_code == 200:
                     print("Server is up!")
                     return None
-
-            # Retry logic: wait before trying again
-            print(
-                f"Server is not up yet. Retrying in {retry_interval} seconds..."
-            )
+            print( f"Server is not up yet. Retrying in {retry_interval} seconds...")
             time.sleep(retry_interval)
 
     def generate(
@@ -165,31 +159,8 @@ class VLLMClient:
         guided_decoding_regex: Optional[str] = None,
     ) -> list[list[str]]:
         """
-        Generates model completions for the provided prompts.
-
-        Args:
-            prompts (`list[str]`):
-                List of text prompts for which the model will generate completions.
-            n (`int`, *optional*, defaults to `1`):
-                Number of completions to generate for each prompt.
-            repetition_penalty (`float`, *optional*, defaults to `1.0`):
-                Parameter for repetition penalty. 1.0 means no penalty.
-            temperature (`float`, *optional*, defaults to `1.0`):
-                Temperature parameter for sampling. Higher values increase diversity.
-            top_p (`float`, *optional*, defaults to `1.0`):
-                Top-p sampling parameter.`1.0` means no truncation.
-            top_k (`int`, *optional*, defaults to `-1`):
-                Top-k sampling parameter. `-1` means no truncation.
-            min_p (`float`, *optional*, defaults to `0.0`):
-                Minimum probability for sampling.
-            max_tokens (`int`, *optional*, defaults to `16`):
-                Maximum number of tokens to generate for each prompt.
-            guided_decoding_regex (`str` or `None`, *optional*, defaults to `None`):
-                Regular expression to guide the decoding process.
-
-        Returns:
-            `list[list[int]]`:
-                List of lists of token IDs representing the model-generated completions for each prompt.
+        Generate completions with built-in fault tolerance.
+        Automatically retries on failure and returns empty list instead of crashing.
         """
         params = {
             "prompts": prompts,
@@ -202,29 +173,32 @@ class VLLMClient:
             "max_tokens": max_tokens,
             "guided_decoding_regex": guided_decoding_regex,
         }
-        return self._make_request("generate", method="post", json=params)[
-            "completion_ids"
-        ]
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self._make_request("generate", method="post", json=params, max_retries=2)
+                return response["completion_ids"]
+            except Exception as e:
+                logger.warning(f"Generate attempt {attempt + 1} failed with error: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)  # Wait before retry
+                    
+        logger.error(f"Failed to generate completions after {max_retries} attempts. Returning empty list...")
+        return []
 
     def init_communicator(self):
-        """
-        Initializes the weight update group in a distributed setup for model synchronization.
-        """
-        # Get the tensor parallel size from the server
-        tensor_parallel_size = self._make_request("get_tensor_parallel_size")[
-            "tensor_parallel_size"
-        ]
+        response = self._make_request("get_tensor_parallel_size")
+        tensor_parallel_size = response["tensor_parallel_size"]
         world_size = tensor_parallel_size + 1
         self.rank = tensor_parallel_size  # The client's rank is the last process
 
-        # Initialize weight update group
         self._make_request(
             "init_communicator",
             method="post",
             json={"host": "0.0.0.0", "port": self.group_port, "world_size": world_size},
         )
 
-        # Set up the communication group for weight broadcasting
         pg = StatelessProcessGroup.create(
             host=self.host, port=self.group_port, rank=self.rank, world_size=world_size
         )
@@ -232,40 +206,41 @@ class VLLMClient:
 
     def update_named_param(self, name: str, weights: torch.Tensor):
         """
-        Updates a specific named parameter in the model and broadcasts it to other processes.
-
-        Args:
-            name (`str`):
-                Name of the layer whose weights are being updated.
-            weights (`torch.Tensor`):
-                Tensor containing the updated weights.
+        Update named parameter with built-in fault tolerance.
+        Automatically retries on failure and logs warnings instead of crashing.
         """
-        self._make_request(
-            "update_named_param",
-            method="post",
-            json={
-                "name": name,
-                "dtype": str(weights.dtype),
-                "shape": tuple(weights.shape),
-            },
-        )
-        
-        if self.pynccl_comm is not None:            
-            # Broadcast the weights to the other processes
-            self.pynccl_comm.broadcast(
-                weights, src=self.rank, stream=torch.cuda.current_stream()
-            )
-            self.pynccl_comm.group.barrier()
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self._make_request(
+                    "update_named_param",
+                    method="post",
+                    json={
+                        "name": name,
+                        "dtype": str(weights.dtype),
+                        "shape": tuple(weights.shape),
+                    },
+                    max_retries=2
+                )
+                
+                if self.pynccl_comm is not None:            
+                    self.pynccl_comm.broadcast(
+                        weights, src=self.rank, stream=torch.cuda.current_stream()
+                    )
+                    self.pynccl_comm.group.barrier()
+                
+                # Success - no need to log, this happens frequently
+                return
+                
+            except Exception as e:
+                logger.warning(f"Update parameter '{name}' attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)  # Wait before retry
+                    
+        logger.error(f"Failed to update parameter '{name}' after {max_retries} attempts. Skipping...")
 
     def update_lora_params(self, model: PeftModel):
-        """
-        Updates parameters for a LoRA-enabled model by computing the effective weights
-        after applying LoRA adaptations.
-
-        Args:
-            model (`PeftModel`):
-                LoRA-enabled model whose parameters are to be updated.
-        """
+        
         if not isinstance(model, PeftModel):
             raise ValueError("Model is not a PeftModel")
             
@@ -291,22 +266,10 @@ class VLLMClient:
                     self.update_named_param(new_name, new_wights)
 
     def update_model_params(self, model: nn.Module, lora=False, single_gpu=False,lora_path=None):
-        """
-        Updates all parameters of the given model by calling `update_named_param` for each parameter in the model.
-
-        Args:
-            model (`nn.Module`):
-                Model whose parameters (weights/biases) are to be updated.
-            lora (`bool`, *optional*, defaults to `False`):
-                Whether the model uses LoRA adaptations.
-        """
-        
         if single_gpu:
             for name, param in model.named_parameters():
                 if "lora" in name:
                     print(f"{param.data.sum()}")
-                    
-               
             model.save_pretrained(lora_path,adapter_name="grpo")
             return
         if lora:
@@ -314,89 +277,158 @@ class VLLMClient:
             return
         
         for name, param in model.named_parameters():
-            # Update each parameter individually
             self.update_named_param(name, param.data)
 
     def reset_prefix_cache(self):
-        """
-        Resets the prefix cache for the model.
-        """
-        self._make_request("reset_prefix_cache", method="post")
+        """Reset prefix cache with built-in fault tolerance."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self._make_request("reset_prefix_cache", method="post", max_retries=2)
+                logger.info("Prefix cache successfully reset")
+                return
+            except Exception as e:
+                logger.warning(f"Reset prefix cache attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    
+        logger.error(f"Failed to reset prefix cache after {max_retries} attempts. Continuing anyway...")
 
     def close_communicator(self):
-        """
-        Closes the weight update group and cleans up the communication group.
-        """
-        self._make_request("close_communicator", method="post")
+        """Close communicator with built-in fault tolerance."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self._make_request("close_communicator", method="post", max_retries=2)
+                logger.info("Communicator successfully closed")
+                return
+            except Exception as e:
+                logger.warning(f"Close communicator attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    
+        logger.error(f"Failed to close communicator after {max_retries} attempts. Continuing anyway...")
 
     def get_sample(self) -> Optional[dict]:
         """
-        Gets a sample from the server's buffer.
-
-        Returns:
-            `dict` or `None`:
-                A dictionary containing the sample data with completion_ids, completions, and rewards,
-                or None if the buffer is empty.
+        Get a sample from the VLLM server with built-in fault tolerance.
+        Automatically retries on failure and returns None instead of crashing.
         """
-        response = self._make_request("get_sample", method="post")
-        return response.get("sample")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self._make_request("get_sample", method="post", max_retries=2)
+                return response.get("sample")
+            except Exception as e:
+                logger.warning(f"Get sample attempt {attempt + 1} failed with error: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)  # Wait before retry
+                    
+        logger.error(f"Failed to get sample after {max_retries} attempts. Returning None...")
+        return None
 
     def empty_buffer(self):
         """
-        Empties the server's buffer by removing all samples.
-
-        Returns:
-            `dict`:
-                A dictionary containing the status of the operation.
+        Empty the VLLM server buffer with built-in fault tolerance.
+        Automatically retries on failure and logs warnings instead of crashing.
         """
-        return self._make_request("empty_buffer", method="post")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                result = self._make_request("empty_buffer", method="post", max_retries=2)
+                logger.info("VLLM buffer successfully emptied")
+                return result
+            except Exception as e:
+                logger.warning(f"Empty buffer attempt {attempt + 1} failed with error: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)  # Wait before retry
+                    
+        logger.error(f"Failed to empty buffer after {max_retries} attempts. Continuing anyway...")
+        return {"empty_buffer": False, "error": "Max retries exceeded"}
 
     def fill_buffer(self, num_samples: int = None):
         """
-        Fills the server's buffer with new samples.
-
-        Args:
-            num_samples (`int`, *optional*, defaults to `100`):
-                Number of samples to generate and add to the buffer.
-
-        Returns:
-            `dict`:
-                A dictionary containing the status of the operation.
+        Fill the VLLM server buffer with built-in fault tolerance.
+        Automatically retries on failure and logs warnings instead of crashing.
         """
-        if num_samples is None:
-            return self._make_request("buffer_fill", method="post")
-        else:
-            return self._make_request(
-                "buffer_fill", method="post", json={"num_samples": num_samples}
-            )
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if num_samples is None:
+                    result = self._make_request("buffer_fill", method="post", max_retries=2)
+                else:
+                    result = self._make_request(
+                        "buffer_fill", method="post", json={"num_samples": num_samples}, max_retries=2
+                    )
+                logger.info("VLLM buffer successfully filled")
+                return result
+            except Exception as e:
+                logger.warning(f"Buffer fill attempt {attempt + 1} failed with error: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)  # Wait before retry
+                    
+        logger.error(f"Failed to fill buffer after {max_retries} attempts. Continuing anyway...")
+        return {"buffer_fill": False, "error": "Max retries exceeded"}
 
     def trigger_buffer_fill(self):
-        """
-        Triggers the server to start filling its buffer with new samples.
-        """
-        return self._make_request("buffer_fill", method="post")
+        """Trigger buffer fill with built-in fault tolerance."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                result = self._make_request("buffer_fill", method="post", max_retries=2)
+                logger.info("Buffer fill successfully triggered")
+                return result
+            except Exception as e:
+                logger.warning(f"Trigger buffer fill attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    
+        logger.error(f"Failed to trigger buffer fill after {max_retries} attempts. Continuing anyway...")
+        return {"buffer_fill": False, "error": "Max retries exceeded"}
 
     def sleep(self):
         """
-        Puts the LLM engine to sleep, offloading weights to CPU and clearing KV cache.
-        
-        Returns:
-            `dict`:
-                A dictionary containing the status of the operation.
+        Put the VLLM server to sleep with built-in fault tolerance.
+        Automatically retries on failure and logs warnings instead of crashing.
         """
-        return self._make_request("sleep", method="post")
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                response = self._make_request("sleep", method="post", max_retries=2)
+                if response and response.get("sleep", False):
+                    logger.info("VLLM client successfully put to sleep")
+                    return response
+                else:
+                    logger.warning(f"Sleep attempt {attempt + 1} failed: {response}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2)  # Wait before retry
+            except Exception as e:
+                logger.warning(f"Sleep attempt {attempt + 1} failed with error: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)  # Wait before retry
+                    
+        logger.error(f"Failed to put VLLM client to sleep after {max_retries} attempts. Continuing anyway...")
+        return {"sleep": False, "error": "Max retries exceeded"}
 
     def wake_up(self):
         """
-        Wakes up the LLM engine from sleep mode.
-        
-        Returns:
-            `dict`:
-                A dictionary containing the status of the operation.
+        Wake up the VLLM server with built-in fault tolerance.
+        Automatically retries on failure and logs warnings instead of crashing.
         """
-        res = self._make_request("wake_up", method="post")
-        time.sleep(5)
-        return res
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                res = self._make_request("wake_up", method="post", max_retries=2)
+                time.sleep(5)
+                logger.info("VLLM client successfully woken up")
+                return res
+            except Exception as e:
+                logger.warning(f"Wake up attempt {attempt + 1} failed with error: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(3)  # Wait before retry
+                    
+        logger.error(f"Failed to wake up VLLM client after {max_retries} attempts. Continuing anyway...")
+        return {"wake_up": False, "error": "Max retries exceeded"}
 
 
 # Example usage
