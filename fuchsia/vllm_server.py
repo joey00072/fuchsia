@@ -37,6 +37,7 @@ from transformers import AutoTokenizer
 
 
 import asyncio
+import threading
 
 # Check CUDA availability
 try:
@@ -160,8 +161,11 @@ class WeightSyncWorker(Worker):
             shape (`Sequence[int]`):
                 Shape of the weight tensor.
         """
+
         if self.pynccl_comm is None:
-            raise RuntimeError("Communicator not initialized")
+            print("Communicator not initialized")
+            return
+            # raise RuntimeError("Communicator not initialized")
 
         weight = torch.empty(shape, dtype=dtype, device=self.device)
         self.pynccl_comm.broadcast(
@@ -209,6 +213,8 @@ class ServerConfig:
     vllm_max_tokens: int = 1024
     vllm_kv_quantization: bool = False
     generation_batch_size: int = 1
+    
+    single_gpu: bool = False
        
 
     def __post_init__(self,**kwargs):
@@ -268,6 +274,7 @@ class DataSamplerServer:
         if config.vllm_kv_quantization:
             kwargs["kv_cache_dtype"] = "fp8"
             kwargs["calculate_kv_scales"] = True
+        print(config)
 
         self.llm = LLM(
             model=config.model,
@@ -278,13 +285,16 @@ class DataSamplerServer:
             dtype=config.dtype,
             enable_prefix_caching=config.enable_prefix_caching,
             max_model_len=config.max_model_len,
-            worker_cls="fuchsia.vllm_server.WeightSyncWorker",
+            enable_lora=config.single_gpu,
+            enable_sleep_mode=True,  # Enable sleep mode for CUDA
+            worker_cls="fuchsia.vllm_server.WeightSyncWorker", 
             **kwargs
         )
 
         # Data sampler specific initialization
         self.dataset = dataset
         self.is_data_sampler = dataset is not None
+        self._lora_idx = 0
         
         if self.is_data_sampler:
             self.tokenizer = AutoTokenizer.from_pretrained(config.model)
@@ -308,6 +318,9 @@ class DataSamplerServer:
             self.enable_lora = config.enable_lora
             self.lora_path = config.lora_path
             self._is_filling = False
+            self._is_sleeping = False  # Track sleep state
+            self._sleep_requested = False  # Track if sleep has been requested
+            self._generation_lock = threading.Lock()  # Lock for generation operations
             
             if pre_fill_buffer:
                 self.buffer_fill()
@@ -349,9 +362,31 @@ class DataSamplerServer:
                 guided_decoding=guided_decoding,
                 stop=self.stop,
             )
-            all_outputs = self.llm.generate(
-                request.prompts, sampling_params=sampling_params
-            )
+            
+            # Use generation lock if in data sampler mode
+            if self.is_data_sampler:
+                def generate_with_lock():
+                    with self._generation_lock:
+                        # Check if sleep was requested
+                        if hasattr(self, '_sleep_requested') and self._sleep_requested:
+                            logger.info("Sleep requested - aborting generation")
+                            return []
+                        return self.llm.generate(
+                            request.prompts, sampling_params=sampling_params,
+                            lora_path=self.lora_path,
+                        )
+                
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    all_outputs = await asyncio.get_event_loop().run_in_executor(
+                        executor, generate_with_lock
+                    )
+            else:
+                all_outputs = self.llm.generate(
+                    request.prompts, sampling_params=sampling_params,
+                    lora_path=self.lora_path,
+                )
+            
             completion_ids = [
                 list(output.token_ids)
                 for outputs in all_outputs
@@ -396,6 +431,61 @@ class DataSamplerServer:
             self.llm.collective_rpc("close_communicator")
             return {"message": "Request received, closing communicator"}
 
+        @app.post("/sleep/")
+        async def sleep():
+            """Puts the LLM engine to sleep, offloading weights to CPU and clearing KV cache."""
+            try:
+                if self.is_data_sampler:
+                    # Check if generation is currently in progress without blocking
+                    generation_in_progress = not self._generation_lock.acquire(blocking=False)
+                    if generation_in_progress:
+                        logger.info("Generation in progress - cannot sleep now")
+                        return {
+                            "message": "Generation in progress - cannot sleep now", 
+                            "sleep": False
+                        }
+                    
+                    try:
+                        # Signal that sleep has been requested
+                        self._sleep_requested = True
+                        logger.info("Sleep requested - proceeding with sleep...")
+                        self._is_sleeping = True
+                    finally:
+                        self._generation_lock.release()
+                
+                self.llm.sleep(level=1)  # Level 1: offload weights to CPU & clear KV cache
+                torch.cuda.empty_cache()  # Clear CUDA cache after sleep
+                
+                if self.is_data_sampler:
+                    self._sleep_requested = False  # Reset the flag
+                    
+                return {
+                    "message": "LLM engine has been put to sleep successfully", 
+                    "sleep": True
+                }
+            except Exception as e:
+                logger.error(f"Failed to put LLM to sleep: {e}")
+                if self.is_data_sampler:
+                    self._sleep_requested = False  # Reset the flag on error
+                    self._is_sleeping = False
+                return {
+                    "error": f"Failed to put LLM to sleep: {str(e)}", 
+                    "sleep": False
+                }
+
+        @app.post("/wake_up/")
+        async def wake_up():
+            """Wakes up the LLM engine from sleep mode."""
+            try:
+                self.llm.wake_up()
+                await asyncio.sleep(5)
+                if self.is_data_sampler:
+                    self._is_sleeping = False
+                return {"message": "LLM engine has been woken up successfully"}
+            except Exception as e:
+                logger.error(f"Failed to wake up LLM: {e}")
+                return {"error": f"Failed to wake up LLM: {str(e)}"}
+
         # Add data sampler specific endpoints if in data sampler mode
         if self.is_data_sampler:
             @app.post("/get_sample/")
@@ -405,9 +495,16 @@ class DataSamplerServer:
                     await asyncio.sleep(5)
                     return {"sample": None}
                 items = self.buffer.pop(0)
-                if len(self.buffer) < self.buffer_size:
+                # Only trigger buffer fill if not sleeping and sleep not requested
+                if (len(self.buffer) < self.buffer_size and 
+                    not getattr(self, '_is_sleeping', False) and 
+                    not getattr(self, '_sleep_requested', False)):
                     background_tasks.add_task(self.buffer_fill)
                     logger.info("requesting buffer fill")
+                elif getattr(self, '_is_sleeping', False):
+                    logger.info("Skipping buffer fill request - LLM is sleeping")
+                elif getattr(self, '_sleep_requested', False):
+                    logger.info("Skipping buffer fill request - sleep requested")
                 return {"sample": items}
 
             @app.post("/buffer_fill/")
@@ -415,6 +512,10 @@ class DataSamplerServer:
                 """Fills the buffer with new samples if not already filling."""
                 if self._is_filling:
                     return {"message": "Buffer fill already in progress"}
+                if getattr(self, '_is_sleeping', False):
+                    return {"message": "Buffer fill skipped - LLM is sleeping"}
+                if getattr(self, '_sleep_requested', False):
+                    return {"message": "Buffer fill skipped - sleep requested"}
                 background_tasks.add_task(self.buffer_fill)
                 return {"message": "Buffer filling started"}
 
@@ -425,6 +526,8 @@ class DataSamplerServer:
                     "current_size": len(self.buffer),
                     "max_size": self.buffer_size,
                     "is_filling": self._is_filling,
+                    "is_sleeping": getattr(self, '_is_sleeping', False),
+                    "sleep_requested": getattr(self, '_sleep_requested', False),
                     "epoch": self._epoch,
                 }
 
@@ -444,10 +547,21 @@ class DataSamplerServer:
         """Fills the buffer with new samples."""
         if not self.is_data_sampler or self._is_filling:
             return
+        
+        # Don't fill buffer if LLM is sleeping or sleep is requested
+        if (hasattr(self, '_is_sleeping') and self._is_sleeping) or \
+           (hasattr(self, '_sleep_requested') and self._sleep_requested):
+            logger.info("Skipping buffer fill - LLM is sleeping or sleep requested")
+            return
 
         self._is_filling = True
         try:
             while len(self.buffer) < self.buffer_size:
+                # Check if sleep was requested during buffer fill
+                if hasattr(self, '_sleep_requested') and self._sleep_requested:
+                    logger.info("Sleep requested during buffer fill - stopping buffer fill")
+                    break
+                    
                 items = []
                 for _ in range(self._generation_batch_size):
                     try:
@@ -477,45 +591,55 @@ class DataSamplerServer:
         if not self.is_data_sampler:
             return []
 
-        prompts = [item[self.dataset_field] for item in items]
-        all_outputs = self.llm.generate(prompts, sampling_params=self._sampling_params)
-        
-        completion_ids = [
-            list(output.token_ids)
-            for outputs in all_outputs
-            for output in outputs.outputs
-        ]
-        stop_reason = [output.stop_reason for outputs in all_outputs for output in outputs.outputs]
-        finish_reason = [output.finish_reason for outputs in all_outputs for output in outputs.outputs]
-        completions = [self.tokenizer.decode(c) for c in completion_ids]
-
-        all_outputs = []
-        for g_idx, item in enumerate(items):
-            output = {
-                "item": [item] * self.config.vllm_n,
-                "completions": [],
-                "completion_ids": [],
-                "stop_reason": [],
-                "finish_reason": [],
-                "epoch": self._epoch,
-                "inputs": item[self.dataset_field]
-            }
+        with self._generation_lock:
+            # Check if sleep was requested while waiting for the lock
+            if hasattr(self, '_sleep_requested') and self._sleep_requested:
+                logger.info("Sleep requested - aborting sample processing")
+                return []
+                
+            prompts = [item[self.dataset_field] for item in items]
+            if self.config.single_gpu and os.path.exists(self.lora_path):
+                all_outputs = self.llm.generate(prompts, sampling_params=self._sampling_params, lora_request=LoRARequest("grpo", self._lora_idx, self.lora_path))
+                self._lora_idx += 1
+            else:
+                all_outputs = self.llm.generate(prompts, sampling_params=self._sampling_params)
             
-            for idx in range(self.config.vllm_n):
-                base_idx = g_idx * self.config.vllm_n + idx
-                output["completions"].append(completions[base_idx])
-                output["completion_ids"].append(completion_ids[base_idx])
-                output["stop_reason"].append(stop_reason[base_idx])
-                output["finish_reason"].append(finish_reason[base_idx])
+            completion_ids = [
+                list(output.token_ids)
+                for outputs in all_outputs
+                for output in outputs.outputs
+            ]
+            stop_reason = [output.stop_reason for outputs in all_outputs for output in outputs.outputs]
+            finish_reason = [output.finish_reason for outputs in all_outputs for output in outputs.outputs]
+            completions = [self.tokenizer.decode(c) for c in completion_ids]
 
-            output["all_rewards"], output["rewards"], output["mean"], output["std"] = (
-                self.calculate_rewards(
-                    output["item"], output["completions"], output["completion_ids"]
+            all_outputs = []
+            for g_idx, item in enumerate(items):
+                output = {
+                    "item": [item] * self.config.vllm_n,
+                    "completions": [],
+                    "completion_ids": [],
+                    "stop_reason": [],
+                    "finish_reason": [],
+                    "epoch": self._epoch,
+                    "inputs": item[self.dataset_field]
+                }
+                
+                for idx in range(self.config.vllm_n):
+                    base_idx = g_idx * self.config.vllm_n + idx
+                    output["completions"].append(completions[base_idx])
+                    output["completion_ids"].append(completion_ids[base_idx])
+                    output["stop_reason"].append(stop_reason[base_idx])
+                    output["finish_reason"].append(finish_reason[base_idx])
+
+                output["all_rewards"], output["rewards"], output["mean"], output["std"] = (
+                    self.calculate_rewards(
+                        output["item"], output["completions"], output["completion_ids"]
+                    )
                 )
-            )
-            all_outputs.append(output)
+                all_outputs.append(output)
 
-        return all_outputs
+            return all_outputs
 
     def calculate_rewards(self, items, completions, completion_ids):
         """Calculates rewards for generated completions."""
@@ -573,6 +697,64 @@ class DataSamplerServer:
 
         uvicorn.run(self.app, host=self.config.host, port=self.config.port)
         dist.destroy_process_group()
+
+
+class VLLMClient:
+    """Client for interacting with the VLLM server."""
+    
+    def __init__(self, host: str = "localhost", port: int = 8000):
+        self.base_url = f"http://{host}:{port}"
+        
+    def _make_request(self, method: str, endpoint: str, json_data=None):
+        """Make HTTP request to the server."""
+        import requests
+        url = f"{self.base_url}{endpoint}"
+        try:
+            if method.upper() == "GET":
+                response = requests.get(url)
+            elif method.upper() == "POST":
+                response = requests.post(url, json=json_data)
+            else:
+                raise ValueError(f"Unsupported method: {method}")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"Request failed: {e}")
+            return None
+    
+    def health_check(self):
+        """Check if the server is healthy."""
+        return self._make_request("GET", "/health/")
+    
+    def generate(self, prompts, **kwargs):
+        """Generate completions for the given prompts."""
+        request_data = {"prompts": prompts}
+        request_data.update(kwargs)
+        return self._make_request("POST", "/generate/", request_data)
+    
+    def get_sample(self):
+        """Get a sample from the data sampler buffer."""
+        return self._make_request("POST", "/get_sample/")
+    
+    def get_buffer_status(self):
+        """Get the current buffer status."""
+        return self._make_request("GET", "/buffer_status/")
+    
+    def empty_buffer(self):
+        """Empty the server buffer."""
+        return self._make_request("POST", "/empty_buffer/")
+    
+    def buffer_fill(self):
+        """Trigger buffer fill."""
+        return self._make_request("POST", "/buffer_fill/")
+    
+    def sleep(self):
+        """Put the LLM engine to sleep."""
+        return self._make_request("POST", "/sleep/")
+    
+    def wake_up(self):
+        """Wake up the LLM engine from sleep."""
+        return self._make_request("POST", "/wake_up/")
 
 
 def load_config_from_yaml(yaml_path: str) -> ServerConfig:
