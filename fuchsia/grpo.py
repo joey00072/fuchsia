@@ -322,8 +322,8 @@ class GRPO:
                 completions.append(item["completions"][idx])
                 ignore_sample.append(item["finish_reason"][idx] != "length")
                 
-                mean_rewards.append(item["rewards"])
-                std_rewards.append(item["rewards"])
+                mean_rewards.append(item["mean"])
+                std_rewards.append(item["std"])
                 
         encoded = self.tokenizer(inputs_texts, padding=True, return_tensors="pt")
         input_ids = encoded["input_ids"]
@@ -391,7 +391,7 @@ class GRPO:
             if not self._is_model_on_gpu:
                 self.load_model_to_gpu()
             
-            x_batch_inputs, rewards, mean_rewards, std_rewards, loss_mask, ignore_samples = self.sample_batch()
+            x_batch_inputs, rewards, _mean_rewards, _std_rewards, loss_mask, ignore_samples = self.sample_batch()
             
             batch_inputs = x_batch_inputs.reshape(
                 self.batch_size, self.group_size, *x_batch_inputs.shape[1:]

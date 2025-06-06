@@ -391,7 +391,7 @@ class VLLMClient:
         Put the VLLM server to sleep with built-in fault tolerance.
         Automatically retries on failure and logs warnings instead of crashing.
         """
-        max_retries = 5
+        max_retries = 10
         for attempt in range(max_retries):
             try:
                 response = self._make_request("sleep", method="post", max_retries=2)
@@ -405,7 +405,7 @@ class VLLMClient:
             except Exception as e:
                 logger.warning(f"Sleep attempt {attempt + 1} failed with error: {e}")
                 if attempt < max_retries - 1:
-                    time.sleep(2)  # Wait before retry
+                    time.sleep(5)  # Wait before retry
                     
         logger.error(f"Failed to put VLLM client to sleep after {max_retries} attempts. Continuing anyway...")
         return {"sleep": False, "error": "Max retries exceeded"}
