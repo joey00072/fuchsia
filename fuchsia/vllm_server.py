@@ -38,6 +38,7 @@ from transformers import AutoTokenizer
 
 import asyncio
 import threading
+import torch
 
 # Check CUDA availability
 try:
@@ -653,12 +654,26 @@ class DataSamplerServer:
             )
             all_rewards[reward_function.__name__] = rewards
 
-        reward_values = np.array([list(rewards) for rewards in all_rewards.values()])
-        total_rewards = reward_values.sum(axis=0)
-        mean = float(total_rewards.mean())
-        std = float(total_rewards.std())
-
-        return all_rewards, total_rewards.tolist(), mean, std
+        # Convert all reward lists to tensors and stack them
+        if all_rewards:
+            reward_tensors = []
+            for rewards in all_rewards.values():
+                reward_tensor = torch.tensor(rewards, dtype=torch.float32)
+                reward_tensors.append(reward_tensor)
+            
+            # Stack tensors if we have multiple reward functions, otherwise use the single tensor
+            if len(reward_tensors) > 1:
+                reward_values = torch.stack(reward_tensors, dim=0)
+                total_rewards = reward_values.sum(dim=0)
+            else:
+                total_rewards = reward_tensors[0]
+            
+            mean = total_rewards.mean().item()
+            std = total_rewards.std().item()
+            
+            return all_rewards, total_rewards.tolist(), mean, std
+        else:
+            return {}, [], 0.0, 0.0
 
     def serve(self):
         """Starts the FastAPI server with rich console output."""

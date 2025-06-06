@@ -81,12 +81,12 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
                 answer_value = float(answer_content)
                 correct_template += 1
                 if answer_value == float(sample["correct_answer"]):
-                    content_reward += 3
+                    content_reward += 4
             except ValueError:
                 content_reward -= 0.1
 
         if correct_template == 1:
-            format_reward += 2.0
+            format_reward += 1.0
 
         return format_reward + content_reward
 

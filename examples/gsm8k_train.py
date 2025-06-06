@@ -70,6 +70,7 @@ def main():
             model_name,
             device_map="cpu",
             # load_in_4bit=True,
+            use_cache=False,
             torch_dtype=torch.bfloat16,
         )
         tokenizer = AutoTokenizer.from_pretrained(model_name)

@@ -260,16 +260,22 @@ class GRPO:
     def compute_loss(
         self, inputs, old_policy_log_probs, reward, mean_rewards, std_rewards, loss_mask, ignore_sample
     ) -> Tensor:
+        
+        if self.beta != 0:
+            with torch.no_grad():
+                # calculating this before calculating policy_log_probs reduces peak memory usage
+                with (
+                    self.ref_model.disable_adapter()
+                    if self.using_lora
+                    else contextlib.nullcontext()
+                ):
+                    ref_policy_log_probs = self.get_per_token_logps(self.ref_model, inputs)
+            
         policy_log_probs = self.get_per_token_logps(self.model, inputs, training=True)
 
         kld = 0
+        
         if self.beta != 0:
-            with (
-                self.ref_model.disable_adapter()
-                if self.using_lora
-                else contextlib.nullcontext()
-            ):
-                ref_policy_log_probs = self.get_per_token_logps(self.ref_model, inputs)
             # kl divergence calculation
             log_ratios = ref_policy_log_probs - policy_log_probs
             kld = torch.exp(log_ratios) - log_ratios - 1
@@ -313,17 +319,20 @@ class GRPO:
         
         for _ in range(self.batch_size):
             item = next(self.data_loader_iter)
+            
             rewards.append(item["rewards"])
+            mean_rewards.append(item["mean"])
+            std_rewards.append(item["std"])
+            
             for idx in range(len(item["completions"])):
                 samples.append(item)
-                
+
                 prompt = item["inputs"]
                 inputs_texts.append(prompt)
                 completions.append(item["completions"][idx])
                 ignore_sample.append(item["finish_reason"][idx] != "length")
                 
-                mean_rewards.append(item["mean"])
-                std_rewards.append(item["std"])
+
                 
         encoded = self.tokenizer(inputs_texts, padding=True, return_tensors="pt")
         input_ids = encoded["input_ids"]
@@ -382,7 +391,7 @@ class GRPO:
             wandb.log(metrics)
 
 
-    def train(self, epochs=1, max_iterations=1000):
+    def train(self, epochs=1, max_iterations=10000):
         
         idx = 0
         start_time = time.perf_counter()
@@ -391,7 +400,11 @@ class GRPO:
             if not self._is_model_on_gpu:
                 self.load_model_to_gpu()
             
-            x_batch_inputs, rewards, _mean_rewards, _std_rewards, loss_mask, ignore_samples = self.sample_batch()
+            x_batch_inputs, x_rewards, batch_mean_rewards, batch_std_rewards, loss_mask, ignore_samples = self.sample_batch()
+            
+            
+            batch_mean_rewards = batch_mean_rewards.unsqueeze(-1).repeat_interleave(self.group_size, dim=-1)
+            batch_std_rewards = batch_std_rewards.unsqueeze(-1).repeat_interleave(self.group_size, dim=-1)
             
             batch_inputs = x_batch_inputs.reshape(
                 self.batch_size, self.group_size, *x_batch_inputs.shape[1:]
@@ -402,7 +415,7 @@ class GRPO:
             ignore_samples = ignore_samples.reshape(
                 self.batch_size, self.group_size
             ).cpu()
-            rewards = rewards.cpu()
+            x_rewards = x_rewards.cpu()
 
             self.cleanup_tensors(x_batch_inputs)
 
@@ -415,14 +428,15 @@ class GRPO:
                     pi_old.append(x_old_policy_log_probs)
                 torch.cuda.empty_cache()
 
-            for b_inputs, b_old_policy_log_probs, b_reward, b_loss_mask, b_ignore_sample in zip(
-                batch_inputs, pi_old, rewards, loss_mask, ignore_samples
+            for b_inputs, b_old_policy_log_probs, b_reward, b_loss_mask, b_ignore_sample, b_mean_rewards, b_std_rewards in zip(
+                batch_inputs, pi_old, x_rewards, loss_mask, ignore_samples, batch_mean_rewards, batch_std_rewards
             ):
                 idx += 1
                 
                 reward = b_reward.to(self.device)
-                mean_rewards = reward.mean(dim=-1).unsqueeze(-1)
-                std_rewards = reward.std(dim=-1).unsqueeze(-1)
+                mean_x_rewards = reward.mean(dim=-1).unsqueeze(-1)
+                std_x_rewards = reward.std(dim=-1).unsqueeze(-1)
+
 
                 g_inputs = b_inputs.reshape(
                     b_inputs.shape[0] // self.micro_group_size,
@@ -450,17 +464,33 @@ class GRPO:
                     *b_ignore_sample.shape[1:],
                 )
                 
+                g_mean_rewards = b_mean_rewards.reshape(
+                    b_inputs.shape[0] // self.micro_group_size,
+                    self.micro_group_size,
+                    *b_mean_rewards.shape[1:],
+                )
+                g_std_rewards = b_std_rewards.reshape(
+                    b_inputs.shape[0] // self.micro_group_size,
+                    self.micro_group_size,
+                    *b_std_rewards.shape[1:],
+                )
+                
                 group_losses = []
                 self.optimizer.zero_grad(set_to_none=True)
+                
+                
 
-                for inputs, old_policy_log_probs, reward_batch, loss_mask_batch, ignore_sample_batch in zip(
-                    g_inputs, g_old_policy_log_probs, g_reward, g_loss_mask, g_ignore_sample
+                for inputs, old_policy_log_probs, reward_batch, loss_mask_batch, ignore_sample_batch, mean_rewards, std_rewards in zip(
+                    g_inputs, g_old_policy_log_probs, g_reward, g_loss_mask, g_ignore_sample, g_mean_rewards, g_std_rewards
                 ):
                     inputs = inputs.to(self.device)
                     old_policy_log_probs = old_policy_log_probs.to(self.device)
                     reward_batch = reward_batch.to(self.device)
                     loss_mask_batch = loss_mask_batch.to(self.device)
                     ignore_sample_batch = ignore_sample_batch.unsqueeze(-1).to(self.device)
+                    
+                    mean_rewards = mean_rewards.to(self.device)
+                    std_rewards = std_rewards.to(self.device)
 
                     loss = self.compute_loss(
                         inputs,
@@ -480,7 +510,7 @@ class GRPO:
                         loss_mask_batch, ignore_sample_batch, loss
                     )
 
-                self.optimizer.step()
+                
 
                 print(f"{idx:04d} loss: {sum(group_losses) / len(group_losses)} reward: {reward.mean()}")
                 
@@ -490,10 +520,9 @@ class GRPO:
                     self.metrics["mean_group_reward"].append(b_reward.mean().item())
                     self.metrics["loss"].append(sum(group_losses) / len(group_losses))
                     self.metrics["valid_samples"].append(b_ignore_sample.sum().item())
+            self.optimizer.step()
 
-                del reward, mean_rewards, std_rewards
-                
-            del batch_inputs, loss_mask, ignore_samples, rewards, pi_old, loss, x_batch_inputs
+            del batch_inputs, loss_mask, ignore_samples, x_rewards, pi_old, loss, x_batch_inputs, reward, mean_x_rewards, std_x_rewards
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -513,6 +542,7 @@ class GRPO:
                 if self.single_gpu:
                     self.logger.info("Offloading model to CPU")
                     self.offload_to_cpu()
+                    time.sleep(3)
                     
                     self.logger.info("Waking up VLLM client")
                     self.vllm_client.wake_up()
