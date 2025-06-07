@@ -1,179 +1,71 @@
-from dataclasses import dataclass, field
-from vllm import LLM, SamplingParams
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from concurrent.futures import ThreadPoolExecutor
-from rich import print
+class MultiHeadAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super(MultiHeadAttention, self).__init__()
+        assert embed_dim % num_heads == 0, "Embedding dimension must be divisible by number of heads"
+        
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
 
-# max_new_tokens = 256*2
-# prompts = [
-#     "The president of the United States is",
-#     "10 cities in india are"
-# ]
-# sampling_params = SamplingParams(temperature=0.8, top_p=0.95,max_tokens=max_new_tokens)
+        # Separate projections for query, key, value
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
 
+    def forward(self, x, mask=None, is_causal=False):
+        B, T, C = x.shape  # Batch size, Sequence length, Embedding dim
 
-# llm = LLM(model="unsloth/Llama-3.2-1B-Instruct",max_model_len=max_new_tokens)
+        # Linear projections
+        q = self.q_proj(x)  # (B, T, C)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
 
+        # Reshape for multi-head attention
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)  # (B, num_heads, T, head_dim)
+        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
-# outputs = llm.generate(prompts, sampling_params)
+        # scaled_dot_product_attention expects (B, num_heads, T, head_dim)
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, is_causal=is_causal
+        )  # (B, num_heads, T, head_dim)
 
-# for output in outputs:
-#     prompt = output.prompt
-#     generated_text = output.outputs[0].text
-#     print(f"Stop reason: {output.outputs[0].stop_reason} ")
-#     print("Finishe reason: ", output.outputs[0].finish_reason)
-#     print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
-    
-# print("==<<<END>>==\n")
+        # Concatenate heads
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, embed_dim)
 
-
-
-
-
-
-@dataclass
-class Rollout:
-    prompt: str = ""
-    completion: str = ""
-    last_completion: str = ""
-    stop: list[str] = field(default_factory=list)
-    stop_reason: str = ""
-    finish_reason: str = ""
-    completed: bool = False
-    state:dict = field(default_factory=dict)
-    
-    def __post_init__(self,**kwargs):
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-    
-    @property        
-    def is_completed(self):
-        return self.finish_reason in ["stop", "length"]
-    
-    def input(self):
-        return self.prompt+self.last_completion
+        return self.out_proj(attn_output)
     
     
-        
-
-@dataclass
-class Environment:
-    def process_rollouts(self, rollouts: list[Rollout]):
-        for rollout in rollouts:
-            if rollout.finish_reason in ["stop", "length"]:
-                rollout.completed = True
-        return rollouts
     
-
-class MultiTurnEnvironment(Environment):
-    def process_rollouts(self, rollouts: list[Rollout]):
-        for rollout in rollouts:
-            if rollout.finish_reason in ["stop", "length"]:
-                rollout.completed = True
-        for rollout in rollouts:
-            MultiTurnEnvironment.step_rollout(rollout)
-        return rollouts
+class MergedAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads , wqk, wqo):
+        super().__init__()
+        
+        
+        self.wqk = None
+        self.wqo = None
     
-    @staticmethod
-    def step_rollout(rollout: Rollout):
-        assert False, "Not implemented"
-        
-
-class PythonEnvironment(MultiTurnEnvironment):
-    def __init__(self):
-        self.stop = ["</python>"]
-        
-    @staticmethod
-    def python(code: str) -> str:
-        import subprocess
-        try:
-            result = subprocess.run(
-                ['python', '-c', code],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=10,
-                text=True
-            )
-            if result.stderr:
-                return f"Error: {result.stderr.strip()}"
-            output = result.stdout.strip() if result.stdout else ""
-            if len(output) > 512:
-                output = output[:512] + "... (truncated to 512 chars)"
-            return output
-        except subprocess.TimeoutExpired:
-            return "Error: Code execution timed out after 10 seconds"
-        
-    @staticmethod
-    def step_rollout(rollout: Rollout):
-        if rollout.stop_reason != "</python>":
-            return rollout
-        
-        if not "<python>" in rollout.last_completion:
-            return rollout
-        
-        code = rollout.last_completion.split("<python>")[1]
-        
-        output = PythonEnvironment.python(code)
-        
-        rollout.last_completion = f"</python>\n<output>\n{output}\n</output>"
-        return rollout
-
+    def forward(self, x):
+        pass
     
-class RolloutManager:
-    def __init__(self,llm: LLM, sampling_params: SamplingParams, environment: Environment = None):
-        self.llm = llm
-        self.sampling_params = sampling_params
-        self.rollouts = []
-        self.stop: list[str]|None = None
-        
-    def generate(self, prompts: list[str], n: int = 1, environment: Environment = None):
-        
-       rollouts = []
-       for prompt in prompts:
-           rollouts.extend([Rollout(prompt=prompt) for _ in range(n)])
-               
-       while any(not rollout.completed for rollout in rollouts):
-           incomplete_rollouts = [rollout for rollout in rollouts if not rollout.completed]
-           self._generate(incomplete_rollouts, environment)
-          
-           
-        
-        # while all rollouts are not completed
-            # filter incomplete rollouts
-            # genrate with vllm
-            # pass it to environment
-            # update rollouts
-            
-        # return rollouts
-        
-    def _generate(self, rollouts: list[Rollout], environment: Environment):
-       
-       inputs = []
-       for rollout in rollouts:
-           inputs.append(rollout.prompt+rollout.completion)
-           
-       completions = self.llm.generate(
-           inputs,
-           sampling_params=self.sampling_params,
-           use_tqdm=False,
-           stop=self.stop,
-       )
-       rollouts = environment.process_rollouts(rollouts)
-       return rollouts
-
-            
-            
-            
-            
-            
-        
-        
-        
     
- 
-
-print(Rollout(prompt="what is 2233+3234"))
-
-
-
-
+    @classmethod
+    def from_mha(cls, mha: MultiHeadAttention):
+        return cls(mha.embed_dim, mha.num_heads, mha.wqk, mha.wqo)
+    
+    
+    
+    
+# Example usage:
+embed_dim = 512
+num_heads = 8
+mha = MultiHeadAttention(embed_dim, num_heads)
+x = torch.rand(32, 10, embed_dim)  # (batch_size, seq_length, embed_dim)
+output = mha(x)
+print(output.shape)  # (32, 10, 512)

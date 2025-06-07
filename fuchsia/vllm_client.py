@@ -267,9 +267,9 @@ class VLLMClient:
 
     def update_model_params(self, model: nn.Module, lora=False, single_gpu=False,lora_path=None):
         if single_gpu:
-            for name, param in model.named_parameters():
-                if "lora" in name:
-                    print(f"{param.data.sum()}")
+            # for name, param in model.named_parameters():
+            #     if "lora" in name:
+            #         print(f"{param.data.sum()}")
             model.save_pretrained(lora_path,adapter_name="grpo")
             return
         if lora:
