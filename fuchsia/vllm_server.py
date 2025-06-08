@@ -421,6 +421,8 @@ class DataSamplerServer:
                         self._generation_lock.release()
                 
                 self.llm.sleep(level=1)  # Level 1: offload weights to CPU & clear KV cache
+                torch.cuda.synchronize()
+                torch.randn(1).cuda()
                 torch.cuda.empty_cache()  # Clear CUDA cache after sleep
                 
                 if self.is_data_sampler:
@@ -445,7 +447,10 @@ class DataSamplerServer:
             """Wakes up the LLM engine from sleep mode."""
             try:
                 self.llm.wake_up()
-                await asyncio.sleep(5)
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.randn(1).cuda()
+                await asyncio.sleep(1)
                 if self.is_data_sampler:
                     self._is_sleeping = False
                 return {"message": "LLM engine has been woken up successfully"}
@@ -531,9 +536,11 @@ class DataSamplerServer:
             try:
                 while len(self.buffer) < self.buffer_size:
                     # Check if sleep was requested during buffer fill
-                    if hasattr(self, '_sleep_requested') and self._sleep_requested:
-                        logger.info("Sleep requested during buffer fill - stopping buffer fill")
-                        break
+                    # if hasattr(self, '_sleep_requested') and self._sleep_requested:
+                    #     logger.info("Sleep requested during buffer fill - stopping buffer fill")
+                    #     break
+                    
+                    print(f"Buffer Size: {len(self.buffer)}")
                         
                     items = []
                     for _ in range(self._generation_batch_size):
@@ -545,9 +552,23 @@ class DataSamplerServer:
                             self._epoch += 1
 
                     start_time = time.perf_counter()
-                    items_with_rewards = self.process_sample(items)
+                    
+                    generation_kwargs = {}
+                    if self.config.single_gpu and os.path.exists(self.lora_path):
+                        generation_kwargs["lora_request"] = LoRARequest("grpo", self._lora_idx, self.lora_path)
+                        self._lora_idx += 1
+                    # items_with_rewards = self.process_sample(items)
+                    rollouts:list[Rollout] = []
+                    for item in items:
+                        r = Rollout(prompt=item[self.dataset_field], item=item)
+                        rollouts.append(r)
+                        
+                    rollouts = self.environment.generate(rollouts, self.llm, self._sampling_params, vllm_generate_kwargs=generation_kwargs)
+                    items_with_rewards = self.environment.payload(rollouts)
                     end_time = time.perf_counter()
                     print(f"time taken: {end_time - start_time}")
+                    if len(items_with_rewards) == 0:
+                        continue
                     print("==========")
                     for item in items_with_rewards:
                         print(f"{item['all_rewards']}")
@@ -571,7 +592,6 @@ class DataSamplerServer:
             
         prompts = [item[self.dataset_field] for item in items]
         
-        rollouts = [Rollout(prompt=item[self.dataset_field]) for item in items]
         
         generation_kwargs = {}
         if self.config.single_gpu and os.path.exists(self.lora_path):

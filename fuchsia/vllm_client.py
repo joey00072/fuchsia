@@ -386,12 +386,12 @@ class VLLMClient:
         logger.error(f"Failed to trigger buffer fill after {max_retries} attempts. Continuing anyway...")
         return {"buffer_fill": False, "error": "Max retries exceeded"}
 
-    def sleep(self):
+    def sleep(self, max_retries=10):
         """
         Put the VLLM server to sleep with built-in fault tolerance.
         Automatically retries on failure and logs warnings instead of crashing.
         """
-        max_retries = 10
+        sleep_time = 1
         for attempt in range(max_retries):
             try:
                 response = self._make_request("sleep", method="post", max_retries=2)
@@ -401,7 +401,8 @@ class VLLMClient:
                 else:
                     logger.warning(f"Sleep attempt {attempt + 1} failed: {response}")
                     if attempt < max_retries - 1:
-                        time.sleep(2)  # Wait before retry
+                        time.sleep(sleep_time)  # Wait before retry
+                        sleep_time = min(sleep_time * 2, 8)
             except Exception as e:
                 logger.warning(f"Sleep attempt {attempt + 1} failed with error: {e}")
                 if attempt < max_retries - 1:

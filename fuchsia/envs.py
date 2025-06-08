@@ -24,6 +24,11 @@ class Rollout:
     
     item: dict = field(default_factory=dict)
     epoch: int = 0
+    
+    rewards: dict = field(default_factory=dict)
+    all_rewards: dict = field(default_factory=dict)
+    mean: float = 0.0
+    std: float = 0.0
 
     def __post_init__(self, **kwargs):
         for key, value in kwargs.items():
@@ -148,11 +153,12 @@ class Environment:
                                  output["all_rewards"], output["rewards"], output["mean"], output["std"] = {}, [], 0.0, 0.0
                  
             samples.append(output)
+        samples = [s for s in samples if s["std"] != 0.0]
         return samples
 
     def calculate_rewards(self, items, completions, completion_ids):
         """Calculate rewards using the environment's reward functions."""
-        import torch
+        import numpy as np
         
         all_rewards = {}
         for reward_function in self.reward_functions:
@@ -161,22 +167,22 @@ class Environment:
             )
             all_rewards[reward_function.__name__] = rewards
 
-        # Convert all reward lists to tensors and stack them
+        # Convert all reward lists to numpy arrays and stack them
         if all_rewards:
-            reward_tensors = []
+            reward_arrays = []
             for rewards in all_rewards.values():
-                reward_tensor = torch.tensor(rewards, dtype=torch.float32)
-                reward_tensors.append(reward_tensor)
+                reward_array = np.array(rewards)
+                reward_arrays.append(reward_array)
             
-            # Stack tensors if we have multiple reward functions, otherwise use the single tensor
-            if len(reward_tensors) > 1:
-                reward_values = torch.stack(reward_tensors, dim=0)
-                total_rewards = reward_values.sum(dim=0)
+            # Stack arrays if we have multiple reward functions, otherwise use the single array
+            if len(reward_arrays) > 1:
+                reward_values = np.stack(reward_arrays, axis=0)
+                total_rewards = reward_values.sum(axis=0)
             else:
-                total_rewards = reward_tensors[0]
+                total_rewards = reward_arrays[0]
             
-            mean = total_rewards.mean().item()
-            std = total_rewards.std().item()
+            mean = float(np.mean(total_rewards))
+            std = float(np.std(total_rewards))
             
             return all_rewards, total_rewards.tolist(), mean, std
         else:

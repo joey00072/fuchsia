@@ -213,6 +213,7 @@ class GRPO:
             self.load_model_to_gpu()
         self.model.eval()
         self.move_optimizer_to_cpu()
+        
 
     def prepare_for_training(self):
         if not self._is_model_on_gpu:
@@ -343,6 +344,14 @@ class GRPO:
 
         outputs = []
         self.metrics["samples"].append({"prompt": decoded, "completions": completions})
+        
+        
+        avg_token_lengths = 0
+        for completion in completions:
+            avg_token_lengths += len(self.tokenizer.encode(completion))
+        avg_token_lengths /= len(completions)
+        
+        self.metrics["avg_token_lengths"].append(avg_token_lengths)
 
         for prompt, completion in zip(decoded, completions):
             outputs.append(prompt + completion)
@@ -517,7 +526,7 @@ class GRPO:
                 if self.log_wandb:
                     self.metrics["idx"].append(idx)
                     self.metrics["total_reward"].append(reward.mean().item())
-                    self.metrics["mean_group_reward"].append(b_reward.mean().item())
+                    self.metrics["mean_group_reward"].append(batch_mean_rewards.mean().item())
                     self.metrics["loss"].append(sum(group_losses) / len(group_losses))
                     self.metrics["valid_samples"].append(b_ignore_sample.sum().item())
             self.optimizer.step()
@@ -526,7 +535,7 @@ class GRPO:
             gc.collect()
             torch.cuda.empty_cache()
 
-            print(f"iter {idx}  >>> reward: {b_reward.mean()}")
+            print(f"iter {idx}  >>> reward: {batch_mean_rewards.mean()}")
             print(f"Total time: {str(datetime.timedelta(seconds=int(time.perf_counter() - start_time)))}")
             self.log_metrics()
 
@@ -542,20 +551,20 @@ class GRPO:
                 if self.single_gpu:
                     self.logger.info("Offloading model to CPU")
                     self.offload_to_cpu()
-                    time.sleep(3)
+                    time.sleep(1)
                     
                     self.logger.info("Waking up VLLM client")
                     self.vllm_client.wake_up()
-                    time.sleep(5)
+                    time.sleep(1)
                     
                 self.logger.info("Filling buffer")
                 self.vllm_client.fill_buffer()
-                time.sleep(5)
+                # time.sleep(5)
                 
                 if self.single_gpu:
                     self.logger.info("Putting VLLM client to sleep")
                     self.vllm_client.sleep()
-                    time.sleep(5)
+                    time.sleep(1)
                     self.logger.info("Loading model back to GPU")
                     self.load_model_to_gpu()
             
