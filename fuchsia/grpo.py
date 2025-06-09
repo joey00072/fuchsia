@@ -120,16 +120,24 @@ class GRPO:
 
     def _setup_memory_management(self):
         """Setup CUDA memory management for optimal performance."""
-        if torch.cuda.is_available():
-            # Configure CUDA allocator for better memory management
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+        if not torch.cuda.is_available():
+            return
             
-            # Enable expandable segments if available
-            try:
-                torch.cuda.memory._set_allocator_settings("expandable_segments:True")
-            except:
-                pass  # Fallback for older PyTorch versions
+        # Configure CUDA allocator for better memory management
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Enable expandable segments if available
+        try:
+            torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+            self.logger.info("Enabled CUDA expandable segments")
+        except Exception as e:
+            self.logger.debug(f"Could not enable expandable segments: {e}")
+            
+        # Log initial memory state
+        allocated = torch.cuda.memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        self.logger.info(f"Initial GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
 
 
 
@@ -161,10 +169,7 @@ class GRPO:
         self._is_model_on_gpu = False
         self._is_optimizer_on_gpu = False
         
-        gc.collect()
-        torch.cuda.empty_cache()
-        
-        torch.cuda.synchronize()
+        self.clean_and_sync_memory()
         
         allocated = torch.cuda.memory_allocated() / (1024**3)
         reserved = torch.cuda.memory_reserved() / (1024**3)
@@ -198,9 +203,7 @@ class GRPO:
         self._is_model_on_gpu = True
         self._is_optimizer_on_gpu = True
         
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
+        self.clean_and_sync_memory()
         
         allocated_memory_gb = torch.cuda.memory_allocated() / (1024**3)
         reserved_memory_gb = torch.cuda.memory_reserved() / (1024**3)
@@ -228,17 +231,21 @@ class GRPO:
                     state[k] = v.to("cpu", non_blocking=True)
         
         self._is_optimizer_on_gpu = False
-        gc.collect()
-        torch.cuda.empty_cache()
+        self.clean_and_sync_memory()
 
     @torch.no_grad()
     def cleanup_tensors(self, *tensors):
         for tensor in tensors:
             if hasattr(tensor, 'data'):
                 del tensor
+        self.clean_and_sync_memory()
+        
+    def clean_and_sync_memory(self):
+        self.logger.info("Cleaning and syncing memory...")
+        torch.cuda.synchronize()
+        torch.randn(1).cuda()
         gc.collect()
         torch.cuda.empty_cache()
-
 
     def selective_log_softmax(self, logits, index):
         per_token_logps = []
@@ -287,11 +294,11 @@ class GRPO:
         
         policy_ratio = torch.exp(policy_log_probs - old_policy_log_probs.detach())
 
-        loss1 = policy_ratio * advantage
-        loss2 = (
+        unclipped_loss = policy_ratio * advantage
+        clipped_loss = (
             torch.clamp(policy_ratio, 1 - self.epsilon, 1 + self.epsilon_high) * advantage
         )
-        loss = -torch.min(loss1, loss2)
+        loss = -torch.min(unclipped_loss, clipped_loss)
         
         if self.ignore_imcomplete_samples:
             loss = loss * ignore_sample
@@ -379,8 +386,8 @@ class GRPO:
         valid_gen_mask = gen_tokens != self.tokenizer.pad_token_id
         loss_mask[:, prompt_length:] = valid_gen_mask
 
-        del encoded, attention_mask, decoded, gen_tokens, valid_gen_mask
-        gc.collect()
+        # del encoded, attention_mask, decoded, gen_tokens, valid_gen_mask
+        # self.clean_and_sync_memory()
 
         return (
             outputs,
@@ -426,7 +433,7 @@ class GRPO:
             ).cpu()
             x_rewards = x_rewards.cpu()
 
-            self.cleanup_tensors(x_batch_inputs)
+            # self.cleanup_tensors(x_batch_inputs)
 
             pi_old = []
             with torch.no_grad():
@@ -514,12 +521,10 @@ class GRPO:
                     group_losses.append(loss.item())
                     loss.backward()
                     
-                    self.cleanup_tensors(
-                        inputs, old_policy_log_probs, reward_batch, 
-                        loss_mask_batch, ignore_sample_batch, loss
-                    )
-
-                
+                    # self.cleanup_tensors(
+                    #     inputs, old_policy_log_probs, reward_batch, 
+                    #     loss_mask_batch, ignore_sample_batch, loss
+                    # )
 
                 print(f"{idx:04d} loss: {sum(group_losses) / len(group_losses)} reward: {reward.mean()}")
                 
@@ -531,9 +536,8 @@ class GRPO:
                     self.metrics["valid_samples"].append(b_ignore_sample.sum().item())
             self.optimizer.step()
 
-            del batch_inputs, loss_mask, ignore_samples, x_rewards, pi_old, loss, x_batch_inputs, reward, mean_x_rewards, std_x_rewards
-            gc.collect()
-            torch.cuda.empty_cache()
+            # del batch_inputs, loss_mask, ignore_samples, x_rewards, pi_old, loss, x_batch_inputs, reward, mean_x_rewards, std_x_rewards
+            # self.clean_and_sync_memory()
 
             print(f"iter {idx}  >>> reward: {batch_mean_rewards.mean()}")
             print(f"Total time: {str(datetime.timedelta(seconds=int(time.perf_counter() - start_time)))}")

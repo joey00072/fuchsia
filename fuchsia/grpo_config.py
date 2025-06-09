@@ -30,6 +30,8 @@ class GRPOConfig:
     using_lora: bool = False
     lora_path: str = "lora_weights"
     ignore_imcomplete_samples: bool = True
+    use_clipping: str = "ppo"
+    
     # Generation parameters
     max_new_tokens: int = 512
     temperature: float = 0.9
