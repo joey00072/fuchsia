@@ -207,18 +207,6 @@ class GRPO:
         
         return self.model
 
-    def prepare_for_inference(self):
-        if not self._is_model_on_gpu:
-            self.load_model_to_gpu()
-        self.model.eval()
-        self.move_optimizer_to_cpu()
-        
-
-    def prepare_for_training(self):
-        if not self._is_model_on_gpu:
-            self.load_model_to_gpu()
-        self.model.train()
-
     @torch.no_grad()
     def move_optimizer_to_cpu(self):
         for state in self.optimizer.state.values():
@@ -424,7 +412,7 @@ class GRPO:
             x_batch_inputs, x_rewards, batch_mean_rewards, batch_std_rewards, loss_mask, ignore_samples = self.sample_batch()
             
             batch_mean_rewards = batch_mean_rewards.unsqueeze(-1).repeat_interleave(self.group_size, dim=-1)
-            batch_std_rewards = batch_std_rewards.unsqueeze(-1).repeat_interleave(self.group_size, dim=-1)
+            batch_std_rewards  = batch_std_rewards.unsqueeze(-1).repeat_interleave(self.group_size, dim=-1)
             
             batch_inputs = x_batch_inputs.reshape(
                 self.batch_size, self.group_size, *x_batch_inputs.shape[1:]
