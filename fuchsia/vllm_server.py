@@ -234,6 +234,10 @@ class DataSamplerServer:
         self.config = config
         logger.info(config)
         self.stop = stop
+
+        if not os.environ.get('VLLM_ATTENTION_BACKEND'):
+            os.environ['VLLM_ATTENTION_BACKEND'] = 'flashinfer'
+            logger.info("Set VLLM_ATTENTION_BACKEND to flashinfer")
         
         kwargs = {}
         if config.vllm_kv_quantization:
