@@ -386,12 +386,11 @@ class VLLMClient:
         logger.error(f"Failed to trigger buffer fill after {max_retries} attempts. Continuing anyway...")
         return {"buffer_fill": False, "error": "Max retries exceeded"}
 
-    def sleep(self, max_retries=10):
+    def sleep(self, max_retries=10, retry_sleep_time=1, max_retry_sleep_time=8):
         """
         Put the VLLM server to sleep with built-in fault tolerance.
         Automatically retries on failure and logs warnings instead of crashing.
-        """
-        sleep_time = 1
+        """ 
         for attempt in range(max_retries):
             try:
                 response = self._make_request("sleep", method="post", max_retries=2)
@@ -401,32 +400,33 @@ class VLLMClient:
                 else:
                     logger.warning(f"Sleep attempt {attempt + 1} failed: {response}")
                     if attempt < max_retries - 1:
-                        time.sleep(sleep_time)  # Wait before retry
-                        sleep_time = min(sleep_time * 2, 8)
+                        time.sleep(retry_sleep_time)  # Wait before retry
+                        retry_sleep_time = min(retry_sleep_time * 2, max_retry_sleep_time)
             except Exception as e:
                 logger.warning(f"Sleep attempt {attempt + 1} failed with error: {e}")
                 if attempt < max_retries - 1:
-                    time.sleep(5)  # Wait before retry
+                    time.sleep(retry_sleep_time)  # Wait before retry
+                    retry_sleep_time = min(retry_sleep_time * 2, max_retry_sleep_time)
                     
         logger.error(f"Failed to put VLLM client to sleep after {max_retries} attempts. Continuing anyway...")
         return {"sleep": False, "error": "Max retries exceeded"}
 
-    def wake_up(self):
+    def wake_up(self, max_retries=10, retry_wake_up_time=1, max_retry_wake_up_time=8):
         """
         Wake up the VLLM server with built-in fault tolerance.
         Automatically retries on failure and logs warnings instead of crashing.
         """
-        max_retries = 5
         for attempt in range(max_retries):
             try:
                 res = self._make_request("wake_up", method="post", max_retries=2)
-                time.sleep(5)
+                time.sleep(retry_wake_up_time)
                 logger.info("VLLM client successfully woken up")
                 return res
             except Exception as e:
                 logger.warning(f"Wake up attempt {attempt + 1} failed with error: {e}")
                 if attempt < max_retries - 1:
-                    time.sleep(3)  # Wait before retry
+                    time.sleep(retry_wake_up_time)  # Wait before retry
+                    retry_wake_up_time = min(retry_wake_up_time * 2, max_retry_wake_up_time)
                     
         logger.error(f"Failed to wake up VLLM client after {max_retries} attempts. Continuing anyway...")
         return {"wake_up": False, "error": "Max retries exceeded"}

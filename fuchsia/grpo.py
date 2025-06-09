@@ -4,15 +4,15 @@ import gc
 import logging
 import time
 from collections import defaultdict
-from typing import Any, Callable, List, Optional
+from typing import Callable, List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
-from peft import PeftModel
 from torch import Tensor
 from transformers import AutoModelForCausalLM
+from fuchsia.vllm_client import VLLMClient
 
 try:
     from torch.utils.viz._cycles import warn_tensor_cycles
@@ -30,7 +30,7 @@ class GRPO:
         optimizer=None,
         reward_functions: List[Callable] = None,
         config=None,
-        vllm_client=None,
+        vllm_client:VLLMClient=None,
     ):
         self.config = config
         self.logger = getattr(config, "logger", logging.getLogger("GRPO"))
@@ -97,7 +97,6 @@ class GRPO:
         if self.using_lora and self.beta > 0:
             self.ref_model = model
 
-        self.distributed = config.use_vllm
         self.log_wandb = config.log_wandb
         if self.log_wandb:
             wandb.init(project=config.wandb_project)
@@ -111,9 +110,6 @@ class GRPO:
         if config.use_vllm:
             self.logger.info("Using VLLM")
             self.vllm_client = vllm_client if vllm_client is not None else VLLMClient()
-            
-        # if self.single_gpu:
-        #     self.model.save_pretrained(self.lora_path)
 
         # Set up proper memory management
         self._setup_memory_management()
@@ -138,8 +134,6 @@ class GRPO:
         allocated = torch.cuda.memory_allocated() / (1024**3)
         reserved = torch.cuda.memory_reserved() / (1024**3)
         self.logger.info(f"Initial GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
-
-
 
     @torch.no_grad()
     def offload_to_cpu(self):
@@ -170,11 +164,12 @@ class GRPO:
         self._is_optimizer_on_gpu = False
         
         self.clean_and_sync_memory()
+        time.sleep(1)
         
         allocated = torch.cuda.memory_allocated() / (1024**3)
         reserved = torch.cuda.memory_reserved() / (1024**3)
         self.logger.info(f"GPU Memory after offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
-        
+
         return self.model
     
     @torch.no_grad()
@@ -204,6 +199,7 @@ class GRPO:
         self._is_optimizer_on_gpu = True
         
         self.clean_and_sync_memory()
+        time.sleep(1)
         
         allocated_memory_gb = torch.cuda.memory_allocated() / (1024**3)
         reserved_memory_gb = torch.cuda.memory_reserved() / (1024**3)
@@ -319,7 +315,6 @@ class GRPO:
         inputs_texts = []
         outputs = []
         completions = []
-        samples = []
         rewards = []
         mean_rewards = []
         std_rewards = []
@@ -333,14 +328,10 @@ class GRPO:
             std_rewards.append(item["std"])
             
             for idx in range(len(item["completions"])):
-                samples.append(item)
-
                 prompt = item["inputs"]
                 inputs_texts.append(prompt)
                 completions.append(item["completions"][idx])
                 ignore_sample.append(item["finish_reason"][idx] != "length")
-                
-
                 
         encoded = self.tokenizer(inputs_texts, padding=True, return_tensors="pt")
         input_ids = encoded["input_ids"]
@@ -351,7 +342,6 @@ class GRPO:
 
         outputs = []
         self.metrics["samples"].append({"prompt": decoded, "completions": completions})
-        
         
         avg_token_lengths = 0
         for completion in completions:
@@ -368,7 +358,6 @@ class GRPO:
         )["input_ids"]
 
         input_ids = torch.repeat_interleave(input_ids, self.group_size, dim=0)
-        samples = [sample for _ in range(self.group_size) for sample in samples]
 
         decoded_outputs = self.tokenizer.batch_decode(
             outputs, skip_special_tokens=False
@@ -385,9 +374,6 @@ class GRPO:
         gen_tokens = outputs[:, prompt_length:]
         valid_gen_mask = gen_tokens != self.tokenizer.pad_token_id
         loss_mask[:, prompt_length:] = valid_gen_mask
-
-        # del encoded, attention_mask, decoded, gen_tokens, valid_gen_mask
-        # self.clean_and_sync_memory()
 
         return (
             outputs,
@@ -406,6 +392,25 @@ class GRPO:
                 metrics[f"train/{k}"] = v[idx] if len(v) >= idx else v[-1]
             wandb.log(metrics)
 
+    def handle_policy_update(self):
+        self.vllm_client.update_model_params(
+            self.model, lora=self.using_lora, 
+            single_gpu=self.single_gpu, lora_path=self.lora_path
+        )
+        
+        if not self.async_buffer_fill:
+            self.vllm_client.empty_buffer()
+            
+        if not self.single_gpu:
+            self.vllm_client.fill_buffer()
+            return
+            
+        # if hotswap is enabled
+        self.offload_to_cpu()
+        self.vllm_client.wake_up()
+        self.vllm_client.fill_buffer()
+        self.vllm_client.sleep()
+        self.load_model_to_gpu()
 
     def train(self, epochs=1, max_iterations=10000):
         
@@ -417,7 +422,6 @@ class GRPO:
                 self.load_model_to_gpu()
             
             x_batch_inputs, x_rewards, batch_mean_rewards, batch_std_rewards, loss_mask, ignore_samples = self.sample_batch()
-            
             
             batch_mean_rewards = batch_mean_rewards.unsqueeze(-1).repeat_interleave(self.group_size, dim=-1)
             batch_std_rewards = batch_std_rewards.unsqueeze(-1).repeat_interleave(self.group_size, dim=-1)
@@ -432,8 +436,6 @@ class GRPO:
                 self.batch_size, self.group_size
             ).cpu()
             x_rewards = x_rewards.cpu()
-
-            # self.cleanup_tensors(x_batch_inputs)
 
             pi_old = []
             with torch.no_grad():
@@ -450,9 +452,6 @@ class GRPO:
                 idx += 1
                 
                 reward = b_reward.to(self.device)
-                mean_x_rewards = reward.mean(dim=-1).unsqueeze(-1)
-                std_x_rewards = reward.std(dim=-1).unsqueeze(-1)
-
 
                 g_inputs = b_inputs.reshape(
                     b_inputs.shape[0] // self.micro_group_size,
@@ -493,8 +492,6 @@ class GRPO:
                 
                 group_losses = []
                 self.optimizer.zero_grad(set_to_none=True)
-                
-                
 
                 for inputs, old_policy_log_probs, reward_batch, loss_mask_batch, ignore_sample_batch, mean_rewards, std_rewards in zip(
                     g_inputs, g_old_policy_log_probs, g_reward, g_loss_mask, g_ignore_sample, g_mean_rewards, g_std_rewards
@@ -520,11 +517,6 @@ class GRPO:
                     
                     group_losses.append(loss.item())
                     loss.backward()
-                    
-                    # self.cleanup_tensors(
-                    #     inputs, old_policy_log_probs, reward_batch, 
-                    #     loss_mask_batch, ignore_sample_batch, loss
-                    # )
 
                 print(f"{idx:04d} loss: {sum(group_losses) / len(group_losses)} reward: {reward.mean()}")
                 
@@ -536,41 +528,12 @@ class GRPO:
                     self.metrics["valid_samples"].append(b_ignore_sample.sum().item())
             self.optimizer.step()
 
-            # del batch_inputs, loss_mask, ignore_samples, x_rewards, pi_old, loss, x_batch_inputs, reward, mean_x_rewards, std_x_rewards
-            # self.clean_and_sync_memory()
-
             print(f"iter {idx}  >>> reward: {batch_mean_rewards.mean()}")
             print(f"Total time: {str(datetime.timedelta(seconds=int(time.perf_counter() - start_time)))}")
             self.log_metrics()
 
-            if idx % self.num_policy_updates == 0 and self.distributed:
-                self.vllm_client.update_model_params(
-                    self.model, lora=self.using_lora, 
-                    single_gpu=self.single_gpu, lora_path=self.lora_path
-                )
-                
-                if not self.async_buffer_fill:
-                    self.vllm_client.empty_buffer()
-                    
-                if self.single_gpu:
-                    self.logger.info("Offloading model to CPU")
-                    self.offload_to_cpu()
-                    time.sleep(1)
-                    
-                    self.logger.info("Waking up VLLM client")
-                    self.vllm_client.wake_up()
-                    time.sleep(1)
-                    
-                self.logger.info("Filling buffer")
-                self.vllm_client.fill_buffer()
-                # time.sleep(5)
-                
-                if self.single_gpu:
-                    self.logger.info("Putting VLLM client to sleep")
-                    self.vllm_client.sleep()
-                    time.sleep(1)
-                    self.logger.info("Loading model back to GPU")
-                    self.load_model_to_gpu()
+            if idx % self.num_policy_updates == 0:
+                self.handle_policy_update()
             
             if idx % self.config.save_every == 0:
                 self.model.save_pretrained(f"{self.lora_path}/{idx}", adapter_name="grpo")
