@@ -13,8 +13,8 @@ class GRPOConfig:
     All parameters are user-configurable for maximum flexibility.
     """
     group_size: int = 8
-    micro_group_size: int = 2
     batch_size: int = 1
+    grad_accumulation_steps: int = 1
     max_iterations: int = 1000
     log_wandb: bool = False
     dtype: str = "bfloat16"
@@ -39,6 +39,7 @@ class GRPOConfig:
     top_p: float = 1.0
     top_k: int = -1
     min_p: float = 0.0
+
     # Logging and saving
     log_level: str = "INFO"
     save_every: int = 25
@@ -102,8 +103,8 @@ class GRPOConfig:
         grpo_config = GRPOConfig(
             # GRPO specific parameters
             group_size=grpo_config_dict.get("group_size", 8),
-            micro_group_size=grpo_config_dict.get("micro_group_size", 2),
             batch_size=grpo_config_dict.get("batch_size", 1),
+            grad_accumulation_steps=grpo_config_dict.get("grad_accumulation_steps", 1),
             lr=float(grpo_config_dict.get("lr", 5e-6)),
             weight_decay=float(grpo_config_dict.get("weight_decay", 0.0)),
             beta=float(grpo_config_dict.get("beta", 0.0)),

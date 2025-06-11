@@ -98,8 +98,8 @@ def main():
 
         grpo_config = GRPOConfig(
             group_size=config["grpo"]["group_size"],
-            micro_group_size=config["grpo"]["micro_group_size"],
             batch_size=config["grpo"]["batch_size"],
+            grad_accumulation_steps=config["grpo"]["grad_accumulation_steps"],
             lr=float(config["grpo"]["lr"]),
             weight_decay=float(config["grpo"]["weight_decay"]),
             beta=float(config["grpo"]["beta"]),

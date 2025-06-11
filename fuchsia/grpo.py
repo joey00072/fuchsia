@@ -4,14 +4,14 @@ import gc
 import logging
 import time
 from collections import defaultdict
-from typing import Callable, List
+from typing import Callable, List, Optional, Union, Dict, Any, Tuple, Iterator
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from torch import Tensor
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, PreTrainedTokenizer, PreTrainedModel
 from fuchsia.vllm_client import VLLMClient
 
 try:
@@ -23,15 +23,15 @@ except ImportError:
 class GRPO:
     def __init__(
         self,
-        model,
-        ref_model,
-        tokenizer,
-        dataset,
-        optimizer=None,
-        reward_functions: List[Callable] = None,
-        config=None,
-        vllm_client:VLLMClient=None,
-    ):
+        model: Union[str, PreTrainedModel],
+        ref_model: Optional[PreTrainedModel],
+        tokenizer: PreTrainedTokenizer,
+        dataset: Iterator[Dict[str, Any]],
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        reward_functions: Optional[List[Callable]] = None,
+        config: Any = None,
+        vllm_client: Optional[VLLMClient] = None,
+    ) -> None:
         self.config = config
         self.logger = getattr(config, "logger", logging.getLogger("GRPO"))
         self.device = config.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -58,7 +58,7 @@ class GRPO:
         self.dataset = dataset
         self.data_loader_iter = iter(self.dataset)
         self.group_size = config.group_size
-        self.micro_group_size = config.micro_group_size
+        self.micro_batch = config.batch_size // config.grad_accumulation_steps
         self.batch_size = config.batch_size
         self.max_iterations = config.max_iterations
         self.dtype = config.dtype
@@ -114,7 +114,7 @@ class GRPO:
         # Set up proper memory management
         self._setup_memory_management()
 
-    def _setup_memory_management(self):
+    def _setup_memory_management(self) -> None:
         """Setup CUDA memory management for optimal performance."""
         if not torch.cuda.is_available():
             return
@@ -136,7 +136,7 @@ class GRPO:
         self.logger.info(f"Initial GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
 
     @torch.no_grad()
-    def offload_to_cpu(self):
+    def offload_to_cpu(self) -> PreTrainedModel:
         """Improved CPU offloading with proper memory management."""
         self.logger.info("Starting offload to CPU...")
         
@@ -173,7 +173,7 @@ class GRPO:
         return self.model
     
     @torch.no_grad()
-    def load_model_to_gpu(self):
+    def load_model_to_gpu(self) -> PreTrainedModel:
         self.logger.info("Starting model load to GPU...")
         
         # wake up cuda allocator
@@ -208,7 +208,7 @@ class GRPO:
         return self.model
 
     @torch.no_grad()
-    def move_optimizer_to_cpu(self):
+    def move_optimizer_to_cpu(self) -> None:
         for state in self.optimizer.state.values():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor):
@@ -218,20 +218,20 @@ class GRPO:
         self.clean_and_sync_memory()
 
     @torch.no_grad()
-    def cleanup_tensors(self, *tensors):
+    def cleanup_tensors(self, *tensors: Tensor) -> None:
         for tensor in tensors:
             if hasattr(tensor, 'data'):
                 del tensor
         self.clean_and_sync_memory()
         
-    def clean_and_sync_memory(self):
+    def clean_and_sync_memory(self) -> None:
         self.logger.info("Cleaning and syncing memory...")
         torch.cuda.synchronize()
         torch.randn(1).cuda()
         gc.collect()
         torch.cuda.empty_cache()
 
-    def selective_log_softmax(self, logits, index):
+    def selective_log_softmax(self, logits: Tensor, index: Tensor) -> Tensor:
         per_token_logps = []
         for row_logits, row_labels in zip(logits, index):
             row_logps = F.log_softmax(row_logits, dim=-1)
@@ -242,7 +242,7 @@ class GRPO:
         per_token_logps = torch.stack(per_token_logps)
         return per_token_logps
 
-    def get_per_token_logps(self, model, input_ids, training=False) -> Tensor:
+    def get_per_token_logps(self, model: PreTrainedModel, input_ids: Tensor, training: bool = False) -> Tensor:
         logits = model(input_ids=input_ids, training=training).logits
         logits = logits[:, :-1, :]
         input_ids = input_ids[:, 1:]
@@ -250,7 +250,14 @@ class GRPO:
         return logps
 
     def compute_loss(
-        self, inputs, old_policy_log_probs, reward, mean_rewards, std_rewards, loss_mask, ignore_sample
+        self, 
+        inputs: Tensor, 
+        old_policy_log_probs: Tensor, 
+        reward: Tensor, 
+        mean_rewards: Tensor, 
+        std_rewards: Tensor, 
+        loss_mask: Tensor, 
+        ignore_sample: Tensor
     ) -> Tensor:
         
         if self.beta != 0:
@@ -299,7 +306,7 @@ class GRPO:
 
         return loss.mean()
 
-    def sample_batch(self):
+    def sample_batch(self) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         inputs_texts = []
         outputs = []
         completions = []
@@ -372,7 +379,7 @@ class GRPO:
             torch.tensor(ignore_sample, dtype=torch.bool).to(torch.int8)
         )
 
-    def log_metrics(self):
+    def log_metrics(self) -> None:
         if self.log_wandb:
             idx = self.metrics["idx"][-1] - 1
             metrics = {}
@@ -380,7 +387,7 @@ class GRPO:
                 metrics[f"train/{k}"] = v[idx] if len(v) >= idx else v[-1]
             wandb.log(metrics)
 
-    def handle_policy_update(self):
+    def handle_policy_update(self) -> None:
         self.vllm_client.update_model_params(
             self.model, lora=self.using_lora, 
             single_gpu=self.single_gpu, lora_path=self.lora_path
@@ -400,7 +407,7 @@ class GRPO:
         self.vllm_client.sleep()
         self.load_model_to_gpu()
 
-    def train(self, epochs=1, max_iterations=10000):
+    def train(self, epochs: int = 1, max_iterations: int = 10000) -> None:
         
         idx = 0
         start_time = time.perf_counter()
@@ -434,56 +441,25 @@ class GRPO:
                     pi_old.append(x_old_policy_log_probs)
                 torch.cuda.empty_cache()
 
+            self.optimizer.zero_grad()
             for b_inputs, b_old_policy_log_probs, b_reward, b_loss_mask, b_ignore_sample, b_mean_rewards, b_std_rewards in zip(
                 batch_inputs, pi_old, x_rewards, loss_mask, ignore_samples, batch_mean_rewards, batch_std_rewards
             ):
                 idx += 1
+                group_losses = []
                 
                 reward = b_reward.to(self.device)
 
-                g_inputs = b_inputs.reshape(
-                    b_inputs.shape[0] // self.micro_group_size,
-                    self.micro_group_size,
-                    *b_inputs.shape[1:],
-                )
-                g_old_policy_log_probs = b_old_policy_log_probs.reshape(
-                    b_inputs.shape[0] // self.micro_group_size,
-                    self.micro_group_size,
-                    *b_old_policy_log_probs.shape[1:],
-                )
-                g_reward = b_reward.reshape(
-                    b_inputs.shape[0] // self.micro_group_size,
-                    self.micro_group_size,
-                    *b_reward.shape[1:],
-                )
-                g_loss_mask = b_loss_mask.reshape(
-                    b_inputs.shape[0] // self.micro_group_size,
-                    self.micro_group_size,
-                    *b_loss_mask.shape[1:],
-                )
-                g_ignore_sample = b_ignore_sample.reshape(
-                    b_inputs.shape[0] // self.micro_group_size,
-                    self.micro_group_size,
-                    *b_ignore_sample.shape[1:],
-                )
-                
-                g_mean_rewards = b_mean_rewards.reshape(
-                    b_inputs.shape[0] // self.micro_group_size,
-                    self.micro_group_size,
-                    *b_mean_rewards.shape[1:],
-                )
-                g_std_rewards = b_std_rewards.reshape(
-                    b_inputs.shape[0] // self.micro_group_size,
-                    self.micro_group_size,
-                    *b_std_rewards.shape[1:],
-                )
-                
-                group_losses = []
-                self.optimizer.zero_grad(set_to_none=True)
-
-                for inputs, old_policy_log_probs, reward_batch, loss_mask_batch, ignore_sample_batch, mean_rewards, std_rewards in zip(
-                    g_inputs, g_old_policy_log_probs, g_reward, g_loss_mask, g_ignore_sample, g_mean_rewards, g_std_rewards
-                ):
+                for start in range(0, b_inputs.shape[0], self.micro_batch):
+                    end = start + self.micro_batch
+                    inputs = b_inputs[start:end]
+                    old_policy_log_probs = b_old_policy_log_probs[start:end]
+                    reward_batch = b_reward[start:end]
+                    loss_mask_batch = b_loss_mask[start:end]
+                    ignore_sample_batch = b_ignore_sample[start:end]
+                    mean_rewards = b_mean_rewards[start:end]
+                    std_rewards = b_std_rewards[start:end]
+                    
                     inputs = inputs.to(self.device)
                     old_policy_log_probs = old_policy_log_probs.to(self.device)
                     reward_batch = reward_batch.to(self.device)
