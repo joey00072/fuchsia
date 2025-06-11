@@ -73,12 +73,8 @@ class Environment:
         ##  otherwise the rollouts will forked at each step
         
         rollouts = [rollouts] if isinstance(rollouts, Rollout) else rollouts
-        all_rollouts = []
-        for rollout in rollouts:
-            all_rollouts.extend([rollout.clone() for _ in range(sampling_params.n)])
-            
-        sampling_params.n = 1
-
+        all_rollouts = rollouts
+        
         step = 0
         while (
             step < self.max_samples and
@@ -95,15 +91,22 @@ class Environment:
             )
             
             ##  Update the rollouts with the vllm outputs
-            for rollout, output in zip(all_rollouts, vllm_outputs):
-                rollout.last_completion = output.outputs[0].text
-                rollout.completion += output.outputs[0].text
-                rollout.completion_ids.extend(list(output.outputs[0].token_ids))
-                rollout.stop_reason = output.outputs[0].stop_reason if output.outputs[0].stop_reason else ""
-                rollout.finish_reason = output.outputs[0].finish_reason if output.outputs[0].finish_reason else ""
-                
+            new_rollouts = []
+            for rollout, outputs in zip(all_rollouts, vllm_outputs):
+                for idx,output in enumerate(outputs.outputs):
+                    new_rollout = rollout.clone()
+                    new_rollout.last_completion = output.text
+                    new_rollout.completion += output.text
+                    new_rollout.completion_ids.extend(list(output.token_ids))
+                    new_rollout.stop_reason = output.stop_reason if output.stop_reason else ""
+                    new_rollout.finish_reason = output.finish_reason if output.finish_reason else ""
+                    new_rollouts.append(new_rollout)
             ##  Process the rollouts
-            all_rollouts = self.process_rollouts(all_rollouts,step)
+            all_rollouts = self.process_rollouts(new_rollouts,step)
+            
+            # reset the n to 1 otherwise the rollouts will forked at each step
+            sampling_params.n = 1
+            
         return all_rollouts
     
     def process_rollouts(self, rollouts: list[Rollout], step: int):
