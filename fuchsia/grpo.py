@@ -20,6 +20,8 @@ try:
 except ImportError:
     CYCLE_DETECTION_AVAILABLE = False
 
+from fuchsia.grpo_config import GRPOConfig
+
 class GRPO:
     def __init__(
         self,
@@ -29,7 +31,7 @@ class GRPO:
         dataset: Iterator[Dict[str, Any]],
         optimizer: Optional[torch.optim.Optimizer] = None,
         reward_functions: Optional[List[Callable]] = None,
-        config: Any = None,
+        config: GRPOConfig = None,
         vllm_client: Optional[VLLMClient] = None,
     ) -> None:
         self.config = config
@@ -66,6 +68,7 @@ class GRPO:
         self.epsilon = config.epsilon
         self.epsilon_high = config.epsilon_high
         self.single_gpu = config.single_gpu
+        self.non_blocking = config.non_blocking
         
         self.optimizer = (
             optimizer
@@ -138,26 +141,27 @@ class GRPO:
     @torch.no_grad()
     def offload_to_cpu(self) -> PreTrainedModel:
         """Improved CPU offloading with proper memory management."""
+        offload_start_time = time.perf_counter()
         self.logger.info("Starting offload to CPU...")
         
         # wake up cuda allocator
         torch.randn(1).cuda()
         
         for param in self.model.parameters():
-            param.data = param.data.to("cpu", non_blocking=True)
+            param.data = param.data.to("cpu", non_blocking=self.non_blocking)
             if hasattr(param, "_local_shard"): # this need for fsdp
                 param._local_shard = param.data
             if param.grad is not None:
-                param.grad = param.grad.to("cpu", non_blocking=True)
+                param.grad = param.grad.to("cpu", non_blocking=self.non_blocking)
                 
         for buffer in self.model.buffers():
-            buffer.data = buffer.data.to("cpu", non_blocking=True)
+            buffer.data = buffer.data.to("cpu", non_blocking=self.non_blocking)
             
         if hasattr(self, 'optimizer') and self.optimizer is not None:
             for state in self.optimizer.state.values():
                 for k, v in state.items():
                     if isinstance(v, torch.Tensor):
-                        state[k] = v.to("cpu", non_blocking=True)
+                        state[k] = v.to("cpu", non_blocking=self.non_blocking)
         
         self.model.eval()        
         self._is_model_on_gpu = False
@@ -166,34 +170,36 @@ class GRPO:
         self.clean_and_sync_memory()
         time.sleep(1)
         
+        offload_time = time.perf_counter() - offload_start_time
         allocated = torch.cuda.memory_allocated() / (1024**3)
         reserved = torch.cuda.memory_reserved() / (1024**3)
-        self.logger.info(f"GPU Memory after offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+        self.logger.info(f"CPU offload completed in {offload_time:.2f}s - GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
 
         return self.model
     
     @torch.no_grad()
     def load_model_to_gpu(self) -> PreTrainedModel:
+        gpu_load_start_time = time.perf_counter()
         self.logger.info("Starting model load to GPU...")
         
         # wake up cuda allocator
         torch.randn(1).cuda()
         
         for param in self.model.parameters():
-            param.data = param.data.to("cuda", non_blocking=True)
+            param.data = param.data.to("cuda", non_blocking=self.non_blocking)
             
             if hasattr(param, "_local_shard"): # this need for fsdp
                 param._local_shard = param.data
             if param.grad is not None:
-                param.grad = param.grad.to("cuda", non_blocking=True)
+                param.grad = param.grad.to("cuda", non_blocking=self.non_blocking)
                 
         for buffer in self.model.buffers():
-            buffer.data = buffer.data.to("cuda", non_blocking=True)
+            buffer.data = buffer.data.to("cuda", non_blocking=self.non_blocking)
             
         for state in self.optimizer.state.values():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor):
-                    state[k] = v.to("cuda", non_blocking=True)
+                    state[k] = v.to("cuda", non_blocking=self.non_blocking)
     
         self._is_model_on_gpu = True
         self._is_optimizer_on_gpu = True
@@ -201,9 +207,10 @@ class GRPO:
         self.clean_and_sync_memory()
         time.sleep(1)
         
+        gpu_load_time = time.perf_counter() - gpu_load_start_time
         allocated_memory_gb = torch.cuda.memory_allocated() / (1024**3)
         reserved_memory_gb = torch.cuda.memory_reserved() / (1024**3)
-        self.logger.info(f"GPU Memory after load: {allocated_memory_gb:.2f}GB allocated, {reserved_memory_gb:.2f}GB reserved")
+        self.logger.info(f"GPU load completed in {gpu_load_time:.2f}s - GPU Memory: {allocated_memory_gb:.2f}GB allocated, {reserved_memory_gb:.2f}GB reserved")
         
         return self.model
 
@@ -212,7 +219,7 @@ class GRPO:
         for state in self.optimizer.state.values():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor):
-                    state[k] = v.to("cpu", non_blocking=True)
+                    state[k] = v.to("cpu", non_blocking=self.non_blocking)
         
         self._is_optimizer_on_gpu = False
         self.clean_and_sync_memory()
@@ -401,11 +408,21 @@ class GRPO:
             return
             
         # if hotswap is enabled
+        vllm_cycle_start_time = time.perf_counter()
+        self.logger.info("Starting VLLM hotswap cycle...")
+        
         self.offload_to_cpu()
+        
+        vllm_wake_start_time = time.perf_counter()
         self.vllm_client.wake_up()
         self.vllm_client.fill_buffer()
         self.vllm_client.sleep()
+        vllm_wake_time = time.perf_counter() - vllm_wake_start_time
+        
         self.load_model_to_gpu()
+        
+        total_vllm_cycle_time = time.perf_counter() - vllm_cycle_start_time
+        self.logger.info(f"VLLM hotswap cycle completed in {total_vllm_cycle_time:.2f}s (VLLM wake/fill/sleep: {vllm_wake_time:.2f}s)")
 
     def train(self, epochs: int = 1, max_iterations: int = 10000) -> None:
         

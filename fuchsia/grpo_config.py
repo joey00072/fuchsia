@@ -48,6 +48,8 @@ class GRPOConfig:
     debug: bool = True
     
     single_gpu: bool = False
+    non_blocking: bool = False
+    
     # Device
     device: Optional[str] = None  # If None, auto-detect
 
