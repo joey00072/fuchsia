@@ -39,6 +39,8 @@ class GRPO:
         self.device = config.device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.logger.info(f"Using device: {self.device}")
         
+        self.vllm_client = vllm_client if vllm_client is not None else VLLMClient()
+
         # Enable reference cycle detection if available
         if CYCLE_DETECTION_AVAILABLE:
             warn_tensor_cycles()
@@ -94,9 +96,6 @@ class GRPO:
         self._is_model_on_gpu = False
         self._is_optimizer_on_gpu = False
         
-        if not config.use_vllm and self.ignore_imcomplete_samples:
-            self.logger.warning("ignore_imcomplete_samples is set to True, but use_vllm is set to False. This will not have any effect.")
-            
         if self.using_lora and self.beta > 0:
             self.ref_model = model
 
@@ -110,9 +109,6 @@ class GRPO:
         if self.beta > 0 and ref_model is not None:
             self.ref_model = self.model
 
-        if config.use_vllm:
-            self.logger.info("Using VLLM")
-            self.vllm_client = vllm_client if vllm_client is not None else VLLMClient()
 
         # Set up proper memory management
         self._setup_memory_management()

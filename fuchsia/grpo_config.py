@@ -24,12 +24,11 @@ class GRPOConfig:
     epsilon: float = 0.2
     epsilon_high: float = 0.4
     wandb_project: str = "fuchsia"
-    use_vllm: bool = False
     dataset_feild: str = "prompt"
     num_policy_updates: int = 8
     using_lora: bool = False
     lora_path: str = "lora_weights"
-    ignore_imcomplete_samples: bool = True
+    ignore_imcomplete_samples: bool = False
     use_clipping: str = "ppo"
     
     # Generation parameters
@@ -136,9 +135,6 @@ class GRPOConfig:
             
             # LoRA configuration
             using_lora=lora_config.get("enabled", False),
-            
-            # Set use_vllm to True when loading from YAML (as it's commonly used in configs)
-            use_vllm=True,
         )
 
         return grpo_config
