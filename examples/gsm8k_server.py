@@ -110,7 +110,6 @@ def prepare_dataset(dataset, tokenizer=tokenizer) -> Dataset:
             if "####" not in text:
                 return None
             answer = text.split("####")[1].strip()
-            # Validate that the answer is a number
             answer = answer.replace(",", "").strip()
             answer = float(answer)
             return answer

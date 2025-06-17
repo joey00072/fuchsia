@@ -1,7 +1,7 @@
 import torch
 import logging
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import yaml
 
 
@@ -12,12 +12,18 @@ class GRPOConfig:
     Configuration for GRPO training and generation.
     All parameters are user-configurable for maximum flexibility.
     """
+    # Model configuration
+    model_name: str = ""
+    model_revision: Optional[str] = None
+    max_model_len: int = 1024
+    dtype: str = "bfloat16"
+    
+    
     group_size: int = 8
     batch_size: int = 1
     grad_accumulation_steps: int = 1
     max_iterations: int = 1000
     log_wandb: bool = False
-    dtype: str = "bfloat16"
     lr: float = 5e-6
     weight_decay: float = 0.0
     beta: float = 0.0
@@ -27,9 +33,17 @@ class GRPOConfig:
     dataset_feild: str = "prompt"
     num_policy_updates: int = 8
     using_lora: bool = False
+    lora_r: int = 8
+    lora_alpha: int = 16
+    lora_target_modules: Optional[List[str]] = None
     lora_path: str = "lora_weights"
     ignore_imcomplete_samples: bool = False
     use_clipping: str = "ppo"
+    
+
+    # Gradient checkpointing parameters
+    gradient_checkpointing_enabled: bool = False
+    gradient_checkpointing_cpu_offloading: bool = False
     
     # Generation parameters
     max_new_tokens: int = 512
@@ -101,6 +115,9 @@ class GRPOConfig:
         # Extract LoRA configuration
         lora_config = config.get("lora", {})
         
+        # Extract gradient checkpointing configuration
+        gradient_checkpointing_config = grpo_config_dict.get("gradient_checkpointing", {})
+        
         grpo_config = GRPOConfig(
             # GRPO specific parameters
             group_size=grpo_config_dict.get("group_size", 8),
@@ -115,6 +132,10 @@ class GRPOConfig:
             num_policy_updates=grpo_config_dict.get("num_policy_updates", 8),
             lora_path=grpo_config_dict.get("lora_path", "lora_weights"),
             single_gpu=grpo_config_dict.get("single_gpu", False),
+            
+            # Gradient checkpointing configuration
+            gradient_checkpointing_enabled=gradient_checkpointing_config.get("enabled", False),
+            gradient_checkpointing_cpu_offloading=gradient_checkpointing_config.get("cpu_offloading", False),
             
             # Model configuration
             dtype=model_config.get("dtype", "bfloat16"),
@@ -135,6 +156,14 @@ class GRPOConfig:
             
             # LoRA configuration
             using_lora=lora_config.get("enabled", False),
+            lora_r=lora_config.get("r", 8),
+            lora_alpha=lora_config.get("alpha", 16),
+            lora_target_modules=lora_config.get("target_modules", None),
+            
+            # Model configuration
+            model_name=model_config.get("name", ""),
+            model_revision=model_config.get("revision"),
+            max_model_len=model_config.get("max_model_len", 1024),
         )
 
         return grpo_config

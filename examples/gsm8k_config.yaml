@@ -36,6 +36,9 @@ grpo:
   num_policy_updates: 1
   lora_path: "./lora_weights"
   single_gpu: true
+  gradient_checkpointing:
+    enabled: true
+    cpu_offloading: true
 
 # Server configuration
 server:
