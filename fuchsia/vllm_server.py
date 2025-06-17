@@ -179,6 +179,10 @@ class ServerConfig:
     generation_batch_size: int = 1
     
     single_gpu: bool = False
+    
+    dataset_name: str = ""
+    dataset_split: str = "train"
+    dataset_max_samples: int = -1
        
 
     def __post_init__(self,**kwargs):
@@ -190,6 +194,69 @@ class ServerConfig:
         for key, value in kwargs.items():
             if not hasattr(self, key):
                 setattr(self, key, value)
+
+    @classmethod
+    def from_yaml(cls, yaml_path: str) -> "ServerConfig":
+        import yaml
+        
+        with open(yaml_path, "r") as f:
+            config = yaml.safe_load(f)
+    
+        # Extract server configuration
+        server_config = config.get("server", {})
+        
+        # Extract model configuration
+        model_config = config.get("model", {})
+        
+        # Extract dataset configuration
+        dataset_config = config.get("dataset", {})
+        
+        # Extract GRPO configuration for shared values
+        grpo_config = config.get("grpo", {})
+        
+        # Extract nested vllm configuration
+        vllm_config = server_config.get("vllm", {})
+        
+        # Create ServerConfig with all values loaded from YAML
+        server_config_obj = cls(
+            # Model configuration
+            model=model_config.get("name", ""),
+            revision=model_config.get("revision"),
+            dtype=model_config.get("dtype", "auto"),
+            max_model_len=model_config.get("max_model_len", 512),
+            
+            # Server configuration
+            host=server_config.get("host", "0.0.0.0"),
+            port=server_config.get("port", 8000),
+            gpu_memory_utilization=server_config.get("gpu_memory_utilization", 0.5),
+            tensor_parallel_size=server_config.get("tensor_parallel_size", 1),
+            enable_prefix_caching=server_config.get("enable_prefix_caching", None),
+            quantization=server_config.get("quantization"),
+            buffer_size=server_config.get("buffer_size", 32),
+            generation_batch_size=server_config.get("generation_batch_size", 1),
+            
+            # Dataset configuration
+            dataset_field=dataset_config.get("field", "text"),
+            dataset_name=dataset_config.get("name", ""),
+            dataset_split=dataset_config.get("split", "train"),
+            dataset_max_samples=dataset_config.get("max_samples", -1),
+            
+            # GRPO/LoRA shared configuration
+            lora_path=grpo_config.get("lora_path", "lora_weights"),
+            single_gpu=grpo_config.get("single_gpu", False),
+            
+            # VLLM configuration
+            vllm_n=vllm_config.get("n", 1),
+            vllm_repetition_penalty=vllm_config.get("repetition_penalty", 1.0),
+            vllm_temperature=vllm_config.get("temperature", 0.9),
+            vllm_top_p=vllm_config.get("top_p", 1.0),
+            vllm_top_k=vllm_config.get("top_k", -1),
+            vllm_min_p=vllm_config.get("min_p", 0.0),
+            vllm_max_tokens=vllm_config.get("max_tokens", 1024),
+            vllm_kv_quantization=vllm_config.get("kv_quantization", False),
+        )
+
+        return server_config_obj
 
 
 # API Models
