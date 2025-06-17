@@ -89,10 +89,16 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
         return -1.0
 
 
+idx = 0
 def reward_function_1(tokenizer, samples, completions, *args, **kwargs):
+    global idx
+    idx += 1
     lst = []
     for sample, completion in zip(samples, completions):
-        lst.append(response_format_reward(sample, completion))
+        reward = response_format_reward(sample, completion)
+        if idx > 10 and reward < 3:
+            reward = 0
+        lst.append(reward)
     return lst
 
 

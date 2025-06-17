@@ -294,6 +294,11 @@ class GRPO:
         )
         loss = -torch.min(unclipped_loss, clipped_loss)
         
+        if self.config.loss_type == "cispo":
+            loss = -clipped_loss.detach() * policy_log_probs
+            loss = (loss * loss_mask).sum(dim=-1) / (loss_mask.sum(dim=-1) + 1e-6)
+            return loss.mean()
+        
         if self.ignore_imcomplete_samples:
             loss = loss * ignore_sample
             kld = kld * ignore_sample

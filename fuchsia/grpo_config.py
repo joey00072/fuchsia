@@ -63,6 +63,8 @@ class GRPOConfig:
     single_gpu: bool = False
     non_blocking: bool = False
     
+    loss_type: str = "grpo"
+    
     # Device
     device: Optional[str] = None  # If None, auto-detect
 
