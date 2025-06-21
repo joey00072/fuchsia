@@ -631,6 +631,8 @@ class DataSamplerServer:
                     # items_with_rewards = self.process_sample(items)
                     rollouts:list[Rollout] = []
                     for item in items:
+                        # print(item)
+                        # print(f"FF: {self.dataset_field}")
                         r = Rollout(prompt=item[self.dataset_field], item=item)
                         rollouts.append(r)
                         

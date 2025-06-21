@@ -70,7 +70,7 @@ class GRPO:
         self.epsilon = config.epsilon
         self.epsilon_high = config.epsilon_high
         self.single_gpu = config.single_gpu
-        self.non_blocking = config.non_blocking
+        self.non_blocking = False # config.non_blocking
         
         self.optimizer = (
             optimizer
@@ -418,6 +418,18 @@ class GRPO:
         self.vllm_client.wake_up()
         self.vllm_client.fill_buffer()
         self.vllm_client.sleep()
+        # Wait for GPU memory to drop below half capacity
+        while True:
+            allocated_memory_gb = torch.cuda.memory_allocated() / (1024**3)
+            reserved_memory_gb = torch.cuda.memory_reserved() / (1024**3)
+            total_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            
+            if allocated_memory_gb < total_memory_gb / 2:
+                self.logger.info(f"GPU memory below half capacity: {allocated_memory_gb:.2f}GB / {total_memory_gb:.2f}GB")
+                break
+            
+            self.logger.info(f"Waiting for GPU memory to drop below half capacity: {allocated_memory_gb:.2f}GB / {total_memory_gb:.2f}GB")
+            time.sleep(2)
         vllm_wake_time = time.perf_counter() - vllm_wake_start_time
         
         self.load_model_to_gpu()

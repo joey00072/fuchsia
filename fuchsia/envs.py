@@ -52,6 +52,7 @@ class Environment:
     reward_functions: list[Callable] = field(default_factory=list)
     sampling_params: SamplingParams | None = None
     max_samples: int = 1
+    stop: list[str] = field(default_factory=list)
     
     def generate(
         self,   
@@ -62,13 +63,16 @@ class Environment:
         **kwargs,
     ):
         
+        print(self)
+        print("--------------------------------")
         # Environment sampling params are prioritized over the ones passed in the generate call
         if self.sampling_params is not None:
             sampling_params = self.sampling_params
             
         sampling_params = deepcopy(sampling_params)
         
-
+        if self.stop:
+            sampling_params.stop = self.stop
         ##  You can't n>1 for multi-turn environments
         ##  otherwise the rollouts will forked at each step
         
@@ -150,23 +154,23 @@ class Environment:
 
             if calculate_rewards and self.reward_functions:
                 output["all_rewards"], output["rewards"], output["mean"], output["std"] = (
-                    self.calculate_rewards(output["item"], output["completions"], output["completion_ids"])
+                    self.calculate_rewards(output["item"], output["completions"], output["completion_ids"], group)
                 )
             else:
-                                 output["all_rewards"], output["rewards"], output["mean"], output["std"] = {}, [], 0.0, 0.0
+                output["all_rewards"], output["rewards"], output["mean"], output["std"] = {}, [], 0.0, 0.0
                  
             samples.append(output)
         samples = [s for s in samples if s["std"] != 0.0]
         return samples
 
-    def calculate_rewards(self, items, completions, completion_ids):
+    def calculate_rewards(self, items, completions, completion_ids, rollouts):
         """Calculate rewards using the environment's reward functions."""
         import numpy as np
         
         all_rewards = {}
         for reward_function in self.reward_functions:
             rewards = reward_function(
-                None, items, completions, completion_ids  # tokenizer=None for now
+                rollouts=rollouts, items=items, completions=completions, completion_ids=completion_ids
             )
             all_rewards[reward_function.__name__] = rewards
 
@@ -202,18 +206,17 @@ class SingleTurnEnvironment(Environment):
                 rollout.completed = True
         return rollouts
 
-
+@dataclass
 class MultiTurnEnvironment(Environment):
     def process_rollouts(self, rollouts: list[Rollout], step: int):
         for rollout in rollouts:
             if rollout.finish_reason in ["stop", "length"]:
                 rollout.completed = True
         for rollout in rollouts:
-            MultiTurnEnvironment.step_rollout(rollout)
-        return rollouts
+            self.step_rollout(rollout)
+        return rollouts 
 
-    @staticmethod
-    def step_rollout(rollout: Rollout):
+    def step_rollout(self, rollout: Rollout):
         assert False, "Not implemented"
 
 
