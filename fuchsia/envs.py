@@ -160,6 +160,7 @@ class Environment:
                 output["all_rewards"], output["rewards"], output["mean"], output["std"] = {}, [], 0.0, 0.0
                  
             samples.append(output)
+        print(f"{[s['all_rewards'] for s in samples]}")
         samples = [s for s in samples if s["std"] != 0.0]
         return samples
 

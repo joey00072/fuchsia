@@ -1,7 +1,7 @@
-from fuchsia.vllm_server import DataSamplerServer, ServerConfig
+from fuchsia.vllm_server import DataSamplerServer, ServerConfig, Rollout
 from datasets import load_dataset
 from rich import print
-from typing import Optional
+from typing import Optional, List
 from datasets import Dataset
 from transformers import AutoTokenizer
 from pathlib import Path    
@@ -9,7 +9,7 @@ from pathlib import Path
 # os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-SYSTEM_PROMPT = "Respond in following format:<thinking>{step by step reasoning}</thinking><answer>{number}</answer>"
+SYSTEM_PROMPT = "Respond in following format:<thinking>{think on problem, understand problem create plan to solve it relfect on your step answer only when you are sure}</thinking><answer>{number}</answer>"
 
 
 def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
@@ -25,7 +25,8 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
     END_THINKING_TOKEN = "</thinking>"
     START_ANSWER_TOKEN = "<answer>"
     END_ANSWER_TOKEN = "</answer>"
-
+    idx = kwargs["idx"]
+    
     try:
         # Extract the actual response
         try:
@@ -64,7 +65,8 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
                 content_reward += 0.5
         else:
             format_reward -= 0.1
-
+        
+            
         # Validate answer section
         if "<answer>" in s and "</answer>" in s:
             format_reward += 0.4
@@ -81,6 +83,14 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
 
         if correct_template == 1:
             format_reward += 1.0
+            
+        if format_reward + content_reward >= 3 and idx < 8*8*2:
+            if "<thinking>" in s and "</thinking>" in s:
+                s = s.split("<thinking>")[1].split("</thinking>")[0]
+                format_reward += 0.001 * len(s)
+            if "</answer>" in s:
+                s = s.split("</answer>")[-1]
+                format_reward -= 0.001 * len(s)
 
         return format_reward + content_reward
 
@@ -90,15 +100,20 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
 
 
 idx = 0
-def reward_function_1(tokenizer, samples, completions, *args, **kwargs):
+def reward_function_1(rollouts: List[Rollout], *args, **kwargs):
     global idx
     idx += 1
+    print(f"{idx=}")
     lst = []
-    for sample, completion in zip(samples, completions):
-        reward = response_format_reward(sample, completion)
-        if idx > 10 and reward < 3:
+    for rollout in rollouts:
+        reward = response_format_reward(rollout.item, rollout.completion , idx=idx)
+        if idx > 8*8 and reward < 3:
             reward = 0
         lst.append(reward)
+        
+    if idx > 8*8 and not(any(x>4 for x in lst)):
+        lst = [0 for _ in lst]
+        
     return lst
 
 
@@ -157,6 +172,7 @@ def main():
     server_config = ServerConfig.from_yaml(Path(__file__).parent / "gsm8k_config.yaml")
     tokenizer = AutoTokenizer.from_pretrained(server_config.model)
     dataset = load_dataset(server_config.dataset_name, server_config.dataset_split)["train"]
+    dataset = dataset.shuffle()
     dataset = prepare_dataset(dataset, tokenizer)
     
     server = DataSamplerServer(server_config, dataset, [reward_function_1])

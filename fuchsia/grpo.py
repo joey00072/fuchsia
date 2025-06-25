@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import wandb
 from torch import Tensor
 from transformers import AutoModelForCausalLM, PreTrainedTokenizer, PreTrainedModel
+from transformers import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
 from fuchsia.vllm_client import VLLMClient
 
 try:
@@ -82,7 +83,15 @@ class GRPO:
             )
         )
         
+        # Initialize learning rate scheduler
+        self.use_scheduler = config.use_scheduler
+        self.scheduler = None
+        if self.use_scheduler:
+            self._setup_scheduler(config)
+        
         self.logger.info(f"Learning rate: {config.lr}")
+        if self.use_scheduler:
+            self.logger.info(f"Scheduler: {config.scheduler_type} with {config.warmup_steps} warmup steps")
         self.reward_functions: list = reward_functions
         self.dataset_feild = config.dataset_feild
         self.num_policy_updates = config.num_policy_updates
@@ -133,6 +142,30 @@ class GRPO:
         allocated = torch.cuda.memory_allocated() / (1024**3)
         reserved = torch.cuda.memory_reserved() / (1024**3)
         self.logger.info(f"Initial GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+
+    def _setup_scheduler(self, config: GRPOConfig) -> None:
+        """Setup learning rate scheduler based on configuration."""
+        if config.scheduler_type == "constant_with_warmup":
+            self.scheduler = get_constant_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=config.warmup_steps
+            )
+        elif config.scheduler_type == "cosine":
+            self.scheduler = get_cosine_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=config.warmup_steps,
+                num_training_steps=config.max_iterations
+            )
+        elif config.scheduler_type == "linear":
+            self.scheduler = get_linear_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=config.warmup_steps,
+                num_training_steps=config.max_iterations
+            )
+        else:
+            raise ValueError(f"Unsupported scheduler type: {config.scheduler_type}")
+        
+        self.logger.info(f"Initialized {config.scheduler_type} scheduler with {config.warmup_steps} warmup steps")
 
     @torch.no_grad()
     def offload_to_cpu(self) -> PreTrainedModel:
@@ -303,7 +336,7 @@ class GRPO:
             loss = loss * ignore_sample
             kld = kld * ignore_sample
         
-        loss = (loss * loss_mask).sum(dim=-1) / (loss_mask.sum(dim=-1) + 1e-6)
+        loss = (loss * loss_mask).sum(dim=-1) / (torch.ones_like(loss_mask).sum(dim=-1) + 1e-6) # dr grpo loss
         kld =  (kld  * loss_mask).sum(dim=-1) / (loss_mask.sum(dim=-1) + 1e-6)
 
         loss += kld * self.beta
@@ -521,6 +554,14 @@ class GRPO:
                     self.metrics["loss"].append(sum(group_losses) / len(group_losses))
                     self.metrics["valid_samples"].append(b_ignore_sample.sum().item())
             self.optimizer.step()
+
+            # Step the learning rate scheduler if enabled
+            if self.use_scheduler and self.scheduler is not None:
+                self.scheduler.step()
+                current_lr = self.scheduler.get_last_lr()[0]
+                if self.log_wandb:
+                    self.metrics["learning_rate"].append(current_lr)
+                self.logger.debug(f"Current learning rate: {current_lr:.2e}")
 
             print(f"iter {idx}  >>> reward: {batch_mean_rewards.mean()}")
             print(f"Total time: {str(datetime.timedelta(seconds=int(time.perf_counter() - start_time)))}")

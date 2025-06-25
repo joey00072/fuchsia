@@ -28,7 +28,7 @@ class GRPOConfig:
     weight_decay: float = 0.0
     beta: float = 0.0
     epsilon: float = 0.2
-    epsilon_high: float = 0.4
+    epsilon_high: float = 0.28
     wandb_project: str = "fuchsia"
     dataset_feild: str = "prompt"
     num_policy_updates: int = 8
@@ -39,6 +39,11 @@ class GRPOConfig:
     lora_path: str = "lora_weights"
     ignore_imcomplete_samples: bool = False
     use_clipping: str = "ppo"
+    
+    # Learning rate scheduler parameters
+    use_scheduler: bool = True
+    warmup_steps: int = 8
+    scheduler_type: str = "constant_with_warmup"  # Options: "constant_with_warmup", "cosine", "linear"
     
 
     # Gradient checkpointing parameters
@@ -129,11 +134,17 @@ class GRPOConfig:
             weight_decay=float(grpo_config_dict.get("weight_decay", 0.0)),
             beta=float(grpo_config_dict.get("beta", 0.0)),
             epsilon=float(grpo_config_dict.get("epsilon", 0.2)),
+            epsilon_high=float(grpo_config_dict.get("epsilon_high", 0.28)),
             log_wandb=grpo_config_dict.get("log_wandb", False),
             wandb_project=grpo_config_dict.get("wandb_project", "fuchsia"),
             num_policy_updates=grpo_config_dict.get("num_policy_updates", 8),
             lora_path=grpo_config_dict.get("lora_path", "lora_weights"),
             single_gpu=grpo_config_dict.get("single_gpu", False),
+            
+            # Learning rate scheduler parameters
+            use_scheduler=grpo_config_dict.get("use_scheduler", True),
+            warmup_steps=grpo_config_dict.get("warmup_steps", 8),
+            scheduler_type=grpo_config_dict.get("scheduler_type", "constant_with_warmup"),
             
             # Gradient checkpointing configuration
             gradient_checkpointing_enabled=gradient_checkpointing_config.get("enabled", False),
