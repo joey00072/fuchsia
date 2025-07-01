@@ -442,15 +442,19 @@ class GRPO:
             return
             
         # if hotswap is enabled
+        self._perform_vllm_hotswap_cycle()
+
+    def _perform_vllm_hotswap_cycle(self) -> None:
+        """Perform VLLM hotswap cycle: offload model, wake VLLM, fill buffer, wait for memory, load model back."""
         vllm_cycle_start_time = time.perf_counter()
         self.logger.info("Starting VLLM hotswap cycle...")
         
         self.offload_to_cpu()
-        
         vllm_wake_start_time = time.perf_counter()
         self.vllm_client.wake_up()
         self.vllm_client.fill_buffer()
         self.vllm_client.sleep()
+        
         # Wait for GPU memory to drop below half capacity
         while True:
             allocated_memory_gb = torch.cuda.memory_allocated() / (1024**3)
@@ -463,10 +467,9 @@ class GRPO:
             
             self.logger.info(f"Waiting for GPU memory to drop below half capacity: {allocated_memory_gb:.2f}GB / {total_memory_gb:.2f}GB")
             time.sleep(2)
+            
         vllm_wake_time = time.perf_counter() - vllm_wake_start_time
-        
         self.load_model_to_gpu()
-        
         total_vllm_cycle_time = time.perf_counter() - vllm_cycle_start_time
         self.logger.info(f"VLLM hotswap cycle completed in {total_vllm_cycle_time:.2f}s (VLLM wake/fill/sleep: {vllm_wake_time:.2f}s)")
 

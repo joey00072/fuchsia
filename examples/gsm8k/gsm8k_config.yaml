@@ -1,7 +1,7 @@
 # Generation configuration (shared parameters)
 generation: &generation
   max_len: &max_len 1024
-  group_size: &group_size 16
+  group_size: &group_size 8
   temperature: &temperature 0.7
   top_k: &top_k -1
   top_p: &top_p 1.0
@@ -25,8 +25,8 @@ lora:
 # GRPO training configuration
 grpo:
   group_size: *group_size
-  batch_size: *generation_batch_size
-  grad_accumulation_steps: *generation_batch_size
+  batch_size: 4
+  grad_accumulation_steps: 4
   lr: 0.0001
   weight_decay: 0.1
   beta: 0.0003
