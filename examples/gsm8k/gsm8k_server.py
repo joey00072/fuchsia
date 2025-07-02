@@ -22,9 +22,9 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
     USER_TOKEN = "user"
 
     START_THINKING_TOKEN = "<thinking>"
-    END_THINKING_TOKEN = "\n</thinking>"
-    START_ANSWER_TOKEN = "\n<answer>"
-    END_ANSWER_TOKEN = "\n</answer>"
+    END_THINKING_TOKEN = "</thinking>"
+    START_ANSWER_TOKEN = "<answer>"
+    END_ANSWER_TOKEN = "</answer>"
     idx = kwargs["idx"]
     
     try:
@@ -83,6 +83,15 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
 
         if correct_template == 1:
             format_reward += 1.0
+            
+        if format_reward + content_reward >= 3 and idx < 8*8*2:
+            if "<thinking>" in s and "</thinking>" in s:
+                s = s.split("<thinking>")[1].split("</thinking>")[0]
+                format_reward += 0.001 * len(s)
+            if "</answer>" in s:
+                s = s.split("</answer>")[-1]
+                format_reward -= 0.001 * len(s)
+
         return format_reward + content_reward
 
     except Exception as e:

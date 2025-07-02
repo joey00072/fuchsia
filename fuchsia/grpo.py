@@ -294,7 +294,7 @@ class GRPO:
         std_rewards: Tensor, 
         loss_mask: Tensor, 
         ignore_sample: Tensor
-    ) -> Tensor:
+    ) -> Tuple[Tensor, float]:
         
         if self.beta != 0:
             with torch.no_grad():
@@ -330,7 +330,7 @@ class GRPO:
         if self.config.loss_type == "cispo":
             loss = -clipped_loss.detach() * policy_log_probs
             loss = (loss * loss_mask).sum(dim=-1) / (loss_mask.sum(dim=-1) + 1e-6)
-            return loss.mean()
+            return loss.mean(), 0.0  # Return 0.0 for KLD when using CISPO
         
         if self.ignore_imcomplete_samples:
             loss = loss * ignore_sample
@@ -341,11 +341,10 @@ class GRPO:
 
         loss += kld * self.beta
 
-        if self.log_wandb:
-            for _kd in kld:
-                self.metrics["kld"].append(_kd.mean().item())
+        # Calculate average KLD for this batch
+        avg_kld = kld.mean().item() if self.beta != 0 else 0.0
 
-        return loss.mean()
+        return loss.mean(), avg_kld
 
     def sample_batch(self) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         inputs_texts = []
@@ -421,12 +420,19 @@ class GRPO:
         )
 
     def log_metrics(self) -> None:
-        if self.log_wandb:
-            idx = self.metrics["idx"][-1] - 1
-            metrics = {}
-            for k, v in self.metrics.items():
-                metrics[f"train/{k}"] = v[idx] if len(v) >= idx else v[-1]
-            wandb.log(metrics)
+        if not self.log_wandb:
+            return
+            
+        current_idx = self.metrics.get("idx", [0])[-1] if self.metrics.get("idx") else 0
+        
+        metrics = {
+            f"train/{k}": v[-1] 
+            for k, v in self.metrics.items() 
+            if k != "idx" and v
+        }
+        metrics["train/iteration"] = current_idx
+        
+        wandb.log(metrics)
 
     def handle_policy_update(self) -> None:
         self.vllm_client.update_model_params(
@@ -508,11 +514,22 @@ class GRPO:
                 torch.cuda.empty_cache()
 
             self.optimizer.zero_grad()
+            
+            # Collect metrics for this outer loop iteration
+            iteration_metrics = {
+                "total_reward": [],
+                "mean_group_reward": [],
+                "loss": [],
+                "valid_samples": [],
+                "kld": []
+            }
+            
             for b_inputs, b_old_policy_log_probs, b_reward, b_loss_mask, b_ignore_sample, b_mean_rewards, b_std_rewards in zip(
                 batch_inputs, pi_old, x_rewards, loss_mask, ignore_samples, batch_mean_rewards, batch_std_rewards
             ):
                 idx += 1
                 group_losses = []
+                group_klds = []
                 
                 reward = b_reward.to(self.device)
 
@@ -535,7 +552,7 @@ class GRPO:
                     mean_rewards = mean_rewards.to(self.device)
                     std_rewards = std_rewards.to(self.device)
 
-                    loss = self.compute_loss(
+                    loss, kld = self.compute_loss(
                         inputs,
                         old_policy_log_probs,
                         reward_batch,
@@ -546,16 +563,19 @@ class GRPO:
                     )
                     
                     group_losses.append(loss.item())
+                    group_klds.append(kld)
                     loss.backward()
 
                 print(f"{idx:04d} loss: {sum(group_losses) / len(group_losses)} reward: {reward.mean()}")
                 
-                if self.log_wandb:
-                    self.metrics["idx"].append(idx)
-                    self.metrics["total_reward"].append(reward.mean().item())
-                    self.metrics["mean_group_reward"].append(batch_mean_rewards.mean().item())
-                    self.metrics["loss"].append(sum(group_losses) / len(group_losses))
-                    self.metrics["valid_samples"].append(b_ignore_sample.sum().item())
+                # Collect metrics for this group
+                iteration_metrics["total_reward"].append(reward.mean().item())
+                iteration_metrics["mean_group_reward"].append(batch_mean_rewards.mean().item())
+                iteration_metrics["loss"].append(sum(group_losses) / len(group_losses))
+                iteration_metrics["valid_samples"].append(b_ignore_sample.sum().item())
+                iteration_metrics["kld"].append(sum(group_klds) / len(group_klds))
+            
+            # Step the optimizer
             self.optimizer.step()
 
             # Step the learning rate scheduler if enabled
@@ -565,6 +585,15 @@ class GRPO:
                 if self.log_wandb:
                     self.metrics["learning_rate"].append(current_lr)
                 self.logger.debug(f"Current learning rate: {current_lr:.2e}")
+
+            # Log metrics for this iteration (averaged across all groups)
+            if self.log_wandb:
+                self.metrics["idx"].append(idx)
+                self.metrics["total_reward"].append(sum(iteration_metrics["total_reward"]) / len(iteration_metrics["total_reward"]))
+                self.metrics["mean_group_reward"].append(sum(iteration_metrics["mean_group_reward"]) / len(iteration_metrics["mean_group_reward"]))
+                self.metrics["loss"].append(sum(iteration_metrics["loss"]) / len(iteration_metrics["loss"]))
+                self.metrics["valid_samples"].append(sum(iteration_metrics["valid_samples"]))
+                self.metrics["kld"].append(sum(iteration_metrics["kld"]) / len(iteration_metrics["kld"]))
 
             print(f"iter {idx}  >>> reward: {batch_mean_rewards.mean()}")
             print(f"Total time: {str(datetime.timedelta(seconds=int(time.perf_counter() - start_time)))}")

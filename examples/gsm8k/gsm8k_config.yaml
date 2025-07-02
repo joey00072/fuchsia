@@ -6,7 +6,7 @@ generation: &generation
   top_k: &top_k -1
   top_p: &top_p 1.0
   min_p: &min_p 0.0
-  batch_size: &generation_batch_size 4
+  batch_size: &generation_batch_size 2
 
 # Model configuration
 model:
@@ -18,18 +18,18 @@ model:
 # LoRA configuration
 lora:
   enabled: true
-  r: 8
+  r: 16
   alpha: 16
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
 
 # GRPO training configuration
 grpo:
   group_size: *group_size
-  batch_size: 4
-  grad_accumulation_steps: 4
-  lr: 0.0001
+  batch_size: *generation_batch_size
+  grad_accumulation_steps: *generation_batch_size
+  lr: 0.00001
   weight_decay: 0.1
-  beta: 0.0003
+  beta: 0.0
   epsilon: 0.2
   epsilon_high: 0.28
   log_wandb: true
