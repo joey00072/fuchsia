@@ -9,6 +9,11 @@ import re
 from fuchsia.envs import MultiTurnEnvironment, Rollout
 from dataclasses import dataclass
 import json
+from IPython.core.interactiveshell import InteractiveShell
+from IPython.core.inputtransformer2 import TransformerManager
+from IPython.utils.io import capture_output
+from types import MethodType
+
 
 # os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -20,12 +25,38 @@ def response_format_reward(rollouts: list[Rollout], *args, **kwargs) -> list[flo
     # correct_answer = sample["correct_answer"]
     lst = []  
     for rollout in rollouts:
-        print(rollout.state["reward"])
-        lst.append(rollout.state["reward"])
+        print(rollout.completion)
+        print(rollout.stop_reason)
+        print(rollout.finish_reason)
+        print("="*100)
     return lst
 
+def execute_code(code_string: str):
+    ip = InteractiveShell.instance()
+    ip.colors = "NoColor"
+    ip.ast_node_interactivity = "last_expr"
+    ip.displayhook.write_output_prompt = MethodType(
+        lambda self, *a, **k: None, ip.displayhook
+    )
+    with capture_output() as cap:
+        ip.run_cell(code_string, store_history=False)
 
-    
+    # whatever IPython printed (result only, no prompt) is here
+    return {"stdout/stderr": cap.stdout.strip()}
+
+tools = [
+    {
+        "name": "code_interpreter",
+        "description": "Python interpreter that takes code string as input and returns the output.",
+        "parameters": {
+            "code": {
+                "description": "The code to execute. only std output will be returned.",
+                "type": "str",
+                "default": "",
+            }
+        },
+    }
+]
 
 def prepare_dataset(dataset, tokenizer) -> Dataset:
 
@@ -47,12 +78,15 @@ def prepare_dataset(dataset, tokenizer) -> Dataset:
 
 give answer in  explanation \n<answer>number</answer> format.
 """
+
         example["text"] = tokenizer.apply_chat_template(
             [
-                {"role": "user", "content": prefix + example["prompt"][0]["content"]},
+                {"role": "user", "content": prefix + "What is the sum of the first 1000 prime numbers?"},
             ],
+            # tools=tools,
             tokenize=False,
         )
+        # print(example["text"])
         return example
 
   
