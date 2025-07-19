@@ -74,3 +74,6 @@ wandb/
 lora_weights/ 
 
 dev*
+unsloth*
+output*
+examples/function/outputs*
