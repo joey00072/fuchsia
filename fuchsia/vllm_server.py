@@ -631,12 +631,10 @@ class DataSamplerServer:
                     # items_with_rewards = self.process_sample(items)
                     rollouts:list[Rollout] = []
                     for item in items:
-                        # print(item)
-                        # print(f"FF: {self.dataset_field}")
                         r = Rollout(prompt=item[self.dataset_field], item=item)
                         rollouts.append(r)
                         
-                    rollouts = self.environment.generate(rollouts, self.llm, self._sampling_params, vllm_generate_kwargs=generation_kwargs)
+                    rollouts = self.environment.generate(rollouts, self.llm, self._sampling_params, vllm_generate_kwargs=generation_kwargs, tokenizer=self.tokenizer)
                     items_with_rewards = self.environment.payload(rollouts)
                     end_time = time.perf_counter()
                     print(f"time taken: {end_time - start_time}")

@@ -459,6 +459,7 @@ class GRPO:
         vllm_wake_start_time = time.perf_counter()
         self.vllm_client.wake_up()
         self.vllm_client.fill_buffer()
+        time.sleep(5)
         self.vllm_client.sleep()
         
         # Wait for GPU memory to drop below half capacity

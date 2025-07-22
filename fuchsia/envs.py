@@ -2,14 +2,19 @@ from dataclasses import dataclass, field
 from vllm import LLM, SamplingParams
 from typing import Callable
 import numpy as np
-
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from rich import print
-
+from collections import defaultdict
 from copy import deepcopy
+from transformers import AutoTokenizer
+
 
 @dataclass
 class Rollout:
+    
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    group_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     
     prompt: str = ""
     completion: str = ""
@@ -44,14 +49,17 @@ class Rollout:
     
     
     def clone(self):
-        return deepcopy(self)
+        new_rollout = deepcopy(self)
+        new_rollout.id = str(uuid.uuid4())
+        new_rollout.group_id = self.group_id
+        return new_rollout
 
 
 @dataclass
 class Environment:
     reward_functions: list[Callable] = field(default_factory=list)
     sampling_params: SamplingParams | None = None
-    max_samples: int = 1
+    max_steps: int = 1
     stop: list[str] = field(default_factory=list)
     
     def generate(
@@ -60,16 +68,21 @@ class Environment:
         llm: LLM,
         sampling_params: SamplingParams | None = None,
         vllm_generate_kwargs: dict = {},
+        tokenizer: AutoTokenizer = None,
         **kwargs,
     ):
         
         print(self)
         print("--------------------------------")
+        process_kwargs = {
+            "tokenizer": tokenizer,
+            "max_model_len": llm.llm_engine.model_config.max_model_len,
+        }
         # Environment sampling params are prioritized over the ones passed in the generate call
         if self.sampling_params is not None:
             sampling_params = self.sampling_params
             
-        sampling_params = deepcopy(sampling_params)
+        sampling_params:SamplingParams = deepcopy(sampling_params)
         
         if self.stop:
             sampling_params.stop = self.stop
@@ -77,16 +90,18 @@ class Environment:
         ##  otherwise the rollouts will forked at each step
         
         rollouts = [rollouts] if isinstance(rollouts, Rollout) else rollouts
-        all_rollouts = rollouts
+        all_rollouts: dict[str, Rollout] = {rollout.id: rollout for rollout in rollouts}
+        
         
         step = 0
         while (
-            step < self.max_samples and
-            not all([rollout.completed for rollout in all_rollouts])
+            step < self.max_steps and
+            not all([rollout.completed for rollout in all_rollouts.values()])
             ):
             
             step += 1
-            inputs = [rollout.input for rollout in all_rollouts]
+            active_rollouts = [rollout for rollout in all_rollouts.values() if not rollout.completed]
+            inputs = [rollout.input for rollout in active_rollouts]
             
             vllm_outputs = llm.generate(
                 inputs,
@@ -96,9 +111,9 @@ class Environment:
             
             ##  Update the rollouts with the vllm outputs
             new_rollouts = []
-            for rollout, outputs in zip(all_rollouts, vllm_outputs):
+            for rollout, outputs in zip(active_rollouts, vllm_outputs):
                 for idx,output in enumerate(outputs.outputs):
-                    new_rollout = rollout.clone()
+                    new_rollout = rollout.clone() if idx != len(outputs.outputs) - 1 else rollout
                     new_rollout.last_completion = output.text
                     new_rollout.completion += output.text
                     new_rollout.completion_ids.extend(list(output.token_ids))
@@ -106,14 +121,24 @@ class Environment:
                     new_rollout.finish_reason = output.finish_reason if output.finish_reason else ""
                     new_rollouts.append(new_rollout)
             ##  Process the rollouts
-            all_rollouts = self.process_rollouts(new_rollouts,step)
+            new_rollouts = self.process_rollouts(new_rollouts,step, process_kwargs)
+            for rollout in new_rollouts:
+                all_rollouts[rollout.id] = rollout
             
             # reset the n to 1 otherwise the rollouts will forked at each step
             sampling_params.n = 1
-            
-        return all_rollouts
+        
+        grouped_rollouts = defaultdict(list)
+        for rollout in all_rollouts.values():
+            grouped_rollouts[rollout.group_id].append(rollout)
+        
+        output_rollouts = []
+        for group in grouped_rollouts.values():
+            for rollout in group:
+                output_rollouts.append(rollout)
+        return output_rollouts
     
-    def process_rollouts(self, rollouts: list[Rollout], step: int):
+    def process_rollouts(self, rollouts: list[Rollout], step: int, process_kwargs: dict):
         for rollout in rollouts:
             if rollout.finish_reason in ["stop", "length"]:
                 rollout.completed = True
@@ -201,7 +226,7 @@ class Environment:
     
 @dataclass
 class SingleTurnEnvironment(Environment):
-    def process_rollouts(self, rollouts: list[Rollout], step: int):
+    def process_rollouts(self, rollouts: list[Rollout], step: int, process_kwargs: dict):
         for rollout in rollouts:
             if rollout.finish_reason in ["stop", "length"]:
                 rollout.completed = True
@@ -209,12 +234,26 @@ class SingleTurnEnvironment(Environment):
 
 @dataclass
 class MultiTurnEnvironment(Environment):
-    def process_rollouts(self, rollouts: list[Rollout], step: int):
+    def process_rollouts(self, rollouts: list[Rollout], step: int, process_kwargs: dict):
         for rollout in rollouts:
-            if rollout.finish_reason in ["stop", "length"]:
+            if (rollout.finish_reason in ["length"] 
+                or (rollout.finish_reason in ["stop"] and rollout.stop_reason not in self.stop)
+                or rollout.completed):
                 rollout.completed = True
         for rollout in rollouts:
             self.step_rollout(rollout)
+            
+        tokenizer = process_kwargs["tokenizer"]
+        max_model_len = process_kwargs["max_model_len"]
+        for rollout in rollouts:
+            token_length = len(tokenizer.encode(rollout.input))
+            if token_length > max_model_len:
+                rollout.completed = True
+                rollout.finish_reason = "length"
+                rollout.stop_reason = "length"
+                rollout.stop = [tokenizer.eos_token]
+                rollout.completion = tokenizer.decode(rollout.completion_ids[:max_model_len])
+                
         return rollouts 
 
     def step_rollout(self, rollout: Rollout):
