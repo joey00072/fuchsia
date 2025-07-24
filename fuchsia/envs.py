@@ -12,7 +12,6 @@ from transformers import AutoTokenizer
 
 @dataclass
 class Rollout:
-    
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     group_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     
@@ -150,13 +149,14 @@ class Environment:
         # Group rollouts by their original prompt/item (since we clone rollouts for n>1)
         grouped_rollouts = {}
         for rollout in rollouts:
-            key = rollout.prompt  # Use prompt as the grouping key
+            key = rollout.group_id 
             if key not in grouped_rollouts:
                 grouped_rollouts[key] = []
             grouped_rollouts[key].append(rollout)
         
         samples = []
         for prompt, group in grouped_rollouts.items():
+            # print(f"GROUP: calculating rewards for {len(group)} rollouts")
             # Take the first rollout to get shared properties
             first_rollout = group[0]
             
@@ -185,6 +185,7 @@ class Environment:
                 output["all_rewards"], output["rewards"], output["mean"], output["std"] = {}, [], 0.0, 0.0
                  
             samples.append(output)
+        #output["rewards"]
         print(f"{[s['all_rewards'] for s in samples]}")
         samples = [s for s in samples if s["std"] != 0.0]
         return samples
@@ -192,7 +193,7 @@ class Environment:
     def calculate_rewards(self, items, completions, completion_ids, rollouts):
         """Calculate rewards using the environment's reward functions."""
         import numpy as np
-        
+        # print(f"calculating rewards for {len(rollouts)} rollouts")
         all_rewards = {}
         for reward_function in self.reward_functions:
             rewards = reward_function(

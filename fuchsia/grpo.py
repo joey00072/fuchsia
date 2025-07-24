@@ -267,24 +267,87 @@ class GRPO:
         gc.collect()
         torch.cuda.empty_cache()
 
-    def selective_log_softmax(self, logits: Tensor, index: Tensor) -> Tensor:
-        per_token_logps = []
-        for row_logits, row_labels in zip(logits, index):
-            row_logps = F.log_softmax(row_logits, dim=-1)
-            row_per_token_logps = row_logps.gather(
-                dim=-1, index=row_labels.unsqueeze(-1)
-            ).squeeze(-1)
-            per_token_logps.append(row_per_token_logps)
-        per_token_logps = torch.stack(per_token_logps)
-        return per_token_logps
+    def selective_log_softmax(
+        self,
+        logits: Tensor,                 # (B, T, V)
+        labels: Tensor,                 # (B, T)
+        *,
+        chunk_size: int = 128,          # 0 ⇒ disable chunking
+        ignore_index: int = -100,
+    ) -> Tensor:
+        """
+        Returns per‑token log‑probs log p(x_t = labels_t | x_<t>)
+        while keeping peak memory low by processing `chunk_size`
+        rows at a time (rows = B·T tokens).
 
-    def get_per_token_logps(self, model: PreTrainedModel, input_ids: Tensor, training: bool = False) -> Tensor:
-        logits = model(input_ids=input_ids, training=training).logits
-        logits = logits[:, :-1, :]
-        input_ids = input_ids[:, 1:]
-        logps = self.selective_log_softmax(logits, input_ids)
-        return logps
+        The fast‑path (chunk_size==0) is fully vectorised.
+        """
 
+        B, T, V = logits.shape
+        logits = logits.reshape(-1, V)          # (B·T, V)
+        labels = labels.reshape(-1, 1)          # (B·T, 1)
+
+        # ---- no chunking --------------------------------------------------------
+        if chunk_size == 0:
+            logps    = F.log_softmax(logits, dim=-1)
+            picked   = logps.gather(-1, labels.clamp_min(0)).squeeze(-1)
+            picked   = torch.where(labels.squeeze(-1) == ignore_index,
+                                torch.zeros_like(picked),
+                                picked)
+            return picked.view(B, T)
+
+        # ---- chunked path -------------------------------------------------------
+        out: list[Tensor] = []
+        for logits_chunk, labels_chunk in zip(
+                logits.split(chunk_size),
+                labels.split(chunk_size)
+        ):
+            logps_chunk  = F.log_softmax(logits_chunk, dim=-1)
+            picked_chunk = logps_chunk.gather(-1, labels_chunk.clamp_min(0)).squeeze(-1)
+            picked_chunk = torch.where(labels_chunk.squeeze(-1) == ignore_index,
+                                    torch.zeros_like(picked_chunk),
+                                    picked_chunk)
+            out.append(picked_chunk)
+
+        return torch.cat(out).view(B, T)
+
+    # def selective_log_softmax(self, logits: Tensor, index: Tensor) -> Tensor:
+    #     per_token_logps = []
+    #     for row_logits, row_labels in zip(logits, index):
+    #         row_logps = F.log_softmax(row_logits, dim=-1)
+    #         row_per_token_logps = row_logps.gather(
+    #             dim=-1, index=row_labels.unsqueeze(-1)
+    #         ).squeeze(-1)
+    #         per_token_logps.append(row_per_token_logps)
+    #     per_token_logps = torch.stack(per_token_logps)
+    #     return per_token_logps
+
+    # def get_per_token_logps(self, model: PreTrainedModel, input_ids: Tensor, training: bool = False) -> Tensor:
+    #     logits = model(input_ids=input_ids, training=training).logits
+    #     logits = logits[:, :-1, :]
+    #     input_ids = input_ids[:, 1:]
+    #     logps = self.selective_log_softmax(logits, input_ids)
+    #     return logps
+
+    def get_per_token_logps(
+        self,
+        model,
+        input_ids: Tensor,
+        *,
+        chunk_size: int = 128,
+        training: bool = False,
+    ) -> Tensor:
+        """
+        Computes log‑probs for the *next* token at every position
+        (causal language‑model shift).
+        """
+        logits  = model(input_ids=input_ids, training=training).logits   # (B, T, V)
+        logits  = logits[:, :-1, :]
+        labels  = input_ids[:, 1:]
+        return self.selective_log_softmax(logits, labels,
+                                    chunk_size=chunk_size,
+                                    ignore_index=-100)
+    
     def compute_loss(
         self, 
         inputs: Tensor, 

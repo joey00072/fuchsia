@@ -643,6 +643,7 @@ class DataSamplerServer:
                     print("==========")
                     for item in items_with_rewards:
                         print(f"{item['all_rewards']}")
+                        print(f"{len(item['rewards'])} {item['rewards']}")
                         print(f"{item['mean']} {item['std']}")
                         print("-"*10)
                     logger.debug("==========")

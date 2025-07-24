@@ -22,6 +22,7 @@ from IPython.utils.capture import capture_output
 # combined.py
 import asyncio
 from fastmcp import Client
+from collections import defaultdict
 
 
 
@@ -48,7 +49,7 @@ def find_last_box_value(text):
 def single_rollout_reward(rollout: Rollout) -> float:
     reward = 0
     completion = rollout.completion
-    print(completion)
+    # print(completion)
     print("--------------------------------")
     format_reward = 0
     correctness_reward = 0
@@ -61,7 +62,7 @@ def single_rollout_reward(rollout: Rollout) -> float:
         if "<tool_call>" not in think:
             return format_reward
         format_reward += 0.1
-        if "</tool_call>" in completion:
+        if "</tool_call>" in output:
             return format_reward
         format_reward += 0.1
         answer = find_last_box_value(output)
@@ -161,9 +162,49 @@ class PythonInterpreterEnvironment(MultiTurnEnvironment):
         print("Output: ", output)
         output = output["stdout/stderr"]
         
-        rollout.last_completion += "</tool_call>\n<tool_response>\n" + output + "\n</tool_response>"
-        rollout.completion += "</tool_call>\n<tool_response>\n" + output + "\n</tool_response>"
+        rollout.last_completion += "</tool_call>\n<tool_response>\n" + output + "\n</tool_response>\n"
+        rollout.completion += "</tool_call>\n<tool_response>\n" + output + "\n</tool_response>\n"
         rollout.stop_reason = ""
+        rollout.completed = False
+        
+    def process_rollouts(self, rollouts: list[Rollout], step: int, process_kwargs: dict):
+        for rollout in rollouts:
+            if (rollout.finish_reason in ["length"] 
+                or (rollout.finish_reason in ["stop"] and rollout.stop_reason not in self.stop)
+                or rollout.completed):
+                rollout.completed = True
+        for rollout in rollouts:
+            self.step_rollout(rollout)
+            
+        group = defaultdict(list)
+        for rollout in rollouts:
+            group[rollout.group_id].append(rollout)
+        for group_id, group_rollouts in group.items():
+            if len(group_rollouts) > 0:
+                last_rollout:Rollout = group_rollouts[0]
+                last_rollout.completed = True
+                last_rollout.finish_reason = "stop"
+                tokenizer = process_kwargs["tokenizer"]
+                last_rollout.completion = tokenizer.apply_chat_template(
+                [
+                    {"role": "assistant", "content": last_rollout.item["completion"]},
+                ],
+                tokenize=False,
+            )
+                
+            
+        tokenizer = process_kwargs["tokenizer"]
+        max_model_len = process_kwargs["max_model_len"]
+        for rollout in rollouts:
+            token_length = len(tokenizer.encode(rollout.input))
+            if token_length > max_model_len:
+                rollout.completed = True
+                rollout.finish_reason = "length"
+                rollout.stop_reason = "length"
+                rollout.stop = [tokenizer.eos_token]
+                rollout.completion = tokenizer.decode(rollout.completion_ids[:max_model_len])
+                
+        return rollouts 
 
 
 def main():

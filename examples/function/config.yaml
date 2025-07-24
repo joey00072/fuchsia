@@ -1,7 +1,7 @@
 # Generation configuration (shared parameters)
 generation: &generation
-  max_len: &max_len 8096
-  group_size: &group_size 32
+  max_len: &max_len 1024
+  group_size: &group_size 8
   temperature: &temperature 0.7
   top_k: &top_k -1
   top_p: &top_p 1.0
@@ -60,7 +60,7 @@ server:
 
 # Dataset configuration
 dataset:
-  name: "joey00072/synth_tool_think_exp023"
+  name: "joey00072/exprimentail-cold-start-tool-use-001"
   split: "default"
   max_samples: null
   field: "text"
