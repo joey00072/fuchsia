@@ -59,6 +59,7 @@ class Environment:
     reward_functions: list[Callable] = field(default_factory=list)
     sampling_params: SamplingParams | None = None
     max_steps: int = 1
+    n: int | None = None
     stop: list[str] = field(default_factory=list)
     
     def generate(
@@ -85,6 +86,8 @@ class Environment:
         
         if self.stop:
             sampling_params.stop = self.stop
+        if self.n is not None:
+            sampling_params.n = self.n
         ##  You can't n>1 for multi-turn environments
         ##  otherwise the rollouts will forked at each step
         

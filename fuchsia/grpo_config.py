@@ -99,7 +99,7 @@ class GRPOConfig:
     def from_yaml(cls, yaml_path: str) -> "GRPOConfig":
         with open(yaml_path, "r") as f:
             config = yaml.safe_load(f)
-    
+        
         # Extract GRPO configuration
         grpo_config_dict = config.get("grpo", {})
         
@@ -127,6 +127,7 @@ class GRPOConfig:
         
         grpo_config = GRPOConfig(
             # GRPO specific parameters
+            loss_type=grpo_config_dict.get("loss_type", "grpo"),
             group_size=grpo_config_dict.get("group_size", 8),
             batch_size=grpo_config_dict.get("batch_size", 1),
             grad_accumulation_steps=grpo_config_dict.get("grad_accumulation_steps", 1),

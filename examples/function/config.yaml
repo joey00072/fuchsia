@@ -1,8 +1,8 @@
 # Generation configuration (shared parameters)
 generation: &generation
-  max_len: &max_len 1024
+  max_len: &max_len 2048
   group_size: &group_size 8
-  temperature: &temperature 0.7
+  temperature: &temperature 0.9
   top_k: &top_k -1
   top_p: &top_p 1.0
   min_p: &min_p 0.0
@@ -10,7 +10,7 @@ generation: &generation
 
 # Model configuration
 model:
-  name: "joey00072/fuchsia-toolexp-001"
+  name: "joey00072/exp-ntr-qwen3-4b-v0"
   revision: null
   dtype: "bfloat16"
   max_model_len: *max_len
@@ -24,6 +24,7 @@ lora:
 
 # GRPO training configuration
 grpo:
+  loss_type: "reinforce"
   group_size: *group_size
   batch_size: *generation_batch_size
   grad_accumulation_steps: *generation_batch_size
@@ -37,19 +38,19 @@ grpo:
   lora_path: "./lora_weights"
   single_gpu: true
   gradient_checkpointing:
-    enabled: true
-    cpu_offloading: true
+    enabled: false
+    cpu_offloading: false
 
 # Server configuration
 server:
   host: "0.0.0.0"
   port: 8000
-  gpu_memory_utilization: 0.9
+  gpu_memory_utilization: 0.95
   tensor_parallel_size: 1
   enable_prefix_caching: false
   buffer_size: *generation_batch_size
   generation_batch_size: *generation_batch_size
-  quantization:
+  quantization: fp8
   vllm:
     max_tokens: *max_len
     n: *group_size

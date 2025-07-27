@@ -49,7 +49,7 @@ def find_last_box_value(text):
 def single_rollout_reward(rollout: Rollout) -> float:
     reward = 0
     completion = rollout.completion
-    # print(completion)
+    print(completion)
     print("--------------------------------")
     format_reward = 0
     correctness_reward = 0
@@ -59,7 +59,7 @@ def single_rollout_reward(rollout: Rollout) -> float:
     if "</think>" in completion and completion.count("</think>") == 1:
         format_reward += 0.1
         think, output = completion.split("</think>")
-        if "<tool_call>" not in think:
+        if "</tool_call>" not in think:
             return format_reward
         format_reward += 0.1
         if "</tool_call>" in output:
@@ -98,7 +98,7 @@ def response_format_reward(rollouts: list[Rollout], *args, **kwargs) -> list[flo
 def prepare_dataset(dataset, tokenizer) -> Dataset:
 
     def process_example(example: dict) -> Optional[dict]:
-        prefix = """Online function calling is avalible while in thinking:\n [
+        system_prompt = """Online tool calling is avalible while in thinking:\n [
     {
         "name": "ipython_interpreter",
         "description": "ipython interpreter that takes code string as input and returns the output.",
@@ -112,11 +112,19 @@ def prepare_dataset(dataset, tokenizer) -> Dataset:
     }
 ]
 
+format of tool call
+<tool_call>
+you will pass json here
+</tool_call>
+<tool_response>
+you will recive output
+</tool_response>
 
 """
         example["text"] = tokenizer.apply_chat_template(
             [
-                {"role": "user", "content": prefix + example["problem"] +"\n give answer in \\boxed{number} format."},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content":  example["problem"] +"\n give answer in \\boxed{number} format."},
             ],
             tokenize=False,
         )
@@ -135,8 +143,11 @@ class PythonInterpreterEnvironment(MultiTurnEnvironment):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.max_steps = 4
+        # self.n = 2
         self.stop = ["</tool_call>"]
         self.reward_functions = [response_format_reward]
+        
+        self.counter = 0
 
     def step_rollout(self, rollout: Rollout):
         rollout.state["reward"] = 0
@@ -168,6 +179,10 @@ class PythonInterpreterEnvironment(MultiTurnEnvironment):
         rollout.completed = False
         
     def process_rollouts(self, rollouts: list[Rollout], step: int, process_kwargs: dict):
+        self.counter += 1
+        # if self.counter % 40 == 0:
+        #     self.n = min(self.n * 2,8)
+            
         for rollout in rollouts:
             if (rollout.finish_reason in ["length"] 
                 or (rollout.finish_reason in ["stop"] and rollout.stop_reason not in self.stop)
@@ -175,7 +190,8 @@ class PythonInterpreterEnvironment(MultiTurnEnvironment):
                 rollout.completed = True
         for rollout in rollouts:
             self.step_rollout(rollout)
-            
+        
+        FILL_TOKEN = "<|xxxFILL_TOKENxxx|>"
         group = defaultdict(list)
         for rollout in rollouts:
             group[rollout.group_id].append(rollout)
@@ -185,12 +201,13 @@ class PythonInterpreterEnvironment(MultiTurnEnvironment):
                 last_rollout.completed = True
                 last_rollout.finish_reason = "stop"
                 tokenizer = process_kwargs["tokenizer"]
-                last_rollout.completion = tokenizer.apply_chat_template(
+                completion = tokenizer.apply_chat_template(
                 [
-                    {"role": "assistant", "content": last_rollout.item["completion"]},
+                    {"role": "assistant", "content": FILL_TOKEN},
                 ],
                 tokenize=False,
             )
+            last_rollout.completion = completion.replace(FILL_TOKEN, last_rollout.item["completion"])
                 
             
         tokenizer = process_kwargs["tokenizer"]
