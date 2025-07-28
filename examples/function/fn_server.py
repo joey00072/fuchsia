@@ -82,7 +82,7 @@ def single_rollout_reward(rollout: Rollout) -> float:
     else:
         correctness_reward = 0
         
-    return format_reward + correctness_reward
+    return format_reward + correctness_reward + rollout.state["reward"]
 
 def response_format_reward(rollouts: list[Rollout], *args, **kwargs) -> list[float]:
     # correct_answer = sample["correct_answer"]
@@ -172,6 +172,9 @@ class PythonInterpreterEnvironment(MultiTurnEnvironment):
             output = {"stdout/stderr": f"Error: {e}"}
         print("Output: ", output)
         output = output["stdout/stderr"]
+        
+        if "Error" in output:
+            rollout.state["reward"] = -1
         
         rollout.last_completion += "</tool_call>\n<tool_response>\n" + output + "\n</tool_response>\n"
         rollout.completion += "</tool_call>\n<tool_response>\n" + output + "\n</tool_response>\n"
