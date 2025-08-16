@@ -25,7 +25,11 @@ import os
 import threading
 import time
 from collections import defaultdict
+from contextlib import asynccontextmanager
+from multiprocessing import Pipe, Process
 from dataclasses import dataclass
+from itertools import chain
+from multiprocessing.connection import Connection
 from typing import Optional, Sequence, Callable
 
 # Third party imports
@@ -52,7 +56,7 @@ if libcuda_available:
     from vllm import LLM, SamplingParams
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.distributed.parallel_state import get_world_group
-    from vllm.distributed.utils import StatelessProcessGroup
+    from vllm.distributed.utils import StatelessProcessGroup, get_open_port
     from vllm.lora.request import LoRARequest
     from vllm.sampling_params import GuidedDecodingParams
     from vllm.worker.worker import Worker
@@ -69,6 +73,75 @@ logger = logging.getLogger(__name__)
 # Configure multiprocessing for CUDA
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
+
+def chunk_list(lst: list, n: int) -> list[list]:
+    """
+    Split list `lst` into `n` evenly distributed sublists.
+
+    Example:
+    ```python
+    >>> chunk_list([1, 2, 3, 4, 5, 6], 2)
+    [[1, 2, 3], [4, 5, 6]]
+
+    >>> chunk_list([1, 2, 3, 4, 5, 6], 4)
+    [[1, 2], [3, 4], [5], [6]]
+
+    >>> chunk_list([1, 2, 3, 4, 5, 6], 8)
+    [[1], [2], [3], [4], [5], [6], [], []]
+    ```
+    """
+    k, r = divmod(len(lst), n)
+    return [lst[i * k + min(i, r) : (i + 1) * k + min(i + 1, r)] for i in range(n)]
+
+
+def llm_worker(
+    config: ServerConfig, data_parallel_rank: int, master_port: int, connection: Connection
+) -> None:
+    """The worker process that runs a vLLM instance."""
+    # Set required environment variables for DP to work with vLLM
+    os.environ["VLLM_DP_RANK"] = str(data_parallel_rank)
+    os.environ["VLLM_DP_RANK_LOCAL"] = str(data_parallel_rank)
+    os.environ["VLLM_DP_SIZE"] = str(config.data_parallel_size)
+    os.environ["VLLM_DP_MASTER_PORT"] = str(master_port)
+
+    kwargs = {}
+    if config.vllm_kv_quantization:
+        kwargs["kv_cache_dtype"] = "fp8"
+        kwargs["calculate_kv_scales"] = True
+
+    llm = LLM(
+        model=config.model,
+        quantization=config.quantization,
+        revision=config.revision,
+        tensor_parallel_size=config.tensor_parallel_size,
+        gpu_memory_utilization=config.gpu_memory_utilization,
+        dtype=config.dtype,
+        enable_prefix_caching=config.enable_prefix_caching,
+        max_model_len=config.max_model_len,
+        enable_lora=config.single_gpu,
+        enable_sleep_mode=True,
+        worker_cls="fuchsia.vllm_server.WeightSyncWorker",
+        **kwargs,
+    )
+
+    connection.send({"status": "ready"})
+
+    while True:
+        try:
+            command = connection.recv()
+        except (KeyboardInterrupt, EOFError):
+            llm.collective_rpc(method="close_communicator")
+            break
+
+        if command["type"] in ["call", "fire_and_forget"]:
+            method_name = command["method"]
+            args, kwargs = command.get("args", ()), command.get("kwargs", {})
+            method = getattr(llm, method_name)
+            result = method(*args, **kwargs)
+            if command["type"] == "call":
+                connection.send(result)
+        elif command["type"] == "shutdown":
+            break
 
 
 class WeightSyncWorker(Worker):
@@ -156,6 +229,7 @@ class ServerConfig:
     model: str
     revision: Optional[str] = None
     tensor_parallel_size: int = 1
+    data_parallel_size: int = 1
     host: str = "0.0.0.0"
     port: int = 8000
     gpu_memory_utilization: float = 0.5
@@ -231,6 +305,7 @@ class ServerConfig:
             port=server_config.get("port", 8000),
             gpu_memory_utilization=server_config.get("gpu_memory_utilization", 0.5),
             tensor_parallel_size=server_config.get("tensor_parallel_size", 1),
+            data_parallel_size=server_config.get("data_parallel_size", 1),
             enable_prefix_caching=server_config.get("enable_prefix_caching", None),
             quantization=server_config.get("quantization"),
             buffer_size=server_config.get("buffer_size", 32),
@@ -289,10 +364,48 @@ class UpdateWeightsRequest(BaseModel):
     shape: list[int]
 
 
+class VllmProxy:
+    def __init__(self, connections, config):
+        self.connections = connections
+        self.config = config
+
+    def generate(self, prompts, sampling_params, **kwargs):
+        chunked_prompts = chunk_list(prompts, self.config.data_parallel_size)
+
+        for connection, prompts_chunk in zip(self.connections, chunked_prompts):
+            if not prompts_chunk:
+                prompts_chunk = ["<placeholder>"]
+
+            worker_kwargs = {"prompts": prompts_chunk, "sampling_params": sampling_params}
+            if "lora_request" in kwargs:
+                worker_kwargs["lora_request"] = kwargs["lora_request"]
+
+            connection.send({"type": "call", "method": "generate", "kwargs": worker_kwargs})
+
+        results = [connection.recv() for connection in self.connections]
+
+        valid_results = [result for result, p_chunk in zip(results, chunked_prompts) if p_chunk]
+
+        return list(chain.from_iterable(valid_results))
+
+    @property
+    def llm_engine(self):
+        class MockModelConfig:
+            def __init__(self, max_model_len):
+                self.max_model_len = max_model_len
+
+        class MockEngine:
+            def __init__(self, max_model_len):
+                self.model_config = MockModelConfig(max_model_len)
+
+        return MockEngine(self.config.max_model_len)
+
+
 class DataSamplerServer:
     def __init__(
         self, 
         config: ServerConfig,
+        connections: list[Connection],
         dataset: Optional[Dataset] = None,
         reward_functions: Optional[list[Callable]] = None,
         pre_fill_buffer: bool = True,
@@ -300,33 +413,14 @@ class DataSamplerServer:
         stop: Optional[list[str]] = None,
     ):
         self.config = config
+        self.connections = connections
         logger.info(config)
         self.stop = stop
+        self.llm_proxy = VllmProxy(self.connections, self.config)
 
         if not os.environ.get('VLLM_ATTENTION_BACKEND'):
             os.environ['VLLM_ATTENTION_BACKEND'] = 'flashinfer'
             logger.info("Set VLLM_ATTENTION_BACKEND to flashinfer")
-        
-        kwargs = {}
-        if config.vllm_kv_quantization:
-            kwargs["kv_cache_dtype"] = "fp8"
-            kwargs["calculate_kv_scales"] = True
-        print(config)
-
-        self.llm = LLM(
-            model=config.model,
-            quantization=config.quantization,
-            revision=config.revision,
-            tensor_parallel_size=config.tensor_parallel_size,
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            dtype=config.dtype,
-            enable_prefix_caching=config.enable_prefix_caching,
-            max_model_len=config.max_model_len,
-            enable_lora=config.single_gpu,
-            enable_sleep_mode=True,  # Enable sleep mode for CUDA
-            worker_cls="fuchsia.vllm_server.WeightSyncWorker", 
-            **kwargs
-        )
 
         # Data sampler specific initialization
         self.dataset = dataset
@@ -761,9 +855,9 @@ class DataSamplerServer:
 
         @app.get("/get_tensor_parallel_size/")
         async def get_tensor_parallel_size():
-            """Retrieves the tensor parallel size from the LLM engine."""
+            """Retrieves the tensor parallel size from the server config."""
             return {
-                "tensor_parallel_size": self.llm.llm_engine.parallel_config.tensor_parallel_size
+                "tensor_parallel_size": self.config.tensor_parallel_size
             }
 
         @app.get("/server_info/")
@@ -807,6 +901,22 @@ class DataSamplerServer:
                 stop=self.stop,
             )
             
+            def dispatch_to_workers():
+                chunked_prompts = chunk_list(request.prompts, self.config.data_parallel_size)
+
+                for connection, prompts_chunk in zip(self.connections, chunked_prompts):
+                    if not prompts_chunk:
+                        prompts_chunk = ["<placeholder>"]
+                    kwargs = {"prompts": prompts_chunk, "sampling_params": sampling_params}
+                    connection.send({"type": "call", "method": "generate", "kwargs": kwargs})
+
+                results = [connection.recv() for connection in self.connections]
+
+                # Filter out placeholder results
+                valid_results = [result for result, p_chunk in zip(results, chunked_prompts) if p_chunk]
+
+                return list(chain.from_iterable(valid_results))
+
             # Use generation lock if in data sampler mode
             if self.is_data_sampler:
                 def generate_with_lock():
@@ -815,10 +925,7 @@ class DataSamplerServer:
                         if hasattr(self, '_sleep_requested') and self._sleep_requested:
                             logger.info("Sleep requested - aborting generation")
                             return []
-                        return self.llm.generate(
-                            request.prompts, sampling_params=sampling_params,
-                            lora_path=self.lora_path,
-                        )
+                        return dispatch_to_workers()
                 
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -826,10 +933,11 @@ class DataSamplerServer:
                         executor, generate_with_lock
                     )
             else:
-                all_outputs = self.llm.generate(
-                    request.prompts, sampling_params=sampling_params,
-                    lora_path=self.lora_path,
-                )
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    all_outputs = await asyncio.get_event_loop().run_in_executor(
+                        executor, dispatch_to_workers
+                    )
             
             completion_ids = [
                 list(output.token_ids)
@@ -839,40 +947,41 @@ class DataSamplerServer:
             return {"completion_ids": completion_ids}
 
         @app.post("/init_communicator/")
-        async def init_communicator(
-            request: InitCommunicatorRequest, background_tasks: BackgroundTasks
-        ):
+        async def init_communicator(request: InitCommunicatorRequest):
             """Initializes the communicator for weight synchronization."""
-            background_tasks.add_task(
-                self.llm.collective_rpc,
-                "init_communicator",
-                args=(request.host, request.port, self.config.tensor_parallel_size + 1),
-            )
+            world_size = self.config.tensor_parallel_size * self.config.data_parallel_size + 1
+            kwargs = {
+                "method": "init_communicator",
+                "args": (request.host, request.port, world_size),
+            }
+            for connection in self.connections:
+                connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
             return {"message": "Request received, initializing communicator"}
 
         @app.post("/update_named_param/")
-        async def update_named_param(
-            request: UpdateWeightsRequest, background_tasks: BackgroundTasks
-        ):
+        async def update_named_param(request: UpdateWeightsRequest):
             """Updates model weights with the provided tensor."""
             dtype = torch.__getattribute__(request.dtype.split(".")[-1])
-            background_tasks.add_task(
-                self.llm.collective_rpc,
-                "update_named_param",
-                args=(request.name, dtype, request.shape),
-            )
+            kwargs = {"method": "update_named_param", "args": (request.name, dtype, request.shape)}
+            for connection in self.connections:
+                connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
             return {"message": "Request received, updating named parameter"}
 
         @app.post("/reset_prefix_cache/")
         async def reset_prefix_cache():
             """Resets the prefix cache for the model."""
-            success = self.llm.llm_engine.reset_prefix_cache()
+            for conn in self.connections:
+                conn.send({"type": "call", "method": "reset_prefix_cache"})
+            results = [conn.recv() for conn in self.connections]
+            success = all(results)
             return {"message": f"Reset prefix cache status: {success}"}
 
         @app.post("/close_communicator/")
         async def close_communicator():
             """Closes the weight update group and cleans up resources."""
-            self.llm.collective_rpc("close_communicator")
+            kwargs = {"method": "close_communicator"}
+            for connection in self.connections:
+                connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
             return {"message": "Request received, closing communicator"}
 
         @app.post("/sleep/")
@@ -880,54 +989,49 @@ class DataSamplerServer:
             """Puts the LLM engine to sleep, offloading weights to CPU and clearing KV cache."""
             try:
                 if self.is_data_sampler:
-                    # Check if generation is currently in progress without blocking
                     generation_in_progress = not self._generation_lock.acquire(blocking=False)
                     if generation_in_progress:
                         logger.info("Generation in progress - cannot sleep now")
-                        return {
-                            "message": "Generation in progress - cannot sleep now", 
-                            "sleep": False
-                        }
+                        return {"message": "Generation in progress - cannot sleep now", "sleep": False}
                     
                     try:
-                        # Signal that sleep has been requested
                         self._sleep_requested = True
                         logger.info("Sleep requested - proceeding with sleep...")
                         self._is_sleeping = True
                     finally:
                         self._generation_lock.release()
                 
-                self.llm.sleep(level=1)  # Level 1: offload weights to CPU & clear KV cache
+                for conn in self.connections:
+                    conn.send({"type": "call", "method": "sleep", "kwargs": {"level": 1}})
+
+                results = [conn.recv() for conn in self.connections]
+
                 torch.cuda.synchronize()
-                torch.randn(1).cuda()
-                torch.cuda.empty_cache()  # Clear CUDA cache after sleep
+                torch.cuda.empty_cache()
                 
                 if self.is_data_sampler:
-                    self._sleep_requested = False  # Reset the flag
+                    self._sleep_requested = False
                     
-                return {
-                    "message": "LLM engine has been put to sleep successfully", 
-                    "sleep": True
-                }
+                return {"message": "LLM engine has been put to sleep successfully", "sleep": True}
             except Exception as e:
                 logger.error(f"Failed to put LLM to sleep: {e}")
                 if self.is_data_sampler:
-                    self._sleep_requested = False  # Reset the flag on error
+                    self._sleep_requested = False
                     self._is_sleeping = False
-                return {
-                    "error": f"Failed to put LLM to sleep: {str(e)}", 
-                    "sleep": False
-                }
+                return {"error": f"Failed to put LLM to sleep: {str(e)}", "sleep": False}
 
         @app.post("/wake_up/")
         async def wake_up():
             """Wakes up the LLM engine from sleep mode."""
             try:
-                self.llm.wake_up()
+                for conn in self.connections:
+                    conn.send({"type": "call", "method": "wake_up"})
+
+                results = [conn.recv() for conn in self.connections]
+
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-                torch.randn(1).cuda()
-                await asyncio.sleep(1)
+
                 if self.is_data_sampler:
                     self._is_sleeping = False
                 return {"message": "LLM engine has been woken up successfully"}
@@ -1040,7 +1144,7 @@ class DataSamplerServer:
                         r = Rollout(prompt=item[self.dataset_field], item=item)
                         rollouts.append(r)
                         
-                    rollouts = self.environment.generate(rollouts, self.llm, self._sampling_params, vllm_generate_kwargs=generation_kwargs, tokenizer=self.tokenizer)
+                    rollouts = self.environment.generate(rollouts, self.llm_proxy, self._sampling_params, vllm_generate_kwargs=generation_kwargs, tokenizer=self.tokenizer)
                     items_with_rewards = self.environment.payload(rollouts)
                     end_time = time.perf_counter()
                     print(f"time taken: {end_time - start_time}")
@@ -1077,7 +1181,7 @@ class DataSamplerServer:
             self._lora_idx += 1
         
         print(f">>>>> Generation_kwargs: {generation_kwargs} <<<<<")
-        all_outputs = self.llm.generate(prompts, sampling_params=self._sampling_params, **generation_kwargs)
+        all_outputs = self.llm_proxy.generate(prompts, sampling_params=self._sampling_params, **generation_kwargs)
         
         completion_ids = [
             list(output.token_ids)
@@ -1149,102 +1253,73 @@ class DataSamplerServer:
             return {}, [], 0.0, 0.0
 
     def serve(self):
-        """Starts the FastAPI server with rich console output."""
-        from rich.console import Console
-        from rich.panel import Panel
-        from rich.table import Table
-
-        console = Console()
-
-        # Create network info table
-        table = Table(
-            title="Server Network Information",
-            show_header=True,
-            header_style="bold magenta",
-        )
-        table.add_column("Interface", style="cyan")
-        table.add_column("URL", style="green")
-
-        for ip_info in get_ip_addresses():
-            if ip_info["type"] == "IPv4" and ip_info["interface"] != "lo":
-                url = f"http://{ip_info['ip']}:{self.config.port}"
-                table.add_row(ip_info["interface"], url)
-
-        # Create server status panel
-        mode = "Data Sampler" if self.is_data_sampler else "Standard VLLM"
-        status_text = f"Mode: {mode}\nModel: {self.config.model}\nPort: {self.config.port}"
-        if self.is_data_sampler:
-            status_text += f"\nBuffer Size: {self.buffer_size}"
-            status_text += f"\nDataset Field: {self.dataset_field}"
-
-        # Display information
-        console.print("\n")
-        console.print(Panel(table, title="[bold]Available Network Interfaces[/bold]"))
-        console.print(Panel(status_text, title="[bold]Server Configuration[/bold]"))
-        console.print(f"\n[bold blue]Server running on port {self.config.port}[/bold blue]\n")
-
-        uvicorn.run(self.app, host=self.config.host, port=self.config.port)
-        dist.destroy_process_group()
+        """This method is now obsolete. The server is started by the `run` function."""
+        pass
 
 
-def run_server():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, help="Model to load")
-    parser.add_argument("--revision", type=str)
-    parser.add_argument("--tensor_parallel_size", type=int, default=1)
-    parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--gpu_memory_utilization", type=float, default=0.5)
-    parser.add_argument("--dtype", type=str, default="auto")
-    parser.add_argument("--max_model_len", default=1024, type=int)
-    parser.add_argument("--enable_prefix_caching", default=False, type=bool)
-    parser.add_argument("--config", type=str, default="examples/vllm_server_config.yaml")
+def run(config: ServerConfig):
+    """
+    Main entry point to run the server.
+    This function can be called from the CLI script.
+    """
+    dataset = None
+    if config.dataset_name:
+        dataset = load_dataset(config.dataset_name, split=config.dataset_split)
+        if config.dataset_max_samples > 0:
+            dataset = dataset.select(range(config.dataset_max_samples))
 
-    args = parser.parse_args()
+    master_port = get_open_port()
+    connections = []
+    processes = []
+    for data_parallel_rank in range(config.data_parallel_size):
+        parent_connection, child_connection = Pipe()
+        process = Process(target=llm_worker, args=(config, data_parallel_rank, master_port, child_connection))
+        process.start()
+        connections.append(parent_connection)
+        processes.append(process)
 
-    if args.config:
-        config = load_config_from_yaml(args.config)
-        for key, value in vars(args).items():
-            if value is not None and key != "config":
-                setattr(config, key, value)
-    else:
-        config = ServerConfig(**vars(args))
+    # TODO: Handle reward_functions properly
+    server = DataSamplerServer(config, connections=connections, dataset=dataset, reward_functions=[])
 
-    if not config.model:
-        parser.error("Model must be specified either through --model argument or in config file")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Wait for all workers to send "ready"
+        ready_connections = set()
+        while len(ready_connections) < config.data_parallel_size:
+            for i, connection in enumerate(connections):
+                if connection not in ready_connections and connection.poll(timeout=1):
+                    msg = connection.recv()
+                    if isinstance(msg, dict) and msg.get("status") == "ready":
+                        logger.info(f"Worker {i} is ready.")
+                        ready_connections.add(connection)
 
-    server = VLLMServer(config)
-    server.serve()
+        logger.info("All workers are ready.")
+        yield
 
+        # Shutdown logic
+        logger.info("Shutting down workers...")
+        for connection in connections:
+            try:
+                connection.send({"type": "shutdown"})
+            except BrokenPipeError:
+                pass # Worker might have already died
 
-def test_datasampler():
-    max_model_len = 1024
-    config = ServerConfig(
-        model="unsloth/Llama-3.2-3B-Instruct",
-        revision="main",
-        host="0.0.0.0",
-        port=8000,
-        dataset_field="Question Text",
-        buffer_size=4,
-        max_model_len=max_model_len,
-        gpu_memory_utilization=0.7,
-        dtype="bfloat16",
-        vllm_max_tokens=max_model_len,
-        vllm_n=8,
-        vllm_repetition_penalty=1.0,
-        vllm_temperature=1.0,
-        vllm_top_p=1.0,
-        vllm_top_k=-1,
-        vllm_min_p=0.0,
-    )
-    ds = load_dataset("CK0607/2025-Jee-Mains-Question", split="train")
+        for process in processes:
+            process.join(timeout=10)
+            if process.is_alive():
+                logger.warning(f"Process {process} is still alive, terminating...")
+                process.terminate()
+                process.join()
+        logger.info("All workers shut down.")
 
-    def reward_function(tokenizer, items, completions, completion_ids):
-        return [len(completion) for completion in completions]
+    app = server.app
+    app.router.lifespan = lifespan
 
-    server = DataSamplerServer(config, dataset=ds, reward_functions=[reward_function])
-    server.serve()
+    uvicorn.run(app, host=config.host, port=config.port, log_level="info")
 
 
 if __name__ == "__main__":
-    test_datasampler()
+    # This is for testing purposes.
+    config = ServerConfig.from_yaml("examples/function/config.yaml")
+    config.data_parallel_size = 1
+    run(config)

@@ -280,6 +280,12 @@ Examples:
         help="Number of GPUs to use for tensor parallelism (default: 1)"
     )
     server_parser.add_argument(
+        "--data-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs to use for data parallelism (default: 1)"
+    )
+    server_parser.add_argument(
         "--host",
         default="0.0.0.0",
         help="Host to bind the server to (default: 0.0.0.0)"
@@ -323,12 +329,13 @@ Examples:
         create_default_config(args.output)
         return 0
     elif args.command == "server":
-        from .vllm_server import ServerConfig, VLLMServer
+        from .vllm_server import ServerConfig, run
 
         config = ServerConfig(
             model=args.model,
             revision=args.revision,
             tensor_parallel_size=args.tensor_parallel_size,
+            data_parallel_size=args.data_parallel_size,
             host=args.host,
             port=args.port,
             gpu_memory_utilization=args.gpu_memory_utilization,
@@ -337,8 +344,7 @@ Examples:
             enable_prefix_caching=args.enable_prefix_caching,
             quantization=args.quantization,
         )
-        server = VLLMServer(config)
-        server.serve()
+        run(config)
         return 0
     elif args.command is None:
         parser.print_help()
