@@ -93,7 +93,7 @@ class GRPO:
         if self.use_scheduler:
             self.logger.info(f"Scheduler: {config.scheduler_type} with {config.warmup_steps} warmup steps")
         self.reward_functions: list = reward_functions
-        self.dataset_feild = config.dataset_feild
+        self.dataset_field = config.dataset_field
         self.num_policy_updates = config.num_policy_updates
 
         self.using_lora = config.using_lora
