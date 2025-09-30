@@ -341,7 +341,9 @@ class GRPO:
         Computes log‑probs for the *next* token at every position
         (causal language‑model shift).
         """
-        logits  = model(input_ids=input_ids, training=training).logits   # (B, T, V)
+        outputs = model(input_ids=input_ids, training=training)
+        # Extract logits tensor to ensure gradient checkpointing works correctly
+        logits = outputs.logits if hasattr(outputs, 'logits') else (outputs[0] if isinstance(outputs, tuple) else outputs)  # (B, T, V)
         logits  = logits[:, :-1, :]
         labels  = input_ids[:, 1:]
         return self.selective_log_softmax(logits, labels,
