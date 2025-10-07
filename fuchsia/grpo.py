@@ -341,9 +341,7 @@ class GRPO:
         Computes log‑probs for the *next* token at every position
         (causal language‑model shift).
         """
-        outputs = model(input_ids=input_ids, training=training)
-        # Extract logits tensor to ensure gradient checkpointing works correctly
-        logits = outputs.logits if hasattr(outputs, 'logits') else (outputs[0] if isinstance(outputs, tuple) else outputs)  # (B, T, V)
+        logits  = model(input_ids=input_ids, training=training).logits   # (B, T, V)
         logits  = logits[:, :-1, :]
         labels  = input_ids[:, 1:]
         return self.selective_log_softmax(logits, labels,
@@ -512,7 +510,7 @@ class GRPO:
 
     def handle_policy_update(self) -> None:
         self.vllm_client.update_model_params(
-            self.model, lora=self.using_lora, 
+            self.model, self.tokenizer, lora=self.using_lora, 
             single_gpu=self.single_gpu, lora_path=self.lora_path
         )
         
@@ -688,5 +686,6 @@ class GRPO:
                 self.handle_policy_update()
             
             if idx % self.config.save_every == 0:
+                self.tokenizer.save_pretrained(f"{self.lora_path}/{idx}")
                 self.model.save_pretrained(f"{self.lora_path}/{idx}", adapter_name="grpo")
 

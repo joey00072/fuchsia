@@ -41,17 +41,17 @@ class CPUGradientCheckpointer(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_bwd(device_type='cuda')
     def backward(ctx, grad_output):
-        
+
         (cpu_activations,) = ctx.saved_tensors
-        
+
         gpu_activations = cpu_activations.to("cuda", non_blocking=True).detach()
         gpu_activations.requires_grad = True
-        
+
         with torch.enable_grad():
-            (output,) = ctx.forward_fn(gpu_activations, *ctx.kwargs)
-            
+            output = ctx.forward_fn(gpu_activations, *ctx.kwargs)
+
         torch.autograd.backward(output, grad_output)
-        
+
         return (None, gpu_activations.grad,) + (None,) * len(ctx.kwargs)
 
 

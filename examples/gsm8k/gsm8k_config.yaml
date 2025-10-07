@@ -2,11 +2,11 @@
 generation: &generation
   max_len: &max_len 1024
   group_size: &group_size 8
-  temperature: &temperature 0.7
+  temperature: &temperature 0.8
   top_k: &top_k -1
   top_p: &top_p 1.0
   min_p: &min_p 0.0
-  batch_size: &generation_batch_size 2
+  batch_size: &generation_batch_size 4
 
 # Model configuration
 model:
@@ -29,7 +29,7 @@ grpo:
   grad_accumulation_steps: *generation_batch_size
   lr: 0.00001
   weight_decay: 0.1
-  beta: 0.0
+  beta: 0.01
   epsilon: 0.2
   epsilon_high: 0.28
   log_wandb: true
@@ -69,7 +69,7 @@ dataset:
 # Training configuration
 training:
   max_epochs: 1
-  max_iterations: 1000
+  max_iterations: 100000
   save_steps: 100
   eval_steps: 50
   output_dir: "gsm8k_output" 

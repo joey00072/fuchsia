@@ -265,11 +265,13 @@ class VLLMClient:
                     new_name = name.replace("base_model.model.","").replace(".base_layer.weight",".weight")
                     self.update_named_param(new_name, new_wights)
 
-    def update_model_params(self, model: nn.Module, lora=False, single_gpu=False,lora_path=None):
+    def update_model_params(self, model: nn.Module,tokenizer=None, lora=False, single_gpu=False,lora_path=None):
         if single_gpu:
             # for name, param in model.named_parameters():
             #     if "lora" in name:
             #         print(f"{param.data.sum()}")
+            if tokenizer is not None:
+                tokenizer.save_pretrained(lora_path)
             model.save_pretrained(lora_path,adapter_name="grpo")
             return
         if lora:

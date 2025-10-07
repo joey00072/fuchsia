@@ -58,6 +58,7 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
         # Validate thinking section
         if s.count("<thinking>") == 1:
             format_reward += 0.5
+            
             thinking_content = (
                 s.split(START_THINKING_TOKEN)[1].split(END_THINKING_TOKEN)[0].strip()
             )
@@ -66,6 +67,8 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
         else:
             format_reward -= 0.1
         
+        if "\n" in s:
+            format_reward += 0.1 * min(s.count("\n"), 10)
             
         # Validate answer section
         if "<answer>" in s and "</answer>" in s:
@@ -86,6 +89,8 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
             
         if format_reward + content_reward >= 3 and idx < 8*8*2:
             if "<thinking>" in s and "</thinking>" in s:
+                if "\n<thinking>\n" in s:
+                    format_reward += 0.1
                 s = s.split("<thinking>")[1].split("</thinking>")[0]
                 format_reward += 0.001 * len(s)
             if "</answer>" in s:
@@ -107,11 +112,11 @@ def reward_function_1(rollouts: List[Rollout], *args, **kwargs):
     lst = []
     for rollout in rollouts:
         reward = response_format_reward(rollout.item, rollout.completion , idx=idx)
-        if idx > 8*8 and reward < 3:
+        if idx > 8*2 and reward < 5.1:
             reward = 0
         lst.append(reward)
         
-    if idx > 8*8 and not(any(x>4 for x in lst)):
+    if idx > 8*2 and not(any(x>5.1 for x in lst)):
         lst = [0 for _ in lst]
         
     return lst
