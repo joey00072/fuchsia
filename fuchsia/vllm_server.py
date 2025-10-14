@@ -55,9 +55,6 @@ if libcuda_available:
     from vllm.distributed.utils import StatelessProcessGroup
     from vllm.lora.request import LoRARequest
     from vllm.sampling_params import GuidedDecodingParams
-    from vllm.worker.worker import Worker
-else:
-    Worker = object
 
 # Local imports
 from fuchsia.envs import Rollout, Environment, SingleTurnEnvironment, MultiTurnEnvironment
@@ -71,21 +68,17 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 
 
-class WeightSyncWorker(Worker):
+class WeightSyncWorkerExtension:
     """
-    A vLLM worker that enables weight synchronization between a client and multiple server workers.
+    A vLLM worker extension that enables weight synchronization between a client and multiple server workers.
 
-    This worker uses a `StatelessProcessGroup` to establish communication and a `PyNcclCommunicator` to handle
+    This worker extension uses a `StatelessProcessGroup` to establish communication and a `PyNcclCommunicator` to handle
     efficient GPU-based communication using NCCL. The primary purpose of this class is to receive updated model weights
     from a client process and distribute them to all worker processes participating in model inference.
     """
 
-    def __init__(self, *args, **kwargs):
-        if not libcuda_available:
-            raise ImportError("CUDA is required to use the WeightSyncWorker")
-        super().__init__(*args, **kwargs)
-        self.pynccl_comm = None
-        self.client_rank = None
+    pynccl_comm = None
+    client_rank = None
 
     def init_communicator(self, host: str, port: int, world_size: int) -> None:
         """
@@ -304,8 +297,8 @@ class DataSamplerServer:
         self.stop = stop
 
         if not os.environ.get('VLLM_ATTENTION_BACKEND'):
-            os.environ['VLLM_ATTENTION_BACKEND'] = 'flashinfer'
-            logger.info("Set VLLM_ATTENTION_BACKEND to flashinfer")
+            # os.environ['VLLM_ATTENTION_BACKEND'] = 'FLEX_ATTENTION'
+            logger.info("Set VLLM_ATTENTION_BACKEND to TRITON")
         
         kwargs = {}
         if config.vllm_kv_quantization:
@@ -324,14 +317,14 @@ class DataSamplerServer:
             max_model_len=config.max_model_len,
             enable_lora=config.single_gpu,
             enable_sleep_mode=True,  # Enable sleep mode for CUDA
-            worker_cls="fuchsia.vllm_server.WeightSyncWorker", 
+            worker_extension_cls="fuchsia.vllm_server.WeightSyncWorkerExtension",
             **kwargs
         )
 
         # Data sampler specific initialization
         self.dataset = dataset
         self.is_data_sampler = dataset is not None
-        self._lora_idx = 0
+        self._lora_idx = 1
         
         self.environment = environment or SingleTurnEnvironment(reward_functions=reward_functions)
         
