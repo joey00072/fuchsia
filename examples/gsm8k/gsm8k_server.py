@@ -9,7 +9,12 @@ from pathlib import Path
 # os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-SYSTEM_PROMPT = "Respond in following format:<thinking>{think on problem, understand problem create plan to solve it relfect on your step answer only when you are sure}</thinking><answer>{number}</answer>"
+SYSTEM_PROMPT = """Respond in following format:
+<thinking>
+{think on problem, understand problem create plan to solve it relfect on your step answer only when you are sure}
+</thinking>
+<answer>{number}</answer>
+"""
 
 
 def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
@@ -30,7 +35,7 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
     try:
         # Extract the actual response
         try:
-            s = s.split(f"{START_HEADER_TOKEN}{ASSISTANT_TOKEN}{END_HEADER_TOKEN}")[1]
+            s = s.split(f"{ASSISTANT_TOKEN}")[1]
         except IndexError:
             return -1.0
 
@@ -67,8 +72,8 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
         else:
             format_reward -= 0.1
         
-        if "\n" in s:
-            format_reward += 0.1 * min(s.count("\n"), 10)
+        # if "\n" in s:
+        #     format_reward += 0.1 * min(s.count("\n"), 10)
             
         # Validate answer section
         if "<answer>" in s and "</answer>" in s:
@@ -87,7 +92,7 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
         if correct_template == 1:
             format_reward += 1.0
             
-        if format_reward + content_reward >= 3 and idx < 8*8*2:
+        if format_reward + content_reward >= 3 and idx < 8*4:
             if "<thinking>" in s and "</thinking>" in s:
                 if "\n<thinking>\n" in s:
                     format_reward += 0.1
