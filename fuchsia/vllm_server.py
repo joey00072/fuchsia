@@ -25,7 +25,7 @@ import os
 import threading
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Sequence, Callable
 
 # Third party imports
@@ -146,40 +146,303 @@ class WeightSyncWorkerExtension:
 
 @dataclass
 class ServerConfig:
-    model: str
-    revision: Optional[str] = None
-    tensor_parallel_size: int = 1
-    host: str = "0.0.0.0"
-    port: int = 8000
-    gpu_memory_utilization: float = 0.5
-    dtype: str = "auto"
-    max_model_len: Optional[int] = 512
-    enable_prefix_caching: Optional[bool] = None
-    quantization: Optional[str] = None
+    """
+    Comprehensive configuration for VLLM server with data sampling capabilities.
     
-    # Data sampler specific configs
-    dataset_field: str = "text"
-    buffer_size: int = 32
-    enable_lora: bool = False
-    lora_path: str = "lora_weights"
-    vllm_n: int = 1
-    vllm_repetition_penalty: float = 1.0
-    vllm_temperature: float = 0.9
-    vllm_top_p: float = 1.0
-    vllm_top_k: int = -1
-    vllm_min_p: float = 0.0
-    vllm_max_tokens: int = 1024
-    vllm_kv_quantization: bool = False
-    generation_batch_size: int = 1
+    This configuration class manages settings for:
+    - VLLM model server configuration and hardware settings
+    - Data sampling and buffer management
+    - Generation parameters and optimization settings
+    - Dataset loading and processing options
+    - LoRA integration and model adaptation
+    - Performance tuning and resource management
     
-    single_gpu: bool = False
+    The class provides extensive validation, documentation, and metadata
+    for each configuration option to ensure robust server operation.
+    """
     
-    dataset_name: str = ""
-    dataset_split: str = "train"
-    dataset_max_samples: int = -1
+    # ============================================================================
+    # MODEL AND SERVER CONFIGURATION
+    # ============================================================================
+    
+    model: str = field(
+        metadata={
+            "description": "Model name or path for VLLM server",
+            "examples": ["microsoft/DialoGPT-medium", "meta-llama/Llama-2-7b-hf"],
+            "required": True,
+            "category": "model"
+        }
+    )
+    
+    revision: Optional[str] = field(
+        default=None,
+        metadata={
+            "description": "Specific model revision/commit to use",
+            "examples": ["main", "v1.0", "abc123def456"],
+            "category": "model"
+        }
+    )
+    
+    tensor_parallel_size: int = field(
+        default=1,
+        metadata={
+            "description": "Number of GPUs to use for tensor parallelism",
+            "range": (1, 8),
+            "category": "hardware",
+            "impact": "Higher values enable larger models but require more GPUs"
+        }
+    )
+    
+    host: str = field(
+        default="0.0.0.0",
+        metadata={
+            "description": "Host address to bind the server to",
+            "examples": ["0.0.0.0", "localhost", "127.0.0.1"],
+            "category": "network",
+            "security_note": "0.0.0.0 allows external connections"
+        }
+    )
+    
+    port: int = field(
+        default=8000,
+        metadata={
+            "description": "Port number for the server",
+            "range": (1024, 65535),
+            "category": "network"
+        }
+    )
+    
+    gpu_memory_utilization: float = field(
+        default=0.5,
+        metadata={
+            "description": "Fraction of GPU memory to use for model",
+            "range": (0.1, 0.95),
+            "category": "hardware",
+            "recommendations": {
+                "conservative": 0.5,
+                "aggressive": 0.8,
+                "maximum": 0.9
+            }
+        }
+    )
+    
+    dtype: str = field(
+        default="auto",
+        metadata={
+            "description": "Data type for model weights",
+            "choices": ["auto", "bfloat16", "float16", "float32"],
+            "category": "model",
+            "usage": "auto = let VLLM decide based on model and hardware"
+        }
+    )
+    
+    max_model_len: Optional[int] = field(
+        default=512,
+        metadata={
+            "description": "Maximum sequence length for the model",
+            "range": (1, 32768),
+            "category": "model",
+            "unit": "tokens",
+            "impact": "Higher values use more memory but allow longer sequences"
+        }
+    )
+    
+    enable_prefix_caching: Optional[bool] = field(
+        default=None,
+        metadata={
+            "description": "Enable prefix caching for improved performance",
+            "category": "performance",
+            "usage": "None = auto-detect, True/False = force enable/disable"
+        }
+    )
+    
+    quantization: Optional[str] = field(
+        default=None,
+        metadata={
+            "description": "Quantization method to reduce memory usage",
+            "choices": [None, "awq", "gptq", "squeezellm", "fp8"],
+            "category": "optimization",
+            "trade_off": "Reduces memory but may affect quality"
+        }
+    )
+    
+    # ============================================================================
+    # DATA SAMPLING CONFIGURATION
+    # ============================================================================
+    
+    dataset_field: str = field(
+        default="text",
+        metadata={
+            "description": "Field name in dataset containing input text",
+            "examples": ["text", "prompt", "input", "question"],
+            "category": "dataset"
+        }
+    )
+    
+    buffer_size: int = field(
+        default=32,
+        metadata={
+            "description": "Size of the data buffer for sampling",
+            "range": (1, 1000),
+            "category": "dataset",
+            "impact": "Larger buffers provide more variety but use more memory"
+        }
+    )
+    
+    generation_batch_size: int = field(
+        default=1,
+        metadata={
+            "description": "Batch size for generation during data sampling",
+            "range": (1, 64),
+            "category": "performance"
+        }
+    )
+    
+    dataset_name: str = field(
+        default="",
+        metadata={
+            "description": "Name of the dataset to load",
+            "examples": ["squad", "wikitext", "custom_dataset"],
+            "category": "dataset"
+        }
+    )
+    
+    dataset_split: str = field(
+        default="train",
+        metadata={
+            "description": "Dataset split to use",
+            "choices": ["train", "validation", "test"],
+            "category": "dataset"
+        }
+    )
+    
+    dataset_max_samples: int = field(
+        default=-1,
+        metadata={
+            "description": "Maximum number of samples to load from dataset",
+            "range": (-1, 1000000),
+            "category": "dataset",
+            "usage": "-1 = load all samples"
+        }
+    )
+    
+    # ============================================================================
+    # LORA CONFIGURATION
+    # ============================================================================
+    
+    enable_lora: bool = field(
+        default=False,
+        metadata={
+            "description": "Enable LoRA adapter support",
+            "category": "lora"
+        }
+    )
+    
+    lora_path: str = field(
+        default="lora_weights",
+        metadata={
+            "description": "Path to LoRA weights directory",
+            "category": "lora"
+        }
+    )
+    
+    # ============================================================================
+    # VLLM GENERATION PARAMETERS
+    # ============================================================================
+    
+    vllm_n: int = field(
+        default=1,
+        metadata={
+            "description": "Number of completions to generate per prompt",
+            "range": (1, 20),
+            "category": "generation"
+        }
+    )
+    
+    vllm_repetition_penalty: float = field(
+        default=1.0,
+        metadata={
+            "description": "Repetition penalty for VLLM generation",
+            "range": (0.5, 2.0),
+            "category": "generation"
+        }
+    )
+    
+    vllm_temperature: float = field(
+        default=0.9,
+        metadata={
+            "description": "Sampling temperature for VLLM generation",
+            "range": (0.01, 2.0),
+            "category": "generation"
+        }
+    )
+    
+    vllm_top_p: float = field(
+        default=1.0,
+        metadata={
+            "description": "Top-p (nucleus) sampling parameter",
+            "range": (0.0, 1.0),
+            "category": "generation"
+        }
+    )
+    
+    vllm_top_k: int = field(
+        default=-1,
+        metadata={
+            "description": "Top-k sampling parameter",
+            "range": (-1, 1000),
+            "category": "generation",
+            "usage": "-1 = disabled"
+        }
+    )
+    
+    vllm_min_p: float = field(
+        default=0.0,
+        metadata={
+            "description": "Minimum probability threshold",
+            "range": (0.0, 1.0),
+            "category": "generation"
+        }
+    )
+    
+    vllm_max_tokens: int = field(
+        default=1024,
+        metadata={
+            "description": "Maximum tokens to generate",
+            "range": (1, 4096),
+            "category": "generation"
+        }
+    )
+    
+    vllm_kv_quantization: bool = field(
+        default=False,
+        metadata={
+            "description": "Enable KV cache quantization to save memory",
+            "category": "optimization",
+            "trade_off": "Saves memory but may reduce quality"
+        }
+    )
+    
+    # ============================================================================
+    # SYSTEM CONFIGURATION
+    # ============================================================================
+    
+    single_gpu: bool = field(
+        default=False,
+        metadata={
+            "description": "Force single GPU usage",
+            "category": "hardware"
+        }
+    )
        
 
-    def __post_init__(self,**kwargs):
+    def __post_init__(self, **kwargs):
+        """
+        Post-initialization validation and setup for ServerConfig.
+        
+        Performs comprehensive validation of server configuration parameters,
+        validates network settings, and ensures compatibility between options.
+        """
         # Allow for dynamic attribute setting from config files
         for key, value in self.__dict__.items():
             if not hasattr(self, key):
@@ -188,6 +451,124 @@ class ServerConfig:
         for key, value in kwargs.items():
             if not hasattr(self, key):
                 setattr(self, key, value)
+                
+        self._validate_configuration()
+        
+    def _validate_configuration(self):
+        """Validate server configuration parameters."""
+        errors = []
+        
+        # Model validation
+        if not self.model.strip():
+            errors.append("model cannot be empty")
+            
+        # Network validation
+        if not 1024 <= self.port <= 65535:
+            errors.append(f"port must be in range [1024, 65535], got {self.port}")
+            
+        # Hardware validation
+        if self.tensor_parallel_size <= 0:
+            errors.append(f"tensor_parallel_size must be positive, got {self.tensor_parallel_size}")
+            
+        if not 0.1 <= self.gpu_memory_utilization <= 0.95:
+            errors.append(f"gpu_memory_utilization must be in [0.1, 0.95], got {self.gpu_memory_utilization}")
+            
+        # Model configuration validation
+        if self.max_model_len is not None and self.max_model_len <= 0:
+            errors.append(f"max_model_len must be positive, got {self.max_model_len}")
+            
+        # Data sampling validation
+        if self.buffer_size <= 0:
+            errors.append(f"buffer_size must be positive, got {self.buffer_size}")
+            
+        if self.generation_batch_size <= 0:
+            errors.append(f"generation_batch_size must be positive, got {self.generation_batch_size}")
+            
+        if self.dataset_max_samples < -1:
+            errors.append(f"dataset_max_samples must be >= -1, got {self.dataset_max_samples}")
+            
+        # Generation parameter validation
+        if self.vllm_n <= 0:
+            errors.append(f"vllm_n must be positive, got {self.vllm_n}")
+            
+        if not 0.01 <= self.vllm_temperature <= 2.0:
+            errors.append(f"vllm_temperature must be in [0.01, 2.0], got {self.vllm_temperature}")
+            
+        if not 0.0 <= self.vllm_top_p <= 1.0:
+            errors.append(f"vllm_top_p must be in [0.0, 1.0], got {self.vllm_top_p}")
+            
+        if not 0.0 <= self.vllm_min_p <= 1.0:
+            errors.append(f"vllm_min_p must be in [0.0, 1.0], got {self.vllm_min_p}")
+            
+        if self.vllm_max_tokens <= 0:
+            errors.append(f"vllm_max_tokens must be positive, got {self.vllm_max_tokens}")
+            
+        # Dtype validation
+        valid_dtypes = ["auto", "bfloat16", "float16", "float32"]
+        if self.dtype not in valid_dtypes:
+            errors.append(f"dtype must be one of {valid_dtypes}, got '{self.dtype}'")
+            
+        # Dataset split validation
+        valid_splits = ["train", "validation", "test"]
+        if self.dataset_split not in valid_splits:
+            errors.append(f"dataset_split must be one of {valid_splits}, got '{self.dataset_split}'")
+            
+        # Quantization validation
+        valid_quantization = [None, "awq", "gptq", "squeezellm", "fp8"]
+        if self.quantization not in valid_quantization:
+            errors.append(f"quantization must be one of {valid_quantization}, got '{self.quantization}'")
+            
+        if errors:
+            raise ValueError("ServerConfig validation failed:\n" + "\n".join(f"  - {error}" for error in errors))
+            
+    def get_config_summary(self) -> Dict[str, Any]:
+        """Get a summary of key server configuration parameters."""
+        return {
+            "server": {
+                "model": self.model,
+                "host": self.host,
+                "port": self.port,
+                "tensor_parallel_size": self.tensor_parallel_size
+            },
+            "hardware": {
+                "gpu_memory_utilization": self.gpu_memory_utilization,
+                "dtype": self.dtype,
+                "single_gpu": self.single_gpu
+            },
+            "generation": {
+                "max_tokens": self.vllm_max_tokens,
+                "temperature": self.vllm_temperature,
+                "top_p": self.vllm_top_p,
+                "n_completions": self.vllm_n
+            },
+            "dataset": {
+                "name": self.dataset_name,
+                "field": self.dataset_field,
+                "buffer_size": self.buffer_size,
+                "max_samples": self.dataset_max_samples
+            }
+        }
+        
+    def validate_compatibility(self):
+        """Check for compatibility issues between configuration options."""
+        warnings = []
+        
+        # Memory usage warnings
+        if self.gpu_memory_utilization > 0.8 and self.tensor_parallel_size == 1:
+            warnings.append("High GPU memory utilization (>0.8) with single GPU may cause OOM errors")
+            
+        # Generation parameter warnings
+        if self.vllm_temperature < 0.1:
+            warnings.append("Very low temperature (<0.1) may produce repetitive text")
+            
+        if self.vllm_top_p < 0.1:
+            warnings.append("Very low top_p (<0.1) may limit text diversity")
+            
+        # Buffer size warnings
+        if self.buffer_size > 100:
+            warnings.append("Large buffer size (>100) may use significant memory")
+            
+        return warnings
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "ServerConfig":
@@ -251,6 +632,82 @@ class ServerConfig:
         )
 
         return server_config_obj
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert configuration to dictionary format."""
+        result = {}
+        for field_name, field_obj in self.__dataclass_fields__.items():
+            value = getattr(self, field_name)
+            result[field_name] = value
+        return result
+    
+    def get_field_info(self, field_name: str) -> Dict[str, Any]:
+        """Get detailed information about a specific configuration field."""
+        if field_name not in self.__dataclass_fields__:
+            raise ValueError(f"Field '{field_name}' not found in configuration")
+            
+        field_obj = self.__dataclass_fields__[field_name]
+        info = {
+            "name": field_name,
+            "type": str(field_obj.type),
+            "default": field_obj.default if field_obj.default != field_obj.default_factory else field_obj.default_factory(),
+            "current_value": getattr(self, field_name)
+        }
+        
+        # Add metadata if available
+        if hasattr(field_obj, 'metadata') and field_obj.metadata:
+            info.update(field_obj.metadata)
+            
+        return info
+    
+    def list_fields_by_category(self, category: str = None) -> List[str]:
+        """List all fields, optionally filtered by category."""
+        fields = []
+        for field_name, field_obj in self.__dataclass_fields__.items():
+            if hasattr(field_obj, 'metadata') and field_obj.metadata:
+                field_category = field_obj.metadata.get('category', 'uncategorized')
+                if category is None or field_category == category:
+                    fields.append(field_name)
+            elif category is None:
+                fields.append(field_name)
+        return fields
+    
+    def get_categories(self) -> List[str]:
+        """Get all available configuration categories."""
+        categories = set()
+        for field_obj in self.__dataclass_fields__.values():
+            if hasattr(field_obj, 'metadata') and field_obj.metadata:
+                category = field_obj.metadata.get('category', 'uncategorized')
+                categories.add(category)
+        return sorted(list(categories))
+    
+    def print_config_summary(self):
+        """Print a formatted summary of the configuration."""
+        print("\\n" + "="*60)
+        print("SERVER CONFIGURATION SUMMARY")
+        print("="*60)
+        
+        categories = self.get_categories()
+        for category in categories:
+            print(f"\\n[{category.upper()}]")
+            print("-" * 40)
+            
+            fields = self.list_fields_by_category(category)
+            for field_name in fields:
+                value = getattr(self, field_name)
+                field_info = self.get_field_info(field_name)
+                description = field_info.get('description', 'No description available')
+                
+                # Format value display
+                if isinstance(value, float):
+                    value_str = f"{value:.6g}"
+                else:
+                    value_str = str(value)
+                    
+                print(f"  {field_name}: {value_str}")
+                print(f"    {description}")
+                
+        print("\\n" + "="*60)
 
 
 # API Models
