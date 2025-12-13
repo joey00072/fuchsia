@@ -1,6 +1,6 @@
 # Generation configuration (shared parameters)
 generation: &generation
-  max_len: &max_len 1024
+  max_len: &max_len 2048
   group_size: &group_size 8
   temperature: &temperature 0.8
   top_k: &top_k -1
@@ -27,15 +27,16 @@ grpo:
   group_size: *group_size
   batch_size: *generation_batch_size
   grad_accumulation_steps: *generation_batch_size
-  lr: 0.00001
+  lr: 0.0001
   weight_decay: 0.1
   beta: 0.0
   epsilon: 0.2
   epsilon_high: 0.28
   log_wandb: true
-  wandb_project: "fuchsia-single-gpu-qlora"
+  wandb_project: "fuchsia-dgrpo"
   num_policy_updates: 1
   lora_path: "./lora_weights"
+  loss_type: "cispo"
   single_gpu: true
   gradient_checkpointing:
     enabled: true
@@ -43,7 +44,7 @@ grpo:
 
 # Server configuration
 server:
-  host: "0.0.0.0"
+  host : "0.0.0.0"
   port: 8000
   gpu_memory_utilization: 0.8
   tensor_parallel_size: 1

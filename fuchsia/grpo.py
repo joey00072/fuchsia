@@ -381,14 +381,20 @@ class GRPO:
         # advantage calculation
         advantage: Tensor = (reward - mean_rewards) / (std_rewards + 1e-6)
         advantage = advantage.reshape(-1, 1)
+        # advantage = torch.where(advantage < 0, advantage * 0.001, advantage)
         
         policy_ratio = torch.exp(policy_log_probs - old_policy_log_probs.detach())
+        
 
         unclipped_loss = policy_ratio * advantage
         clipped_loss = (
             torch.clamp(policy_ratio, 1 - self.epsilon, 1 + self.epsilon_high) * advantage
         )
         loss = -torch.min(unclipped_loss, clipped_loss)
+        
+        if self.config.loss_type == "cxpo":
+            loss = F.sigmoid((policy_ratio))*advantage
+            return loss.mean(), 0.0
         
         if self.config.loss_type == "cispo":
             loss = -clipped_loss.detach() * policy_log_probs
@@ -648,6 +654,8 @@ class GRPO:
                     group_losses.append(loss.item())
                     group_klds.append(kld)
                     loss.backward()
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
 
                 print(f"{idx:04d} loss: {sum(group_losses) / len(group_losses)} reward: {reward.mean()}")
                 
@@ -658,8 +666,6 @@ class GRPO:
                 iteration_metrics["valid_samples"].append(b_ignore_sample.sum().item())
                 iteration_metrics["kld"].append(sum(group_klds) / len(group_klds))
             
-                # Step the optimizer
-                self.optimizer.step()
 
             # Step the learning rate scheduler if enabled
             if self.use_scheduler and self.scheduler is not None:

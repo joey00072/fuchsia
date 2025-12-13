@@ -6,7 +6,7 @@ generation: &generation
   top_k: &top_k -1
   top_p: &top_p 1.0
   min_p: &min_p 0.0
-  batch_size: &generation_batch_size 8
+  batch_size: &generation_batch_size 4
 
 # Model configuration
 model:
@@ -24,13 +24,13 @@ lora:
 
 # GRPO training configuration
 grpo:
-  loss_type: "reinforce"
+  loss_type: "cispo"
   group_size: *group_size
   batch_size: *generation_batch_size
   grad_accumulation_steps: *generation_batch_size
-  lr: 0.00005
+  lr: 0.000005
   weight_decay: 0.2
-  beta: 0.01
+  beta: 0.001
   epsilon: 0.2
   log_wandb: true
   wandb_project: "fuchsia-single-gpu-qlora"

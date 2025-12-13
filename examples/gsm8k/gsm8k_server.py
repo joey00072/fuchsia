@@ -16,6 +16,7 @@ SYSTEM_PROMPT = """Respond in following format:
 <answer>{number}</answer>
 """
 
+CURRICULUM_LEARNING = 0
 
 def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
     """Improved reward function with better validation and scoring."""
@@ -92,7 +93,7 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
         if correct_template == 1:
             format_reward += 1.0
             
-        if format_reward + content_reward >= 3 and idx < 8*4:
+        if format_reward + content_reward >= 3 and idx < 8*CURRICULUM_LEARNING:
             if "<thinking>" in s and "</thinking>" in s:
                 if "\n<thinking>\n" in s:
                     format_reward += 0.1
@@ -117,11 +118,11 @@ def reward_function_1(rollouts: List[Rollout], *args, **kwargs):
     lst = []
     for rollout in rollouts:
         reward = response_format_reward(rollout.item, rollout.completion , idx=idx)
-        if idx > 8*2 and reward < 5.1:
+        if idx > 8*CURRICULUM_LEARNING and reward < 5.1:
             reward = 0
         lst.append(reward)
         
-    if idx > 8*2 and not(any(x>5.1 for x in lst)):
+    if idx > 8*CURRICULUM_LEARNING and not(any(x>5.1 for x in lst)):
         lst = [0 for _ in lst]
         
     return lst

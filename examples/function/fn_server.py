@@ -90,6 +90,8 @@ def response_format_reward(rollouts: list[Rollout], *args, **kwargs) -> list[flo
     for rollout in rollouts:
         reward = single_rollout_reward(rollout)
         lst.append(reward)
+        
+    print(lst)
     return lst
 
 
@@ -205,12 +207,12 @@ class PythonInterpreterEnvironment(MultiTurnEnvironment):
                 last_rollout.finish_reason = "stop"
                 tokenizer = process_kwargs["tokenizer"]
                 completion = tokenizer.apply_chat_template(
-                [
-                    {"role": "assistant", "content": FILL_TOKEN},
-                ],
-                tokenize=False,
-            )
-            last_rollout.completion = completion.replace(FILL_TOKEN, last_rollout.item["completion"])
+                    [
+                        {"role": "assistant", "content": FILL_TOKEN},
+                    ],
+                    tokenize=False,
+                )
+                last_rollout.completion = completion.replace(FILL_TOKEN, last_rollout.item["completion"])
                 
             
         tokenizer = process_kwargs["tokenizer"]
@@ -222,8 +224,9 @@ class PythonInterpreterEnvironment(MultiTurnEnvironment):
                 rollout.finish_reason = "length"
                 rollout.stop_reason = "length"
                 rollout.stop = [tokenizer.eos_token]
-                rollout.completion = tokenizer.decode(rollout.completion_ids[:max_model_len])
-                
+                rollout.completion = tokenizer.decode(tokenizer.encode(rollout.input)[:max_model_len])
+    
+    
         return rollouts 
 
 
