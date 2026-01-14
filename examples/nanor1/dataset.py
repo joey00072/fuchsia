@@ -9,7 +9,6 @@ class Equation:
     eqn: str
     numbers: list
     ops: list
-    total: int
     answer: int
     
     def to_json(self):
@@ -17,7 +16,6 @@ class Equation:
             "eqn": self.eqn,
             "numbers": self.numbers,
             "ops": self.ops,
-            "total": self.total,
             "answer": self.answer
         }
 
@@ -38,7 +36,7 @@ class Dataset:
             total = eval(eqn_str)     
             if int(total) != float(total):
                 continue
-            self._dict[int(total)] = Equation(eqn_str, numbers, ops, int(total), total)
+            self._dict[int(total)] = Equation(eqn_str, numbers, ops, int(total))
             
 
         with open("./nanor1_dataset.jsonl", "w") as f:
