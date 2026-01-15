@@ -2,8 +2,7 @@ import random
 from dataclasses import dataclass
 from rich import print
 import json
-
-
+from datasets import Dataset
 @dataclass
 class Equation:
     eqn: str
@@ -19,7 +18,7 @@ class Equation:
             "answer": self.answer
         }
 
-class Dataset:
+class TinyEquationDataset:
     def __init__(self,n=4):
         self.n = n 
         self.ops = ["+","-","*","/"]
@@ -39,15 +38,18 @@ class Dataset:
             self._dict[int(total)] = Equation(eqn_str, numbers, ops, int(total))
             
 
-        with open("./nanor1_dataset.jsonl", "w") as f:
-            for eqn in self._dict.values():
-                f.write(json.dumps(eqn.to_json()) + "\n")
+        # with open("./nanor1_dataset.jsonl", "w") as f:
+        #     for eqn in self._dict.values():
+        #         f.write(json.dumps(eqn.to_json()) + "\n")
+        
+        print(f"Dataset built with {len(self._dict)} equations")
+        ds = Dataset.from_list([eqn.to_json() for eqn in self._dict.values()])
+        print(ds)
+        return ds
 
-    def get_dataset(self):
-        return self._dict
-
-if __name__ == "__main__":
+if __name__ == "__main__":  
     n = 4
     size = 1024*8
-    dataset = Dataset(n)
-    dataset.build_dataset(size)
+    dataset = TinyEquationDataset(n)
+    ds = dataset.build_dataset(size)
+    print(ds[0])
