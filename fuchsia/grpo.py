@@ -478,7 +478,7 @@ class GRPO:
         if self.config.debug:   
             print("\n\n\n")
             print("-" * 10)
-            print(decoded_outputs[0].replace("<|finetune_right_pad_id|>", "").replace("<|end_of_text|>", ""))
+            print(decoded_outputs[0].replace("<|endoftext|>", "").replace("<|finetune_right_pad_id|>", "").replace("<|end_of_text|>", ""))
             print("-" * 10)
             print("\n\n\n")
             
