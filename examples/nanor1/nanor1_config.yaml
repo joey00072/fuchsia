@@ -1,6 +1,6 @@
 # Generation configuration (shared parameters)
 generation: &generation
-  max_len: &max_len 2048
+  max_len: &max_len 1024
   group_size: &group_size 8
   temperature: &temperature 0.8
   top_k: &top_k -1
@@ -33,7 +33,7 @@ grpo:
   epsilon: 0.2
   epsilon_high: 0.28
   log_wandb: true
-  wandb_project: "fuchsia-dgrpo"
+  wandb_project: "fuchsia-nanor1"
   num_policy_updates: 1
   lora_path: "./lora_weights"
   loss_type: "cispo"
