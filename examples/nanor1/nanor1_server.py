@@ -68,13 +68,13 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
     content_reward = 0
     try:
         
-        if START_THINKING_TOKEN in s:
+        if START_THINKING_TOKEN in s and s.count(START_THINKING_TOKEN) == 1:
             format_reward += 0.1
-        if END_THINKING_TOKEN in s:
+        if END_THINKING_TOKEN in s and s.count(END_THINKING_TOKEN) == 1:
             format_reward += 0.1
-        if START_ANSWER_TOKEN in s:
+        if START_ANSWER_TOKEN in s and s.count(START_ANSWER_TOKEN) == 1:
             format_reward += 0.1
-        if END_ANSWER_TOKEN in s:
+        if END_ANSWER_TOKEN in s and s.count(END_ANSWER_TOKEN) == 1:
             format_reward += 0.1
         
         if format_reward == 0.4:
@@ -93,7 +93,9 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
                 output = eval(answer)
                 print(f"{output=}")
                 content_reward += 0.1
-                if int(output) == int(sample['answer']):
+                if int(output) != int(answer):
+                    content_reward -= 0.1
+                if int(output) == int(sample['answer']) and int(output) != int(answer):
                     content_reward += 0.4
             except Exception as e:
                 content_reward = 0
@@ -135,7 +137,7 @@ give the final answer here
         example["text"] = tokenizer.apply_chat_template(
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": x + f"find equation with {n1}, {n2}, {n3} and {n4} and basic arithmetic operations (+,-,*,/,'(',')') to get {example['answer']}" },
+                {"role": "user", "content": x + f"find equation with {n1}, {n2}, {n3} and {n4} and basic arithmetic operations (+,-,*,/,'(',')') to get {example['answer']}, give such equation (only pure equation not any text or explanation not answer, only numbers and this characters (+,-,*,/,'(',')') in <answer> tag)" },
             ],
             tokenize=False,
         )+" system\n"
