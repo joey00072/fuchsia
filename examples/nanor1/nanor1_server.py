@@ -88,17 +88,28 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
             
         if format_reward == 0.5:
             answer = s.split(START_ANSWER_TOKEN)[1].split(END_ANSWER_TOKEN)[0]
-            
+            if "=" in answer:
+                answer = answer.split("=")[0]
+                format_reward -= 0.05
+                
+            is_eqn = False
             try:
-                output = eval(answer)
-                print(f"{output=}")
-                content_reward += 0.1
-                if int(output) != int(answer):
-                    content_reward -= 0.1
-                if int(output) == int(sample['answer']) and int(output) != int(answer):
-                    content_reward += 0.4
+                int(answer)
             except Exception as e:
-                content_reward = 0
+                content_reward +=0.1
+                is_eqn = True
+            finally:
+                content_reward -= 0.1
+                
+            if is_eqn:
+                try:
+                    output = eval(answer)
+                    if int(output) == int(sample['answer']):
+                        content_reward += 0.4
+                    else:
+                        content_reward += 0.1
+                except Exception as e:
+                    content_reward -= 0.1
             
         return format_reward + content_reward
     except Exception as e:
@@ -118,6 +129,18 @@ def reward_function_1(rollouts: List[Rollout], *args, **kwargs):
         
     return lst
 
+def human_join(nums):
+    nums = [str(x) for x in nums]
+    if not nums:
+        return ""
+    if len(nums) == 1:
+        return nums[0]
+    if len(nums) == 2:
+        return f"{nums[0]} and {nums[1]}"
+    return ", ".join(nums[:-1]) + " and " + nums[-1]
+
+# print(human_join([324, 232, 667, 8778]))
+# 324, 232, 667 and 8778
 
 def prepare_dataset(dataset: Dataset, tokenizer) -> Dataset:
     ("first think in <think></think> tag and then give final answer in <answer></answer>"
@@ -133,11 +156,12 @@ give the final answer here
 """
     
     def process_example(example):
-        n1,n2,n3,n4 = example['numbers']
+        # n1,n2,n3,n4 = example['numbers']
+        example['numbers'] = [str(n) for n in example['numbers']]
         example["text"] = tokenizer.apply_chat_template(
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": x + f"find equation with {n1}, {n2}, {n3} and {n4} and basic arithmetic operations (+,-,*,/,'(',')') to get {example['answer']}, give such equation (only pure equation not any text or explanation not answer, only numbers and this characters (+,-,*,/,'(',')') in <answer> tag)" },
+                {"role": "user", "content": x + f"find equation with {human_join(example['numbers'])} and basic arithmetic operations (+,-,*,/,'(',')') to get {example['answer']}, give such equation (only pure equation not any text or explanation not answer, only numbers and this characters (+,-,*,/,'(',')') in <answer> tag, make sure to confaim solution in thinking process)" },
             ],
             tokenize=False,
         )+" system\n"
@@ -149,7 +173,7 @@ def main():
     server_config = ServerConfig.from_yaml(Path(__file__).parent / "nanor1_config.yaml")
     tokenizer = AutoTokenizer.from_pretrained(server_config.model)
     # dataset = load_dataset(server_config.dataset_name, server_config.dataset_split)["train"]
-    dataset = TinyEquationDataset(n=4).build_dataset(size=1024*8)
+    dataset = TinyEquationDataset(n=4, min_n=3).build_dataset(size=1024*8)
     dataset = dataset.shuffle()
     dataset = prepare_dataset(dataset, tokenizer)
     

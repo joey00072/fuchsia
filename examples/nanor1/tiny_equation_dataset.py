@@ -19,17 +19,18 @@ class Equation:
         }
 
 class TinyEquationDataset:
-    def __init__(self,n=4):
+    def __init__(self,n=4, min_n=None):
         self.n = n 
         self.ops = ["+","-","*","/"]
-
+        self.min_n = min_n if min_n is not None else n
 
     def build_dataset(self, size=1024):
         self._dict:[int,Equation] = {}
 
         while len(self._dict) <size:
-            numbers = [random.randint(10,100) for _ in range(self.n)]
-            ops = [random.choice(self.ops) for _ in range(self.n-1)]
+            n = random.randint(self.min_n, self.n)
+            numbers = [random.randint(10,100) for _ in range(n)]
+            ops = [random.choice(self.ops) for _ in range(n-1)]
             total = numbers[0]
             eqn_str = "".join([str(total)] + [str(op) + str(num) for op, num in zip(ops, numbers[1:])])
             total = eval(eqn_str)     
@@ -48,7 +49,8 @@ class TinyEquationDataset:
 
 if __name__ == "__main__":  
     n = 4
+    min_n = 3
     size = 1024*8
-    dataset = TinyEquationDataset(n)
+    dataset = TinyEquationDataset(n, min_n)
     ds = dataset.build_dataset(size)
     print(ds[0])
