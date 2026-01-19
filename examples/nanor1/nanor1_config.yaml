@@ -29,14 +29,14 @@ grpo:
   grad_accumulation_steps: *generation_batch_size
   lr: 0.00005
   weight_decay: 0.1
-  beta: 0.0
+  beta: 0.01
   epsilon: 0.2
   epsilon_high: 0.28
   log_wandb: true
   wandb_project: "fuchsia-nanor1"
   num_policy_updates: 1
   lora_path: "./lora_weights"
-  loss_type: "cispo"
+  loss_type: "grpo"
   single_gpu: true
   gradient_checkpointing:
     enabled: true

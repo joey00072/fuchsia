@@ -148,7 +148,9 @@ def prepare_dataset(dataset: Dataset, tokenizer) -> Dataset:
     
     x = """Respond in following format:
 <think>
-think deeply and solve the problem here
+solve the problem here,
+think step by step
+confarm your solution in thinking process
 </think>
 <answer>
 give the final answer here
@@ -161,7 +163,7 @@ give the final answer here
         example["text"] = tokenizer.apply_chat_template(
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": x + f"find equation with {human_join(example['numbers'])} and basic arithmetic operations (+,-,*,/,'(',')') to get {example['answer']}, give such equation (only pure equation not any text or explanation not answer, only numbers and this characters (+,-,*,/,'(',')') in <answer> tag, make sure to confaim solution in thinking process)" },
+                {"role": "user", "content": x + f"find equation with {human_join(example['numbers'])} and basic arithmetic operations (+,-,*,/,'(',')') to get {example['answer']}, give such equation only in <answer> tag" },
             ],
             tokenize=False,
         )+" system\n"
