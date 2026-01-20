@@ -105,7 +105,7 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
                 try:
                     output = eval(answer)
                     if int(output) == int(sample['answer']):
-                        content_reward += 0.4
+                        content_reward += 0.5
                     else:
                         content_reward += 0.1
                 except Exception as e:
