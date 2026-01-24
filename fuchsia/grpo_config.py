@@ -30,7 +30,7 @@ class GRPOConfig:
     epsilon: float = 0.2
     epsilon_high: float = 0.28
     wandb_project: str = "fuchsia"
-    dataset_feild: str = "prompt"
+    dataset_field: str = "prompt"
     num_policy_updates: int = 8
     using_lora: bool = False
     lora_r: int = 8
@@ -162,7 +162,7 @@ class GRPOConfig:
             min_p=float(generation_config.get("min_p") or vllm_config.get("min_p", 0.0)),
             
             # Dataset configuration
-            dataset_feild=dataset_config.get("field", "prompt"),
+            dataset_field=dataset_config.get("field", "prompt"),
             
             # Training configuration
             max_iterations=training_config.get("max_iterations", 1000),
