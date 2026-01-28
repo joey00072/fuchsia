@@ -1,4 +1,5 @@
 from fuchsia.vllm_server import DataSamplerServer, ServerConfig, Rollout
+from fuchsia.reward_utils import clean_completion
 from datasets import load_dataset
 from rich import print
 from typing import Optional, List
@@ -52,12 +53,13 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
     # print("--------------------------------")
     
     """Improved reward function with better validation and scoring."""
-    START_OF_TEXT_TOKEN = "<|im_start|>"
-    END_OF_TEXT_TOKEN = "<|eot_id|>"
-    START_HEADER_TOKEN = "<|start_header_id|>"
-    END_HEADER_TOKEN = "<|end_header_id|>"
-    ASSISTANT_TOKEN = "assistant"
-    USER_TOKEN = "user"
+    already_clean = kwargs.get("already_clean", False)
+    if not already_clean:
+        s = clean_completion(
+            s,
+            tokenizer=kwargs.get("tokenizer"),
+            token_ids=kwargs.get("completion_ids"),
+        )
 
     START_THINKING_TOKEN = "<think>"
     END_THINKING_TOKEN = "</think>"
@@ -67,6 +69,8 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
     format_reward = 0
     content_reward = 0
     try:
+        if not s:
+            return 0
         
         if START_THINKING_TOKEN in s and s.count(START_THINKING_TOKEN) == 1:
             format_reward += 0.1
@@ -123,8 +127,17 @@ def reward_function_1(rollouts: List[Rollout], *args, **kwargs):
     idx += 1
     print(f"{idx=}")
     lst = []
-    for rollout in rollouts:
-        reward = response_format_reward(rollout.item, rollout.completion , idx=idx)
+    cleaned = kwargs.get("cleaned_completions")
+    for i, rollout in enumerate(rollouts):
+        completion = cleaned[i] if cleaned is not None else rollout.completion
+        reward = response_format_reward(
+            rollout.item,
+            completion,
+            idx=idx,
+            already_clean=cleaned is not None,
+            tokenizer=kwargs.get("tokenizer"),
+            completion_ids=rollout.completion_ids,
+        )
         lst.append(reward)
         
     return lst

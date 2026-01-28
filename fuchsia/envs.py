@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from vllm import LLM, SamplingParams
 from typing import Callable
+import inspect
 import numpy as np
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -8,6 +9,8 @@ from rich import print
 from collections import defaultdict
 from copy import deepcopy
 from transformers import AutoTokenizer
+
+from fuchsia.reward_utils import clean_completions
 
 
 @dataclass
@@ -146,7 +149,12 @@ class Environment:
                 rollout.completed = True
         return rollouts
     
-    def payload(self, rollouts: list[Rollout] | Rollout, calculate_rewards: bool = True):
+    def payload(
+        self,
+        rollouts: list[Rollout] | Rollout,
+        calculate_rewards: bool = True,
+        tokenizer: AutoTokenizer | None = None,
+    ):
         rollouts = [rollouts] if isinstance(rollouts, Rollout) else rollouts
         
         # Group rollouts by their original prompt/item (since we clone rollouts for n>1)
@@ -182,7 +190,13 @@ class Environment:
 
             if calculate_rewards and self.reward_functions:
                 output["all_rewards"], output["rewards"], output["mean"], output["std"] = (
-                    self.calculate_rewards(output["item"], output["completions"], output["completion_ids"], group)
+                    self.calculate_rewards(
+                        output["item"],
+                        output["completions"],
+                        output["completion_ids"],
+                        group,
+                        tokenizer=tokenizer,
+                    )
                 )
             else:
                 output["all_rewards"], output["rewards"], output["mean"], output["std"] = {}, [], 0.0, 0.0
@@ -193,15 +207,57 @@ class Environment:
         samples = [s for s in samples if s["std"] != 0.0]
         return samples
 
-    def calculate_rewards(self, items, completions, completion_ids, rollouts):
+    def calculate_rewards(self, items, completions, completion_ids, rollouts, tokenizer: AutoTokenizer | None = None):
         """Calculate rewards using the environment's reward functions."""
         import numpy as np
         # print(f"calculating rewards for {len(rollouts)} rollouts")
         all_rewards = {}
+        if not self.reward_functions:
+            return {}, [], 0.0, 0.0
+
+        reward_meta = {}
+        needs_cleaned = False
         for reward_function in self.reward_functions:
-            rewards = reward_function(
-                rollouts=rollouts, items=items, completions=completions, completion_ids=completion_ids
+            sig = inspect.signature(reward_function)
+            params = sig.parameters
+            accepts_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
             )
+            reward_meta[reward_function] = (params, accepts_kwargs)
+            if accepts_kwargs or "cleaned_completions" in params:
+                needs_cleaned = True
+
+        cleaned_completions = None
+        if needs_cleaned:
+            cleaned_completions = clean_completions(
+                completions,
+                tokenizer=tokenizer,
+                token_ids_list=completion_ids,
+            )
+
+        for reward_function in self.reward_functions:
+            params, accepts_kwargs = reward_meta[reward_function]
+            base_kwargs = {
+                "rollouts": rollouts,
+                "items": items,
+                "completions": completions,
+                "completion_ids": completion_ids,
+            }
+            extra_kwargs = {}
+            if tokenizer is not None:
+                extra_kwargs["tokenizer"] = tokenizer
+            if cleaned_completions is not None:
+                extra_kwargs["cleaned_completions"] = cleaned_completions
+
+            if accepts_kwargs:
+                kwargs = {**base_kwargs, **extra_kwargs}
+            else:
+                combined = {**base_kwargs, **extra_kwargs}
+                kwargs = {k: v for k, v in combined.items() if k in params}
+            if kwargs:
+                rewards = reward_function(**kwargs)
+            else:
+                rewards = reward_function(rollouts)
             all_rewards[reward_function.__name__] = rewards
 
         # Convert all reward lists to numpy arrays and stack them
@@ -303,4 +359,3 @@ class PythonEnvironment(MultiTurnEnvironment):
 
         rollout.last_completion = f"</python>\n<output>\n{output}\n</output>"
         return rollout
-

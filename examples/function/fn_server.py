@@ -46,9 +46,9 @@ def find_last_box_value(text):
     except ValueError:
         return last
 
-def single_rollout_reward(rollout: Rollout) -> float:
+def single_rollout_reward(rollout: Rollout, completion: str | None = None) -> float:
     reward = 0
-    completion = rollout.completion
+    completion = completion if completion is not None else rollout.completion
     print(completion)
     print("--------------------------------")
     format_reward = 0
@@ -86,9 +86,11 @@ def single_rollout_reward(rollout: Rollout) -> float:
 
 def response_format_reward(rollouts: list[Rollout], *args, **kwargs) -> list[float]:
     # correct_answer = sample["correct_answer"]
-    lst = []  
-    for rollout in rollouts:
-        reward = single_rollout_reward(rollout)
+    lst = []
+    cleaned = kwargs.get("cleaned_completions")
+    for i, rollout in enumerate(rollouts):
+        completion = cleaned[i] if cleaned is not None else rollout.completion
+        reward = single_rollout_reward(rollout, completion=completion)
         lst.append(reward)
         
     print(lst)

@@ -1,6 +1,6 @@
 rich>=13.7.0 
 datasets>=2.14.5
-transformers>=4.50.2
+transformers>=4.50.2,<5
 vllm==0.8.1
 fastapi>=0.114.0
 uvicorn>=0.31.0

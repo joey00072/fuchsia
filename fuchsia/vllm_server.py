@@ -24,6 +24,7 @@ import logging
 import os
 import threading
 import time
+import inspect
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional, Sequence, Callable
@@ -58,6 +59,7 @@ if libcuda_available:
 
 # Local imports
 from fuchsia.envs import Rollout, Environment, SingleTurnEnvironment, MultiTurnEnvironment
+from fuchsia.reward_utils import clean_completions
 from fuchsia.utils import get_ip_addresses
 
 # Configure logging
@@ -1034,7 +1036,7 @@ class DataSamplerServer:
                         rollouts.append(r)
                         
                     rollouts = self.environment.generate(rollouts, self.llm, self._sampling_params, vllm_generate_kwargs=generation_kwargs, tokenizer=self.tokenizer)
-                    items_with_rewards = self.environment.payload(rollouts)
+                    items_with_rewards = self.environment.payload(rollouts, tokenizer=self.tokenizer)
                     end_time = time.perf_counter()
                     print(f"time taken: {end_time - start_time}")
                     if len(items_with_rewards) == 0:
@@ -1114,10 +1116,52 @@ class DataSamplerServer:
             return {}, [], 0.0, 0.0
 
         all_rewards = {}
+        if not self.reward_functions:
+            return {}, [], 0.0, 0.0
+
+        reward_meta = {}
+        needs_cleaned = False
         for reward_function in self.reward_functions:
-            rewards = reward_function(
-                self.tokenizer, items, completions, completion_ids
+            sig = inspect.signature(reward_function)
+            params = sig.parameters
+            accepts_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
             )
+            reward_meta[reward_function] = (params, accepts_kwargs)
+            if accepts_kwargs or "cleaned_completions" in params:
+                needs_cleaned = True
+
+        cleaned_completions = None
+        if needs_cleaned:
+            cleaned_completions = clean_completions(
+                completions,
+                tokenizer=self.tokenizer,
+                token_ids_list=completion_ids,
+            )
+
+        for reward_function in self.reward_functions:
+            params, accepts_kwargs = reward_meta[reward_function]
+            base_kwargs = {
+                "tokenizer": self.tokenizer,
+                "items": items,
+                "completions": completions,
+                "completion_ids": completion_ids,
+            }
+            extra_kwargs = {}
+            if cleaned_completions is not None:
+                extra_kwargs["cleaned_completions"] = cleaned_completions
+
+            if accepts_kwargs:
+                kwargs = {**base_kwargs, **extra_kwargs}
+                rewards = reward_function(**kwargs)
+            else:
+                combined = {**base_kwargs, **extra_kwargs}
+                kwargs = {k: v for k, v in combined.items() if k in params}
+                if kwargs:
+                    rewards = reward_function(**kwargs)
+                else:
+                    rewards = reward_function(self.tokenizer, items, completions, completion_ids)
+
             all_rewards[reward_function.__name__] = rewards
 
         # Convert all reward lists to tensors and stack them

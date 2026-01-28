@@ -1,4 +1,5 @@
 from fuchsia.vllm_server import DataSamplerServer, ServerConfig, Rollout
+from fuchsia.reward_utils import clean_completion
 from datasets import load_dataset
 from rich import print
 from typing import Optional, List
@@ -20,12 +21,13 @@ CURRICULUM_LEARNING = 0
 
 def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
     """Improved reward function with better validation and scoring."""
-    START_OF_TEXT_TOKEN = "<|im_start|>"
-    END_OF_TEXT_TOKEN = "<|eot_id|>"
-    START_HEADER_TOKEN = "<|start_header_id|>"
-    END_HEADER_TOKEN = "<|end_header_id|>"
-    ASSISTANT_TOKEN = "assistant"
-    USER_TOKEN = "user"
+    already_clean = kwargs.get("already_clean", False)
+    if not already_clean:
+        s = clean_completion(
+            s,
+            tokenizer=kwargs.get("tokenizer"),
+            token_ids=kwargs.get("completion_ids"),
+        )
 
     START_THINKING_TOKEN = "<thinking>"
     END_THINKING_TOKEN = "</thinking>"
@@ -34,14 +36,8 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
     idx = kwargs["idx"]
     
     try:
-        # Extract the actual response
-        try:
-            s = s.split(f"{ASSISTANT_TOKEN}")[1]
-        except IndexError:
+        if not s:
             return -1.0
-
-        if END_OF_TEXT_TOKEN in s:
-            s = s.split(END_OF_TEXT_TOKEN)[0]
 
         # Initialize reward components
         format_reward = 0.0
@@ -116,8 +112,17 @@ def reward_function_1(rollouts: List[Rollout], *args, **kwargs):
     idx += 1
     print(f"{idx=}")
     lst = []
-    for rollout in rollouts:
-        reward = response_format_reward(rollout.item, rollout.completion , idx=idx)
+    cleaned = kwargs.get("cleaned_completions")
+    for i, rollout in enumerate(rollouts):
+        completion = cleaned[i] if cleaned is not None else rollout.completion
+        reward = response_format_reward(
+            rollout.item,
+            completion,
+            idx=idx,
+            already_clean=cleaned is not None,
+            tokenizer=kwargs.get("tokenizer"),
+            completion_ids=rollout.completion_ids,
+        )
         if idx > 8*CURRICULUM_LEARNING and reward < 5.1:
             reward = 0
         lst.append(reward)
