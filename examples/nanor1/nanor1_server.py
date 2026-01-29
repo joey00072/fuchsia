@@ -13,10 +13,10 @@ from tiny_equation_dataset import TinyEquationDataset
 
 SYSTEM_PROMPT = """Respond in following format:
 <think>
-think deeply and solve the problem here
+...
 </think>
 <answer>
-give the final answer here
+...
 </answer>
 """
 
@@ -48,9 +48,9 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
     
     # print(f"{sample=}")
     print("--------------------------------")
-    # print(s)
+    print(s)
     # print(f"{('<think>' in s)=}")
-    # print("--------------------------------")
+    print("--------------------------------")
     
     """Improved reward function with better validation and scoring."""
     already_clean = kwargs.get("already_clean", False)
@@ -73,16 +73,23 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
             return 0
         
         if START_THINKING_TOKEN in s and s.count(START_THINKING_TOKEN) == 1:
-            format_reward += 0.1
+            format_reward += 0.05
         if END_THINKING_TOKEN in s and s.count(END_THINKING_TOKEN) == 1:
-            format_reward += 0.1
+            format_reward += 0.05
         if START_ANSWER_TOKEN in s and s.count(START_ANSWER_TOKEN) == 1:
-            format_reward += 0.1
+            format_reward += 0.05
         if END_ANSWER_TOKEN in s and s.count(END_ANSWER_TOKEN) == 1:
-            format_reward += 0.1
+            format_reward += 0.05
         
         if format_reward == 0.4:
             think, answer = s.split(END_THINKING_TOKEN)
+            if "24 * 10 + (6 - 4)" in think:
+                format_reward -= 0.5
+            if "Okay, user want equation with number 10, 24, 4, 6 is equal to 242," in think:
+                format_reward -= 0.5
+            if "24 * 10 + (6 - 4)" in answer:
+                format_reward -= 0.5
+            
             if (
                 START_THINKING_TOKEN in think
                 and START_ANSWER_TOKEN in answer
@@ -109,7 +116,7 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
                 try:
                     output = eval(answer)
                     if int(output) == int(sample['answer']):
-                        content_reward += 0.5
+                        content_reward += 0.7
                     else:
                         content_reward += 0.1
                 except Exception as e:
@@ -160,14 +167,54 @@ def prepare_dataset(dataset: Dataset, tokenizer) -> Dataset:
     "tag.can you " )
     
     x = """Respond in following format:
+
+example:
+what equation with number 10, 24, 4, 6 is equal to 242
 <think>
-solve the problem here,
-think step by step
-confarm your solution in thinking process
+Okay, user want equation with number 10, 24, 4, 6 is equal to 242,
+
+242 is big number so there must be some multiplication in equation,
+i'll try to make equation with multiplication first
+lets try 24*10 = 240
+wait that close to 242
+
+but I still need to add 2
+so I'll try 24*10 + 2 = 242
+
+but 2 is not avalible in numbers
+so I'll try 24*10 + 6 = 246
+
+maybe, i should multiply 6 with 4
+24*10 + 6 * 4 = 242
+
+wait, I made a mistake
+6 * 4 = 24
+and 24 * 10 = 240
+so 24*10 + 6 * 4 = 264 not 242
+
+wait, 6 - 4 = 2 
+aha I got it, 
+
+24*10 + (6-4) = 242
+
+I am confident that this is correct answer
+24*10 = 240
+6 - 4 = 2
+240 + 2 = 242
+
+Therefore final answer is
+24*10 + (6-4) = 242
+
+but user only want equation 
+so I will give final answer only in answer tag
+24*10 + (6-4)
+
 </think>
 <answer>
-give the final answer here
+24 * 10 + (6 - 4)
 </answer>
+
+Now you try to solve this
 """
     
     def process_example(example):
