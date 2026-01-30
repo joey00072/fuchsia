@@ -2,7 +2,7 @@
 generation: &generation
   max_len: &max_len 1024
   group_size: &group_size 8
-  temperature: &temperature 0.8
+  temperature: &temperature 0.9
   top_k: &top_k -1
   top_p: &top_p 1.0
   min_p: &min_p 0.0
@@ -27,9 +27,9 @@ grpo:
   group_size: *group_size
   batch_size: *generation_batch_size
   grad_accumulation_steps: *generation_batch_size
-  lr: 0.00005
+  lr: 0.00001
   weight_decay: 0.1
-  beta: 0.0
+  beta: 0.01
   epsilon: 0.2
   epsilon_high: 0.28
   log_wandb: true

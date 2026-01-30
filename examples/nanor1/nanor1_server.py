@@ -1,7 +1,7 @@
 from fuchsia.vllm_server import DataSamplerServer, ServerConfig, Rollout
 from fuchsia.reward_utils import clean_completion
 from datasets import load_dataset
-from rich import print
+# from rich import print
 from typing import Optional, List
 from datasets import Dataset
 from transformers import AutoTokenizer
@@ -19,8 +19,6 @@ SYSTEM_PROMPT = """Respond in following format:
 ...
 </answer>
 """
-
-CURRICULUM_LEARNING = 0
 
 def equation_validation(equation: str) -> bool:
     """
@@ -81,7 +79,7 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
         if END_ANSWER_TOKEN in s and s.count(END_ANSWER_TOKEN) == 1:
             format_reward += 0.05
         
-        if format_reward == 0.4:
+        if format_reward >= 0.2:
             think, answer = s.split(END_THINKING_TOKEN)
             if "24 * 10 + (6 - 4)" in think:
                 format_reward -= 0.5
@@ -97,7 +95,7 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
             ):
                 format_reward += 0.1
             
-        if format_reward == 0.5:
+        if START_ANSWER_TOKEN in s and END_ANSWER_TOKEN in s and s.count(START_ANSWER_TOKEN) == 1 and s.count(END_ANSWER_TOKEN) == 1 and START_THINKING_TOKEN in s:
             answer = s.split(START_ANSWER_TOKEN)[1].split(END_ANSWER_TOKEN)[0]
             if "=" in answer:
                 answer = answer.split("=")[0]
@@ -118,7 +116,7 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
                     if int(output) == int(sample['answer']):
                         content_reward += 0.7
                     else:
-                        content_reward += 0.1
+                        content_reward += 0.2
                 except Exception as e:
                     content_reward -= 0.1
             
@@ -223,7 +221,7 @@ Now you try to solve this
         example["text"] = tokenizer.apply_chat_template(
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": x + f"find equation with {human_join(example['numbers'])} and basic arithmetic operations (+,-,*,/,'(',')') to get {example['answer']}, give such equation only in <answer> tag" },
+                {"role": "user", "content":  f"find equation with {human_join(example['numbers'])} and basic arithmetic operations (+,-,*,/,'(',')') to get {example['answer']}, give such equation only in <answer> tag" },
             ],
             tokenize=False,
         )+" system\n"
@@ -235,7 +233,7 @@ def main():
     server_config = ServerConfig.from_yaml(Path(__file__).parent / "nanor1_config.yaml")
     tokenizer = AutoTokenizer.from_pretrained(server_config.model)
     # dataset = load_dataset(server_config.dataset_name, server_config.dataset_split)["train"]
-    dataset = TinyEquationDataset(n=4, min_n=3).build_dataset(size=1024*8)
+    dataset = TinyEquationDataset(n=4, min_n=4).build_dataset(size=1024*8)
     dataset = dataset.shuffle()
     dataset = prepare_dataset(dataset, tokenizer)
     

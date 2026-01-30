@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from rich import print
 import json
 from datasets import Dataset
+from tqdm import tqdm
 @dataclass
 class Equation:
     eqn: str
@@ -21,13 +22,17 @@ class Equation:
 class TinyEquationDataset:
     def __init__(self,n=4, min_n=None):
         self.n = n 
-        self.ops = ["+","+","+","-","*","/"]
+        self.ops = ["+","-"]#"+","+","-","*","/"]
         self.min_n = min_n if min_n is not None else n
 
     def build_dataset(self, size=1024):
-        self._dict:[int,Equation] = {}
+        self._dict: dict[str, Equation] = {}
 
-        while len(self._dict) <size:
+        pbar = tqdm(total=size, desc="Building dataset")
+        attempts = 0
+        max_attempts = max(size * 50, 10_000)
+        while len(self._dict) < size and attempts < max_attempts:
+            attempts += 1
             n = random.randint(self.min_n, self.n)
             numbers = [random.randint(10,100) for _ in range(n)]
             ops = [random.choice(self.ops) for _ in range(n-1)]
@@ -36,7 +41,16 @@ class TinyEquationDataset:
             total = eval(eqn_str)     
             if int(total) != float(total):
                 continue
-            self._dict[int(total)] = Equation(eqn_str, numbers, ops, int(total))
+            prev_len = len(self._dict)
+            self._dict[eqn_str] = Equation(eqn_str, numbers, ops, int(total))
+            if len(self._dict) > prev_len:
+                pbar.update(1)
+        pbar.close()
+        if len(self._dict) < size:
+            raise RuntimeError(
+                f"Only generated {len(self._dict)} unique equations after {attempts} attempts. "
+                f"Try reducing size or widening the sampling range."
+            )
             
 
         # with open("./nanor1_dataset.jsonl", "w") as f:
