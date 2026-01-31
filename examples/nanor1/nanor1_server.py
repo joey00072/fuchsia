@@ -18,6 +18,9 @@ SYSTEM_PROMPT = """Respond in following format:
 <answer>
 ...
 </answer>
+
+
+Find anwer in thinking tag, and give only final response itn answer tag
 """
 
 def equation_validation(equation: str) -> bool:
@@ -108,13 +111,13 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
                 content_reward +=0.1
                 is_eqn = True
             finally:
-                content_reward -= 0.1
+                pass
                 
             if is_eqn:
                 try:
                     output = eval(answer)
                     if int(output) == int(sample['answer']):
-                        content_reward += 0.7
+                        content_reward += 0.6
                     else:
                         content_reward += 0.2
                 except Exception as e:
@@ -221,7 +224,7 @@ Now you try to solve this
         example["text"] = tokenizer.apply_chat_template(
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content":  f"find equation with {human_join(example['numbers'])} and basic arithmetic operations (+,-,*,/,'(',')') to get {example['answer']}, give such equation only in <answer> tag" },
+                {"role": "user", "content":  f"find equation with {human_join(example['numbers'])} and using operations +,- to get {example['answer']}, give such equation only in <answer> tag" },
             ],
             tokenize=False,
         )+" system\n"
