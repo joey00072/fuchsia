@@ -14,7 +14,7 @@ class DatasetClient:
     def __init__(self, client: VLLMClient = None):
         self.client = client if client is not None else VLLMClient()
         logger.info("DatasetClient initialized")
-        self.client.sleep()
+        # self.client.sleep()
 
     def __len__(self):
         return len(self.dataset)

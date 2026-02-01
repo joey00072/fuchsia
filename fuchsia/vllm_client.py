@@ -256,6 +256,12 @@ class VLLMClient:
             if "lora" in name:
                 continue
             if any(target in name for target in target_modules):
+                if "bias" in name:
+                    new_name = name.replace("base_model.model.","")
+                    new_wights = param.data.clone() 
+                    self.update_named_param(new_name, new_wights)
+                    continue
+
                 if "lora" not in name:
                     prefix = name.replace(".base_layer.weight","")
                     A_name = f"{prefix}.lora_A.default.weight"
