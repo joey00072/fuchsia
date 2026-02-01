@@ -236,7 +236,7 @@ def main():
     server_config = ServerConfig.from_yaml(Path(__file__).parent / "nanor1_config.yaml")
     tokenizer = AutoTokenizer.from_pretrained(server_config.model)
     # dataset = load_dataset(server_config.dataset_name, server_config.dataset_split)["train"]
-    dataset = TinyEquationDataset(n=4, min_n=4).build_dataset(size=1024*8)
+    dataset = TinyEquationDataset(n=4, min_n=3).build_dataset(size=1024*8)
     dataset = dataset.shuffle()
     dataset = prepare_dataset(dataset, tokenizer)
     

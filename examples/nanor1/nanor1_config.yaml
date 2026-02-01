@@ -1,16 +1,16 @@
 # Generation configuration (shared parameters)
 generation: &generation
-  max_len: &max_len 1024
+  max_len: &max_len 4096
   group_size: &group_size 8
   temperature: &temperature 0.9
   top_k: &top_k -1
   top_p: &top_p 1.0
   min_p: &min_p 0.0
-  batch_size: &generation_batch_size 4
+  batch_size: &generation_batch_size 8
 
 # Model configuration
 model:
-  name: "Qwen/Qwen2.5-1.5B-Instruct"
+  name: "Qwen/Qwen2.5-3B-Instruct"
   revision: null
   dtype: "bfloat16"
   max_model_len: *max_len

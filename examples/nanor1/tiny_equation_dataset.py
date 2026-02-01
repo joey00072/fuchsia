@@ -22,7 +22,7 @@ class Equation:
 class TinyEquationDataset:
     def __init__(self,n=4, min_n=None):
         self.n = n 
-        self.ops = ["+","-"]#"+","+","-","*","/"]
+        self.ops = ["+","-","*","/"]
         self.min_n = min_n if min_n is not None else n
 
     def build_dataset(self, size=1024):
