@@ -170,6 +170,7 @@ class ServerConfig:
     vllm_top_p: float = 1.0
     vllm_top_k: int = -1
     vllm_min_p: float = 0.0
+    vllm_logprobs: int = 1
     vllm_max_tokens: int = 1024
     vllm_kv_quantization: bool = False
     generation_batch_size: int = 1
@@ -248,6 +249,7 @@ class ServerConfig:
             vllm_top_p=vllm_config.get("top_p", 1.0),
             vllm_top_k=vllm_config.get("top_k", -1),
             vllm_min_p=vllm_config.get("min_p", 0.0),
+            vllm_logprobs=vllm_config.get("logprobs", 1),
             vllm_max_tokens=vllm_config.get("max_tokens", 1024),
             vllm_kv_quantization=vllm_config.get("kv_quantization", False),
         )
@@ -346,6 +348,7 @@ class DataSamplerServer:
                 top_p=config.vllm_top_p,
                 top_k=config.vllm_top_k,
                 min_p=config.vllm_min_p,
+                logprobs=config.vllm_logprobs,
                 max_tokens=config.vllm_max_tokens,
                 stop=self.stop,
             )
@@ -1079,6 +1082,11 @@ class DataSamplerServer:
             for outputs in all_outputs
             for output in outputs.outputs
         ]
+        completion_logprobs = [
+            self.environment._extract_completion_logprobs(output)
+            for outputs in all_outputs
+            for output in outputs.outputs
+        ]
         stop_reason = [output.stop_reason for outputs in all_outputs for output in outputs.outputs]
         finish_reason = [output.finish_reason for outputs in all_outputs for output in outputs.outputs]
         completions = [self.tokenizer.decode(c) for c in completion_ids]
@@ -1089,6 +1097,7 @@ class DataSamplerServer:
                 "item": [item] * self.config.vllm_n,
                 "completions": [],
                 "completion_ids": [],
+                "completion_logprobs": [],
                 "stop_reason": [],
                 "finish_reason": [],
                 "epoch": self._epoch,
@@ -1099,6 +1108,7 @@ class DataSamplerServer:
                 base_idx = g_idx * self.config.vllm_n + idx
                 output["completions"].append(completions[base_idx])
                 output["completion_ids"].append(completion_ids[base_idx])
+                output["completion_logprobs"].append(completion_logprobs[base_idx])
                 output["stop_reason"].append(stop_reason[base_idx])
                 output["finish_reason"].append(finish_reason[base_idx])
 

@@ -96,6 +96,17 @@ def create_default_config(output_path: str = "config.yaml") -> None:
             "weight_decay": 0.1,
             "beta": 0.0,
             "epsilon": 0.2,
+            "importance_sampling": {
+                "enabled": True,
+                "ratio_type": "token",
+                "token_mask_high": 8.0,
+                "token_mask_low": 0.125,
+                "sequence_clip_high": 10.0,
+                "geo_mask_high": 10.0,
+                "geo_mask_low": 0.1,
+                "sequence_mask_low": 0.0,
+                "sequence_mask_high": 100.0
+            },
             "log_wandb": True,
             "wandb_project": "fuchsia-jee-deephermes",
             "num_policy_updates": 8,
@@ -168,6 +179,16 @@ grpo:
   weight_decay: 0.1
   beta: 0.0
   epsilon: 0.2
+  importance_sampling:
+    enabled: true
+    ratio_type: "token"
+    token_mask_high: 8.0
+    token_mask_low: 0.125
+    sequence_clip_high: 10.0
+    geo_mask_high: 10.0
+    geo_mask_low: 0.1
+    sequence_mask_low: 0.0
+    sequence_mask_high: 100.0
   log_wandb: true
   wandb_project: "fuchsia-jee-deephermes"
   num_policy_updates: 8

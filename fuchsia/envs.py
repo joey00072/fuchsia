@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from vllm import LLM, SamplingParams
-from typing import Callable
+from typing import Callable, Any
 import inspect
 import numpy as np
 import uuid
@@ -27,6 +27,7 @@ class Rollout:
     completed: bool = False
     state: dict = field(default_factory=dict)
     completion_ids: list[int] = field(default_factory=list)
+    completion_logprobs: list[float] = field(default_factory=list)
     
     
     item: dict = field(default_factory=dict)
@@ -64,6 +65,62 @@ class Environment:
     max_steps: int = 1
     n: int | None = None
     stop: list[str] = field(default_factory=list)
+
+    @staticmethod
+    def _coerce_logprob(value: Any) -> float:
+        if value is None:
+            return 0.0
+        if isinstance(value, (float, int)):
+            return float(value)
+        if isinstance(value, dict):
+            logprob = value.get("logprob")
+            return float(logprob) if logprob is not None else 0.0
+        logprob = getattr(value, "logprob", None)
+        return float(logprob) if logprob is not None else 0.0
+
+    @classmethod
+    def _extract_step_logprob(cls, token_id: int, step_logprobs: Any) -> float:
+        if step_logprobs is None:
+            return 0.0
+
+        if isinstance(step_logprobs, dict):
+            token_data = step_logprobs.get(token_id)
+            if token_data is None:
+                token_data = step_logprobs.get(str(token_id))
+            if token_data is None and step_logprobs:
+                token_data = next(iter(step_logprobs.values()))
+            return cls._coerce_logprob(token_data)
+
+        if isinstance(step_logprobs, (list, tuple)):
+            if len(step_logprobs) == 0:
+                return 0.0
+            for candidate in step_logprobs:
+                if isinstance(candidate, dict):
+                    candidate_token_id = candidate.get("token_id")
+                    if candidate_token_id == token_id or str(candidate_token_id) == str(token_id):
+                        return cls._coerce_logprob(candidate)
+                else:
+                    candidate_token_id = getattr(candidate, "token_id", None)
+                    if candidate_token_id == token_id:
+                        return cls._coerce_logprob(candidate)
+            return cls._coerce_logprob(step_logprobs[0])
+
+        return cls._coerce_logprob(step_logprobs)
+
+    @classmethod
+    def _extract_completion_logprobs(cls, output: Any) -> list[float]:
+        token_ids = list(getattr(output, "token_ids", []))
+        raw_logprobs = getattr(output, "logprobs", None)
+        if not token_ids:
+            return []
+        if raw_logprobs is None:
+            return [0.0] * len(token_ids)
+
+        completion_logprobs: list[float] = []
+        for idx, token_id in enumerate(token_ids):
+            step_logprobs = raw_logprobs[idx] if idx < len(raw_logprobs) else None
+            completion_logprobs.append(cls._extract_step_logprob(token_id, step_logprobs))
+        return completion_logprobs
     
     def generate(
         self,   
@@ -122,6 +179,7 @@ class Environment:
                     new_rollout.last_completion = output.text
                     new_rollout.completion += output.text
                     new_rollout.completion_ids.extend(list(output.token_ids))
+                    new_rollout.completion_logprobs.extend(self._extract_completion_logprobs(output))
                     new_rollout.stop_reason = output.stop_reason if output.stop_reason else ""
                     new_rollout.finish_reason = output.finish_reason if output.finish_reason else ""
                     new_rollouts.append(new_rollout)
@@ -175,6 +233,7 @@ class Environment:
                 "item": [first_rollout.item] * len(group),
                 "completions": [],
                 "completion_ids": [],
+                "completion_logprobs": [],
                 "stop_reason": [],
                 "finish_reason": [],
                 "epoch": first_rollout.epoch,
@@ -185,6 +244,7 @@ class Environment:
             for rollout in group:
                 output["completions"].append(rollout.completion)
                 output["completion_ids"].append(rollout.completion_ids)
+                output["completion_logprobs"].append(rollout.completion_logprobs)
                 output["stop_reason"].append(rollout.stop_reason)
                 output["finish_reason"].append(rollout.finish_reason)
 

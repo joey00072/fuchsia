@@ -18,6 +18,7 @@ SYSTEM_PROMPT = """Respond in following format:
 """
 
 CURRICULUM_LEARNING = 0
+HARD_REWARD_FILTER_THRESHOLD = 5.1
 
 def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
     """Improved reward function with better validation and scoring."""
@@ -28,6 +29,8 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs) -> float:
             tokenizer=kwargs.get("tokenizer"),
             token_ids=kwargs.get("completion_ids"),
         )
+    # Accept common alias tags the model emits.
+    s = s.replace("<think>", "<thinking>").replace("</think>", "</thinking>")
 
     START_THINKING_TOKEN = "<thinking>"
     END_THINKING_TOKEN = "</thinking>"
@@ -123,11 +126,12 @@ def reward_function_1(rollouts: List[Rollout], *args, **kwargs):
             tokenizer=kwargs.get("tokenizer"),
             completion_ids=rollout.completion_ids,
         )
-        if idx > 8*CURRICULUM_LEARNING and reward < 5.1:
+        curriculum_active = CURRICULUM_LEARNING > 0 and idx > 8 * CURRICULUM_LEARNING
+        if curriculum_active and reward < HARD_REWARD_FILTER_THRESHOLD:
             reward = 0
         lst.append(reward)
         
-    if idx > 8*CURRICULUM_LEARNING and not(any(x>5.1 for x in lst)):
+    if curriculum_active and not any(x > HARD_REWARD_FILTER_THRESHOLD for x in lst):
         lst = [0 for _ in lst]
         
     return lst

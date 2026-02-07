@@ -347,6 +347,57 @@ class GRPO:
         return self.selective_log_softmax(logits, labels,
                                     chunk_size=chunk_size,
                                     ignore_index=-100)
+
+    def _apply_importance_sampling_correction(
+        self,
+        policy_log_probs: Tensor,
+        old_policy_log_probs: Tensor,
+        loss_mask: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        log_importance_ratio = policy_log_probs - old_policy_log_probs.detach()
+        token_importance_ratio = torch.exp(log_importance_ratio)
+
+        if not self.config.importance_sampling_correction:
+            return token_importance_ratio, loss_mask
+
+        loss_mask = loss_mask.bool()
+
+        seq_denom = loss_mask.sum(dim=-1).clamp_min(1).to(log_importance_ratio.dtype)
+        masked_log_ratio_sum = (log_importance_ratio * loss_mask.to(log_importance_ratio.dtype)).sum(dim=-1)
+        geo_seq_ratio = torch.exp(masked_log_ratio_sum / seq_denom)
+
+        seq_log_importance_ratio = torch.clamp(masked_log_ratio_sum.detach(), max=10.0)
+        seq_importance_ratio = torch.clamp(
+            torch.exp(seq_log_importance_ratio),
+            max=self.config.importance_sequence_clip_high,
+        )
+
+        seq_min_ratio = torch.where(loss_mask, token_importance_ratio, torch.inf).amin(dim=-1)
+        seq_max_ratio = torch.where(loss_mask, token_importance_ratio, -torch.inf).amax(dim=-1)
+
+        token_mask_low = token_importance_ratio < self.config.importance_token_mask_low
+        token_mask_high = token_importance_ratio > self.config.importance_token_mask_high
+        geo_mask_low = geo_seq_ratio < self.config.importance_geo_mask_low
+        geo_mask_high = geo_seq_ratio > self.config.importance_geo_mask_high
+        seq_mask_low = seq_min_ratio < self.config.importance_sequence_mask_low
+        seq_mask_high = seq_max_ratio > self.config.importance_sequence_mask_high
+
+        is_masked = token_mask_low | token_mask_high
+        is_masked = (
+            is_masked
+            | geo_mask_low.unsqueeze(-1)
+            | geo_mask_high.unsqueeze(-1)
+            | seq_mask_low.unsqueeze(-1)
+            | seq_mask_high.unsqueeze(-1)
+        )
+        keep_mask = loss_mask & ~is_masked
+
+        if self.config.importance_ratio_type == "sequence":
+            importance_ratio = seq_importance_ratio.unsqueeze(-1).expand_as(token_importance_ratio)
+        else:
+            importance_ratio = token_importance_ratio
+
+        return importance_ratio, keep_mask
     
     def compute_loss(
         self, 
@@ -383,7 +434,9 @@ class GRPO:
         advantage = advantage.reshape(-1, 1)
         # advantage = torch.where(advantage < 0, advantage * 0.001, advantage)
         
-        policy_ratio = torch.exp(policy_log_probs - old_policy_log_probs.detach())
+        policy_ratio, effective_loss_mask = self._apply_importance_sampling_correction(
+            policy_log_probs, old_policy_log_probs, loss_mask
+        )
         
 
         unclipped_loss = policy_ratio * advantage
@@ -398,7 +451,7 @@ class GRPO:
         
         if self.config.loss_type == "cispo":
             loss = -clipped_loss.detach() * policy_log_probs
-            loss = (loss * loss_mask).sum(dim=-1) / (loss_mask.sum(dim=-1) + 1e-6)
+            loss = (loss * effective_loss_mask).sum(dim=-1) / (effective_loss_mask.sum(dim=-1) + 1e-6)
             return loss.mean(), 0.0  # Return 0.0 for KLD when using CISPO
         elif self.config.loss_type == "reinforce":
             loss = - unclipped_loss
@@ -407,8 +460,8 @@ class GRPO:
             loss = loss * ignore_sample
             kld = kld * ignore_sample
         
-        loss = (loss * loss_mask).sum(dim=-1) / (torch.ones_like(loss_mask).sum(dim=-1) + 1e-6) # dr grpo loss
-        kld =  (kld  * loss_mask).sum(dim=-1) / (loss_mask.sum(dim=-1) + 1e-6)
+        loss = (loss * effective_loss_mask).sum(dim=-1) / (effective_loss_mask.sum(dim=-1) + 1e-6)
+        kld =  (kld  * effective_loss_mask).sum(dim=-1) / (effective_loss_mask.sum(dim=-1) + 1e-6)
 
         loss += kld * self.beta
 
@@ -417,11 +470,151 @@ class GRPO:
 
         return loss.mean(), avg_kld
 
-    def sample_batch(self) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def _get_pad_token_id(self) -> int:
+        if self.tokenizer.pad_token_id is not None:
+            return int(self.tokenizer.pad_token_id)
+        if self.tokenizer.eos_token_id is not None:
+            return int(self.tokenizer.eos_token_id)
+        return 0
+
+    def _build_batch_from_text(
+        self,
+        prompts: list[str],
+        completions: list[str],
+    ) -> Tuple[Tensor, Tensor, list[str], list[str]]:
+        pad_token_id = self._get_pad_token_id()
+        encoded_prompts = self.tokenizer(prompts, padding=True, return_tensors="pt")
+        prompt_input_ids = encoded_prompts["input_ids"]
+        prompt_attention_mask = encoded_prompts["attention_mask"]
+        prompt_lengths = prompt_attention_mask.sum(dim=1).tolist()
+        decoded_prompts = self.tokenizer.batch_decode(prompt_input_ids, skip_special_tokens=False)
+
+        full_text_outputs = [prompt + completion for prompt, completion in zip(decoded_prompts, completions)]
+        output_ids = self.tokenizer(
+            full_text_outputs, padding=True, padding_side="right", return_tensors="pt"
+        )["input_ids"]
+
+        loss_mask = torch.zeros(output_ids.shape, dtype=torch.bool)
+        for row_idx, prompt_len in enumerate(prompt_lengths):
+            seq_len = int((output_ids[row_idx] != pad_token_id).sum().item())
+            start = min(int(prompt_len), output_ids.shape[1])
+            if seq_len > start:
+                loss_mask[row_idx, start:seq_len] = True
+
+        decoded_outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=False)
+        return output_ids, loss_mask[:, 1:], decoded_prompts, decoded_outputs
+
+    def _build_batch_from_server_tokens(
+        self,
+        prompts: list[str],
+        completion_ids: list[list[int]],
+        completion_logprobs: list[list[float]],
+    ) -> Tuple[Tensor, Tensor, Tensor, list[str], list[str]]:
+        pad_token_id = self._get_pad_token_id()
+        encoded_prompts = self.tokenizer(prompts, padding=True, return_tensors="pt")
+        prompt_input_ids = encoded_prompts["input_ids"]
+        prompt_attention_mask = encoded_prompts["attention_mask"]
+        decoded_prompts = self.tokenizer.batch_decode(prompt_input_ids, skip_special_tokens=False)
+
+        prompt_token_lists = [
+            prompt_input_ids[idx][prompt_attention_mask[idx].bool()].tolist()
+            for idx in range(prompt_input_ids.shape[0])
+        ]
+        sequences = [
+            prompt_tokens + completion_token_ids
+            for prompt_tokens, completion_token_ids in zip(prompt_token_lists, completion_ids)
+        ]
+        max_seq_len = max(len(seq) for seq in sequences)
+        batch_size = len(sequences)
+
+        output_ids = torch.full((batch_size, max_seq_len), pad_token_id, dtype=torch.long)
+        loss_mask = torch.zeros((batch_size, max_seq_len), dtype=torch.bool)
+        old_policy_log_probs = torch.zeros((batch_size, max_seq_len - 1), dtype=torch.float32)
+
+        for row_idx, (prompt_tokens, completion_token_ids, completion_token_logprobs, seq) in enumerate(
+            zip(prompt_token_lists, completion_ids, completion_logprobs, sequences)
+        ):
+            seq_len = len(seq)
+            prompt_len = len(prompt_tokens)
+            completion_len = len(completion_token_ids)
+
+            if seq_len > 0:
+                output_ids[row_idx, :seq_len] = torch.tensor(seq, dtype=torch.long)
+            if completion_len > 0:
+                loss_mask[row_idx, prompt_len : prompt_len + completion_len] = True
+                start_idx = max(prompt_len - 1, 0)
+                old_policy_log_probs[row_idx, start_idx : start_idx + completion_len] = torch.tensor(
+                    completion_token_logprobs, dtype=torch.float32
+                )
+
+        decoded_outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=False)
+        return output_ids, loss_mask[:, 1:], old_policy_log_probs, decoded_prompts, decoded_outputs
+
+    def _build_batch_from_server_completion_ids(
+        self,
+        prompts: list[str],
+        completion_ids: list[list[int]],
+    ) -> Tuple[Tensor, Tensor, list[str], list[str]]:
+        pad_token_id = self._get_pad_token_id()
+        encoded_prompts = self.tokenizer(prompts, padding=True, return_tensors="pt")
+        prompt_input_ids = encoded_prompts["input_ids"]
+        prompt_attention_mask = encoded_prompts["attention_mask"]
+        decoded_prompts = self.tokenizer.batch_decode(prompt_input_ids, skip_special_tokens=False)
+
+        prompt_token_lists = [
+            prompt_input_ids[idx][prompt_attention_mask[idx].bool()].tolist()
+            for idx in range(prompt_input_ids.shape[0])
+        ]
+        sequences = [
+            prompt_tokens + completion_token_ids
+            for prompt_tokens, completion_token_ids in zip(prompt_token_lists, completion_ids)
+        ]
+        max_seq_len = max(len(seq) for seq in sequences)
+        batch_size = len(sequences)
+
+        output_ids = torch.full((batch_size, max_seq_len), pad_token_id, dtype=torch.long)
+        loss_mask = torch.zeros((batch_size, max_seq_len), dtype=torch.bool)
+
+        for row_idx, (prompt_tokens, completion_token_ids, seq) in enumerate(
+            zip(prompt_token_lists, completion_ids, sequences)
+        ):
+            seq_len = len(seq)
+            prompt_len = len(prompt_tokens)
+            completion_len = len(completion_token_ids)
+            if seq_len > 0:
+                output_ids[row_idx, :seq_len] = torch.tensor(seq, dtype=torch.long)
+            if completion_len > 0:
+                loss_mask[row_idx, prompt_len : prompt_len + completion_len] = True
+
+        decoded_outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=False)
+        return output_ids, loss_mask[:, 1:], decoded_prompts, decoded_outputs
+
+    def _can_use_server_logprobs(
+        self,
+        completions: list[str],
+        completion_ids: list[list[int]],
+        completion_logprobs: list[list[float] | None],
+    ) -> bool:
+        for completion_text, completion_token_ids, completion_token_logprobs in zip(
+            completions, completion_ids, completion_logprobs
+        ):
+            if not isinstance(completion_token_ids, list):
+                return False
+            if not isinstance(completion_token_logprobs, list):
+                return False
+            if len(completion_token_ids) != len(completion_token_logprobs):
+                return False
+            text_token_ids = self.tokenizer(completion_text, add_special_tokens=False)["input_ids"]
+            if text_token_ids != completion_token_ids:
+                return False
+        return True
+
+    def sample_batch(self) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, dict]:
         while True:
             inputs_texts = []
-            outputs = []
             completions = []
+            completion_ids = []
+            completion_logprobs = []
             rewards = []
             mean_rewards = []
             std_rewards = []
@@ -438,21 +631,29 @@ class GRPO:
                     prompt = item["inputs"]
                     inputs_texts.append(prompt)
                     completions.append(item["completions"][idx])
+                    completion_ids.append(item["completion_ids"][idx])
+                    item_completion_logprobs = item.get("completion_logprobs")
+                    sample_completion_logprobs = None
+                    if isinstance(item_completion_logprobs, list) and idx < len(item_completion_logprobs):
+                        sample_completion_logprobs = item_completion_logprobs[idx]
+                    completion_logprobs.append(sample_completion_logprobs)
                     ignore_sample.append(item["finish_reason"][idx] != "length")
             
-            for r in rewards:
-                if len(r) != group_size:
-                    continue
+            if any(len(r) != group_size for r in rewards):
+                continue
             break
-        
-        encoded = self.tokenizer(inputs_texts, padding=True, return_tensors="pt")
-        input_ids = encoded["input_ids"]
-        attention_mask = encoded["attention_mask"]
 
-        prompt_length = input_ids.shape[1]
-        decoded = self.tokenizer.batch_decode(input_ids, skip_special_tokens=False)
+        use_server_logprobs = self._can_use_server_logprobs(completions, completion_ids, completion_logprobs)
+        server_old_policy_log_probs = None
+        if use_server_logprobs:
+            outputs, shifted_loss_mask, server_old_policy_log_probs, decoded, decoded_outputs = (
+                self._build_batch_from_server_tokens(inputs_texts, completion_ids, completion_logprobs)
+            )
+        else:
+            outputs, shifted_loss_mask, decoded, decoded_outputs = self._build_batch_from_server_completion_ids(
+                inputs_texts, completion_ids
+            )
 
-        outputs = []
         self.metrics["samples"].append({"prompt": decoded, "completions": completions})
         
         avg_token_lengths = 0
@@ -461,19 +662,6 @@ class GRPO:
         avg_token_lengths /= len(completions)
         
         self.metrics["avg_token_lengths"].append(avg_token_lengths)
-
-        for prompt, completion in zip(decoded, completions):
-            outputs.append(prompt + completion)
-
-        outputs = self.tokenizer(
-            outputs, padding=True, padding_side="right", return_tensors="pt"
-        )["input_ids"]
-
-        input_ids = torch.repeat_interleave(input_ids, group_size, dim=0)
-
-        decoded_outputs = self.tokenizer.batch_decode(
-            outputs, skip_special_tokens=False
-        )
         
         if self.config.debug:   
             print("\n\n\n")
@@ -481,21 +669,17 @@ class GRPO:
             print(decoded_outputs[0].replace("<|endoftext|>", "").replace("<|finetune_right_pad_id|>", "").replace("<|end_of_text|>", ""))
             print("-" * 10)
             print("\n\n\n")
-            
-        loss_mask = torch.zeros(outputs.shape, dtype=torch.bool)
-        gen_tokens = outputs[:, prompt_length:]
-        valid_gen_mask = gen_tokens != self.tokenizer.pad_token_id
-        loss_mask[:, prompt_length:] = valid_gen_mask
 
         return (
             outputs,
             torch.tensor(rewards, dtype=self.dtype).float(),
             torch.tensor(mean_rewards, dtype=self.dtype).float(),
             torch.tensor(std_rewards, dtype=self.dtype).float(),
-            loss_mask[:, 1:],
+            shifted_loss_mask,
             torch.tensor(ignore_sample, dtype=torch.bool).to(torch.int8),
             {
-                "group_size": group_size
+                "group_size": group_size,
+                "old_policy_log_probs": server_old_policy_log_probs,
             }
         )
 
@@ -584,23 +768,28 @@ class GRPO:
                 self.batch_size, group_size
             ).cpu()
             x_rewards = x_rewards.cpu()
-
-            pi_old = []
-            with torch.no_grad():
-                for b_inputs in batch_inputs:
-                    # Process with microbatches to reduce memory usage
-                    b_old_policy_log_probs = []
-                    for start in range(0, b_inputs.shape[0], self.micro_batch):
-                        end = start + self.micro_batch
-                        micro_inputs = b_inputs[start:end].to(self.device)
-                        micro_log_probs = self.get_per_token_logps(
-                            self.model, micro_inputs
-                        ).cpu()
-                        b_old_policy_log_probs.append(micro_log_probs)
-                    # Concatenate microbatches back together
-                    x_old_policy_log_probs = torch.cat(b_old_policy_log_probs, dim=0)
-                    pi_old.append(x_old_policy_log_probs)
-                torch.cuda.empty_cache()
+            old_policy_log_probs = server_info.get("old_policy_log_probs")
+            if old_policy_log_probs is not None:
+                pi_old = old_policy_log_probs.reshape(
+                    self.batch_size, group_size, *old_policy_log_probs.shape[1:]
+                ).cpu()
+            else:
+                pi_old = []
+                with torch.no_grad():
+                    for b_inputs in batch_inputs:
+                        # Process with microbatches to reduce memory usage
+                        b_old_policy_log_probs = []
+                        for start in range(0, b_inputs.shape[0], self.micro_batch):
+                            end = start + self.micro_batch
+                            micro_inputs = b_inputs[start:end].to(self.device)
+                            micro_log_probs = self.get_per_token_logps(
+                                self.model, micro_inputs
+                            ).cpu()
+                            b_old_policy_log_probs.append(micro_log_probs)
+                        # Concatenate microbatches back together
+                        x_old_policy_log_probs = torch.cat(b_old_policy_log_probs, dim=0)
+                        pi_old.append(x_old_policy_log_probs)
+                    torch.cuda.empty_cache()
 
             self.optimizer.zero_grad()
             
@@ -694,4 +883,3 @@ class GRPO:
             if idx % self.config.save_every == 0:
                 self.tokenizer.save_pretrained(f"{self.lora_path}/{idx}")
                 self.model.save_pretrained(f"{self.lora_path}/{idx}", adapter_name="grpo")
-

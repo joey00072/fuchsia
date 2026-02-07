@@ -69,6 +69,17 @@ class GRPOConfig:
     non_blocking: bool = False
     
     loss_type: str = "grpo"
+
+    # Importance sampling correction (off-policy stabilization)
+    importance_sampling_correction: bool = True
+    importance_ratio_type: str = "token"  # Options: "token", "sequence"
+    importance_token_mask_high: float = 8.0
+    importance_token_mask_low: float = 0.125
+    importance_sequence_clip_high: float = 10.0
+    importance_geo_mask_high: float = 10.0
+    importance_geo_mask_low: float = 0.1
+    importance_sequence_mask_low: float = 0.0
+    importance_sequence_mask_high: float = 100.0
     
     # Device
     device: Optional[str] = None  # If None, auto-detect
@@ -90,6 +101,24 @@ class GRPOConfig:
 
         if self.dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
             self.dtype = torch.float16
+
+        if self.importance_ratio_type not in {"token", "sequence"}:
+            raise ValueError(
+                f"Unsupported importance_ratio_type: {self.importance_ratio_type}. "
+                "Supported values are: ['token', 'sequence']"
+            )
+        if self.importance_token_mask_low >= self.importance_token_mask_high:
+            raise ValueError(
+                "importance_token_mask_low must be smaller than importance_token_mask_high"
+            )
+        if self.importance_geo_mask_low >= self.importance_geo_mask_high:
+            raise ValueError(
+                "importance_geo_mask_low must be smaller than importance_geo_mask_high"
+            )
+        if self.importance_sequence_mask_low >= self.importance_sequence_mask_high:
+            raise ValueError(
+                "importance_sequence_mask_low must be smaller than importance_sequence_mask_high"
+            )
 
         # Set up logging
         logging.basicConfig(level=getattr(logging, self.log_level.upper(), logging.INFO))
@@ -124,6 +153,7 @@ class GRPOConfig:
         
         # Extract gradient checkpointing configuration
         gradient_checkpointing_config = grpo_config_dict.get("gradient_checkpointing", {})
+        importance_sampling_config = grpo_config_dict.get("importance_sampling", {})
         
         grpo_config = GRPOConfig(
             # GRPO specific parameters
@@ -136,6 +166,47 @@ class GRPOConfig:
             beta=float(grpo_config_dict.get("beta", 0.0)),
             epsilon=float(grpo_config_dict.get("epsilon", 0.2)),
             epsilon_high=float(grpo_config_dict.get("epsilon_high", 0.28)),
+            importance_sampling_correction=importance_sampling_config.get(
+                "enabled", grpo_config_dict.get("importance_sampling_correction", True)
+            ),
+            importance_ratio_type=importance_sampling_config.get(
+                "ratio_type", grpo_config_dict.get("importance_ratio_type", "token")
+            ),
+            importance_token_mask_high=float(
+                importance_sampling_config.get(
+                    "token_mask_high", grpo_config_dict.get("importance_token_mask_high", 8.0)
+                )
+            ),
+            importance_token_mask_low=float(
+                importance_sampling_config.get(
+                    "token_mask_low", grpo_config_dict.get("importance_token_mask_low", 0.125)
+                )
+            ),
+            importance_sequence_clip_high=float(
+                importance_sampling_config.get(
+                    "sequence_clip_high", grpo_config_dict.get("importance_sequence_clip_high", 10.0)
+                )
+            ),
+            importance_geo_mask_high=float(
+                importance_sampling_config.get(
+                    "geo_mask_high", grpo_config_dict.get("importance_geo_mask_high", 10.0)
+                )
+            ),
+            importance_geo_mask_low=float(
+                importance_sampling_config.get(
+                    "geo_mask_low", grpo_config_dict.get("importance_geo_mask_low", 0.1)
+                )
+            ),
+            importance_sequence_mask_low=float(
+                importance_sampling_config.get(
+                    "sequence_mask_low", grpo_config_dict.get("importance_sequence_mask_low", 0.0)
+                )
+            ),
+            importance_sequence_mask_high=float(
+                importance_sampling_config.get(
+                    "sequence_mask_high", grpo_config_dict.get("importance_sequence_mask_high", 100.0)
+                )
+            ),
             log_wandb=grpo_config_dict.get("log_wandb", False),
             wandb_project=grpo_config_dict.get("wandb_project", "fuchsia"),
             num_policy_updates=grpo_config_dict.get("num_policy_updates", 8),
