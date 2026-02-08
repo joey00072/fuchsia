@@ -192,6 +192,7 @@ class DataSamplerServer:
         self.config = config
         logger.info(config)
         self.stop = stop
+        self._prefill_buffer_on_startup = pre_fill_buffer and dataset is not None
 
         if not os.environ.get('VLLM_ATTENTION_BACKEND'):
             # os.environ['VLLM_ATTENTION_BACKEND'] = 'FLEX_ATTENTION'
@@ -263,9 +264,6 @@ class DataSamplerServer:
             self._is_sleeping = False  # Track sleep state
             self._sleep_requested = False  # Track if sleep has been requested
             self._generation_lock = threading.Lock()  # Lock for generation operations
-            
-            if pre_fill_buffer:
-                self.buffer_fill()
 
         self.app = self._create_app()
 
@@ -285,6 +283,16 @@ class DataSamplerServer:
 
     def _create_app(self) -> FastAPI:
         app = FastAPI()
+
+        @app.on_event("startup")
+        async def startup():
+            if self._prefill_buffer_on_startup:
+                threading.Thread(
+                    target=self.buffer_fill,
+                    daemon=True,
+                    name="fuchsia-buffer-prefill",
+                ).start()
+                logger.info("Started background initial buffer fill")
 
         @app.get("/", response_class=HTMLResponse)
         async def root():
