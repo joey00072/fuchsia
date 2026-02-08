@@ -20,12 +20,11 @@
 import argparse
 import asyncio
 import ctypes
+import inspect
 import logging
 import os
 import threading
 import time
-import inspect
-from collections import defaultdict
 from typing import Optional, Sequence, Callable
 
 # Third party imports
@@ -33,9 +32,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import uvicorn
-from datasets import Dataset, load_dataset
+from datasets import Dataset
 from fastapi import BackgroundTasks, FastAPI
-from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from transformers import AutoTokenizer
 
@@ -56,7 +54,7 @@ if libcuda_available:
     from vllm.sampling_params import GuidedDecodingParams
 
 # Local imports
-from fuchsia.envs import Rollout, Environment, SingleTurnEnvironment, MultiTurnEnvironment
+from fuchsia.envs import Rollout, Environment, SingleTurnEnvironment
 from fuchsia.reward_utils import clean_completions
 from fuchsia.rollout_queue import create_rollout_queue
 from fuchsia.config import FuchsiaConfig
@@ -294,390 +292,14 @@ class DataSamplerServer:
                 ).start()
                 logger.info("Started background initial buffer fill")
 
-        @app.get("/", response_class=HTMLResponse)
+        @app.get("/")
         async def root():
-            """Serves the main HTML page with UI."""
-            html_content = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>vLLM Server UI</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; }
-        .section { background: white; padding: 20px; margin-bottom: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; font-weight: bold; }
-        input, textarea, select { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
-        button { background: #667eea; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; margin: 5px; }
-        button:hover { background: #5a6fd8; }
-        button.danger { background: #e74c3c; }
-        button.danger:hover { background: #c0392b; }
-        button.success { background: #27ae60; }
-        button.success:hover { background: #229954; }
-        .status { padding: 10px; border-radius: 5px; margin: 10px 0; }
-        .status.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .status.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .status.info { background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
-        .response { background: #f8f9fa; padding: 15px; border-radius: 5px; border-left: 4px solid #667eea; margin: 10px 0; white-space: pre-wrap; }
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-        .full-width { grid-column: 1 / -1; }
-        .status-indicators { display: flex; gap: 20px; margin-top: 10px; }
-        .status-indicator { 
-            background: rgba(255,255,255,0.2); 
-            padding: 8px 12px; 
-            border-radius: 5px; 
-            font-weight: bold;
-            font-size: 14px;
-        }
-        .status-indicator.awake { background: rgba(39, 174, 96, 0.3); }
-        .status-indicator.sleeping { background: rgba(231, 76, 60, 0.3); }
-        .status-indicator.requested { background: rgba(243, 156, 18, 0.3); }
-        @media (max-width: 768px) { 
-            .grid { grid-template-columns: 1fr; } 
-            .status-indicators { flex-direction: column; gap: 10px; }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🚀 vLLM Server Control Panel</h1>
-            <p>Model: <span id="model-name">Loading...</span> | Mode: <span id="server-mode">Loading...</span></p>
-            <div class="status-indicators">
-                <span id="sleep-status" class="status-indicator">💤 Sleep Status: Loading...</span>
-                <span id="buffer-status" class="status-indicator">📊 Buffer: Loading...</span>
-            </div>
-        </div>
-
-        <div class="grid">
-            <!-- Server Status -->
-            <div class="section">
-                <h2>📊 Server Status</h2>
-                <div id="server-status" class="status info">Loading server status...</div>
-                <button onclick="getHealth()">🔄 Refresh Status</button>
-                <button onclick="getServerInfo()">📊 Refresh Server Info</button>
-                <button onclick="getTensorParallelSize()">📏 Get Tensor Parallel Size</button>
-            </div>
-
-            <!-- Generation -->
-            <div class="section">
-                <h2>🤖 Text Generation</h2>
-                <div class="form-group">
-                    <label for="prompts">Prompts (one per line):</label>
-                    <textarea id="prompts" rows="4" placeholder="Enter your prompts here...">Hello, how are you?</textarea>
-                </div>
-                <div class="form-group">
-                    <label for="n">Number of completions (n):</label>
-                    <input type="number" id="n" value="1" min="1" max="10">
-                </div>
-                <div class="form-group">
-                    <label for="temperature">Temperature:</label>
-                    <input type="number" id="temperature" value="1.0" min="0.0" max="2.0" step="0.1">
-                </div>
-                <div class="form-group">
-                    <label for="max_tokens">Max Tokens:</label>
-                    <input type="number" id="max_tokens" value="16" min="1" max="2048">
-                </div>
-                <button onclick="generate()">🚀 Generate</button>
-                <div id="generation-response" class="response" style="display: none;"></div>
-            </div>
-
-            <!-- Sleep/Wake Control -->
-            <div class="section">
-                <h2>💤 Sleep Control</h2>
-                <button onclick="sleep()" class="danger">😴 Put to Sleep</button>
-                <button onclick="wakeUp()" class="success">🌅 Wake Up</button>
-                <div id="sleep-response" class="response" style="display: none;"></div>
-            </div>
-
-            <!-- Weight Management -->
-            <div class="section">
-                <h2>⚙️ Weight Management</h2>
-                <div class="form-group">
-                    <label for="comm-host">Host:</label>
-                    <input type="text" id="comm-host" value="localhost">
-                </div>
-                <div class="form-group">
-                    <label for="comm-port">Port:</label>
-                    <input type="number" id="comm-port" value="12345">
-                </div>
-                <div class="form-group">
-                    <label for="world-size">World Size:</label>
-                    <input type="number" id="world-size" value="2">
-                </div>
-                <button onclick="initCommunicator()">🔗 Init Communicator</button>
-                <button onclick="closeCommunicator()" class="danger">❌ Close Communicator</button>
-                <button onclick="resetPrefixCache()">🔄 Reset Prefix Cache</button>
-                <div id="weight-response" class="response" style="display: none;"></div>
-            </div>
-        </div>
-
-        <!-- Data Sampler Controls (if applicable) -->
-        <div id="data-sampler-section" class="section full-width" style="display: none;">
-            <h2>📊 Data Sampler Controls</h2>
-            <div class="grid">
-                <div>
-                    <button onclick="getSample()">📥 Get Sample</button>
-                    <button onclick="bufferFill()">🔄 Fill Buffer</button>
-                    <button onclick="getBufferStatus()">📊 Buffer Status</button>
-                </div>
-                <div>
-                    <button onclick="emptyBuffer()" class="danger">🗑️ Empty Buffer</button>
-                </div>
-            </div>
-            <div id="data-sampler-response" class="response" style="display: none;"></div>
-        </div>
-
-        <!-- Response Display -->
-        <div class="section full-width">
-            <h2>📤 Last Response</h2>
-            <div id="last-response" class="response">No requests made yet.</div>
-        </div>
-    </div>
-
-    <script>
-        // Initialize page
-        document.addEventListener('DOMContentLoaded', function() {
-            getHealth();
-            getServerInfo();
-            getBufferStatus();
-            
-            // Auto-refresh status every 2 seconds
-            setInterval(function() {
-                getServerInfo();
-            }, 2000);
-        });
-
-        // Utility functions
-        function showResponse(elementId, data, isError = false) {
-            const element = document.getElementById(elementId);
-            element.style.display = 'block';
-            element.className = 'response ' + (isError ? 'error' : 'success');
-            element.textContent = typeof data === 'object' ? JSON.stringify(data, null, 2) : data;
-            
-            // Also update last response
-            document.getElementById('last-response').textContent = typeof data === 'object' ? JSON.stringify(data, null, 2) : data;
-        }
-
-        function hideResponse(elementId) {
-            document.getElementById(elementId).style.display = 'none';
-        }
-
-        // Server Status
-        async function getHealth() {
-            try {
-                const response = await fetch('/health/');
-                const data = await response.json();
-                document.getElementById('server-status').textContent = 'Server is running - Status: ' + data.status;
-                document.getElementById('server-status').className = 'status success';
-            } catch (error) {
-                document.getElementById('server-status').textContent = 'Error connecting to server: ' + error.message;
-                document.getElementById('server-status').className = 'status error';
+            return {
+                "service": "fuchsia-vllm-server",
+                "status": "ok",
+                "health": "/health/",
+                "server_info": "/server_info/",
             }
-        }
-
-        async function getServerInfo() {
-            try {
-                const response = await fetch('/server_info/');
-                const data = await response.json();
-                document.getElementById('model-name').textContent = data.model;
-                document.getElementById('server-mode').textContent = data.mode;
-                
-                // Update sleep status
-                const sleepStatus = document.getElementById('sleep-status');
-                if (data.is_sleeping) {
-                    sleepStatus.textContent = '💤 Sleep Status: SLEEPING';
-                    sleepStatus.className = 'status-indicator sleeping';
-                } else if (data.sleep_requested) {
-                    sleepStatus.textContent = '💤 Sleep Status: REQUESTED';
-                    sleepStatus.className = 'status-indicator requested';
-                } else {
-                    sleepStatus.textContent = '💤 Sleep Status: AWAKE';
-                    sleepStatus.className = 'status-indicator awake';
-                }
-                
-                // Update buffer status
-                const bufferStatus = document.getElementById('buffer-status');
-                if (data.mode === 'Data Sampler') {
-                    const currentSize = data.current_buffer_size || 0;
-                    const maxSize = data.buffer_size || 0;
-                    const filling = data.is_filling ? ' (Filling...)' : '';
-                    bufferStatus.textContent = `📊 Buffer: ${currentSize}/${maxSize}${filling}`;
-                    bufferStatus.className = 'status-indicator';
-                } else {
-                    bufferStatus.textContent = '📊 Buffer: N/A (Standard Mode)';
-                    bufferStatus.className = 'status-indicator';
-                }
-            } catch (error) {
-                document.getElementById('model-name').textContent = 'Unknown';
-                document.getElementById('server-mode').textContent = 'Unknown';
-                document.getElementById('sleep-status').textContent = '💤 Sleep Status: Error';
-                document.getElementById('buffer-status').textContent = '📊 Buffer: Error';
-            }
-        }
-
-        async function getTensorParallelSize() {
-            try {
-                const response = await fetch('/get_tensor_parallel_size/');
-                const data = await response.json();
-                showResponse('generation-response', data);
-            } catch (error) {
-                showResponse('generation-response', 'Error: ' + error.message, true);
-            }
-        }
-
-        // Generation
-        async function generate() {
-            const prompts = document.getElementById('prompts').value.split('\\n').filter(p => p.trim());
-            const n = parseInt(document.getElementById('n').value);
-            const temperature = parseFloat(document.getElementById('temperature').value);
-            const max_tokens = parseInt(document.getElementById('max_tokens').value);
-
-            const requestData = {
-                prompts: prompts,
-                n: n,
-                temperature: temperature,
-                max_tokens: max_tokens,
-                repetition_penalty: 1.0,
-                top_p: 1.0,
-                top_k: -1,
-                min_p: 0.0
-            };
-
-            try {
-                const response = await fetch('/generate/', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(requestData)
-                });
-                const data = await response.json();
-                showResponse('generation-response', data);
-            } catch (error) {
-                showResponse('generation-response', 'Error: ' + error.message, true);
-            }
-        }
-
-        // Sleep Control
-        async function sleep() {
-            try {
-                const response = await fetch('/sleep/', { method: 'POST' });
-                const data = await response.json();
-                showResponse('sleep-response', data);
-            } catch (error) {
-                showResponse('sleep-response', 'Error: ' + error.message, true);
-            }
-        }
-
-        async function wakeUp() {
-            try {
-                const response = await fetch('/wake_up/', { method: 'POST' });
-                const data = await response.json();
-                showResponse('sleep-response', data);
-            } catch (error) {
-                showResponse('sleep-response', 'Error: ' + error.message, true);
-            }
-        }
-
-        // Weight Management
-        async function initCommunicator() {
-            const host = document.getElementById('comm-host').value;
-            const port = parseInt(document.getElementById('comm-port').value);
-            const worldSize = parseInt(document.getElementById('world-size').value);
-
-            const requestData = { host, port, world_size: worldSize };
-
-            try {
-                const response = await fetch('/init_communicator/', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(requestData)
-                });
-                const data = await response.json();
-                showResponse('weight-response', data);
-            } catch (error) {
-                showResponse('weight-response', 'Error: ' + error.message, true);
-            }
-        }
-
-        async function closeCommunicator() {
-            try {
-                const response = await fetch('/close_communicator/', { method: 'POST' });
-                const data = await response.json();
-                showResponse('weight-response', data);
-            } catch (error) {
-                showResponse('weight-response', 'Error: ' + error.message, true);
-            }
-        }
-
-        async function resetPrefixCache() {
-            try {
-                const response = await fetch('/reset_prefix_cache/', { method: 'POST' });
-                const data = await response.json();
-                showResponse('weight-response', data);
-            } catch (error) {
-                showResponse('weight-response', 'Error: ' + error.message, true);
-            }
-        }
-
-        // Data Sampler Functions
-        async function getSample() {
-            try {
-                const response = await fetch('/get_sample/', { method: 'POST' });
-                const data = await response.json();
-                showResponse('data-sampler-response', data);
-            } catch (error) {
-                showResponse('data-sampler-response', 'Error: ' + error.message, true);
-            }
-        }
-
-        async function bufferFill() {
-            try {
-                const response = await fetch('/buffer_fill/', { method: 'POST' });
-                const data = await response.json();
-                showResponse('data-sampler-response', data);
-            } catch (error) {
-                showResponse('data-sampler-response', 'Error: ' + error.message, true);
-            }
-        }
-
-        async function getBufferStatus() {
-            try {
-                const response = await fetch('/buffer_status/');
-                const data = await response.json();
-                
-                // Show data sampler section if buffer status is available
-                if (response.ok) {
-                    document.getElementById('data-sampler-section').style.display = 'block';
-                    document.getElementById('server-mode').textContent = 'Data Sampler';
-                    
-                    const statusText = `Buffer: ${data.current_size}/${data.max_size} | Filling: ${data.is_filling} | Sleeping: ${data.is_sleeping} | Epoch: ${data.epoch}`;
-                    showResponse('data-sampler-response', { ...data, status: statusText });
-                } else {
-                    document.getElementById('server-mode').textContent = 'Standard VLLM';
-                }
-            } catch (error) {
-                document.getElementById('server-mode').textContent = 'Standard VLLM';
-            }
-        }
-
-        async function emptyBuffer() {
-            try {
-                const response = await fetch('/empty_buffer/', { method: 'POST' });
-                const data = await response.json();
-                showResponse('data-sampler-response', data);
-            } catch (error) {
-                showResponse('data-sampler-response', 'Error: ' + error.message, true);
-            }
-        }
-    </script>
-</body>
-</html>
-            """
-            return HTMLResponse(content=html_content)
 
         @app.get("/health/")
         async def health():
@@ -1168,6 +790,10 @@ class DataSamplerServer:
         dist.destroy_process_group()
 
 
+# Backward-compatible alias used by CLI/server integrations.
+VLLMServer = DataSamplerServer
+
+
 def run_server():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, help="Model to load")
@@ -1194,38 +820,9 @@ def run_server():
     if not config.model:
         parser.error("Model must be specified either through --model argument or in config file")
 
-    server = VLLMServer(config)
-    server.serve()
-
-
-def test_datasampler():
-    max_model_len = 1024
-    config = ServerConfig(
-        model="unsloth/Llama-3.2-3B-Instruct",
-        revision="main",
-        host="0.0.0.0",
-        port=8000,
-        dataset_field="Question Text",
-        buffer_size=4,
-        max_model_len=max_model_len,
-        gpu_memory_utilization=0.7,
-        dtype="bfloat16",
-        vllm_max_tokens=max_model_len,
-        vllm_n=8,
-        vllm_repetition_penalty=1.0,
-        vllm_temperature=1.0,
-        vllm_top_p=1.0,
-        vllm_top_k=-1,
-        vllm_min_p=0.0,
-    )
-    ds = load_dataset("CK0607/2025-Jee-Mains-Question", split="train")
-
-    def reward_function(tokenizer, items, completions, completion_ids):
-        return [len(completion) for completion in completions]
-
-    server = DataSamplerServer(config, dataset=ds, reward_functions=[reward_function])
+    server = DataSamplerServer(config)
     server.serve()
 
 
 if __name__ == "__main__":
-    test_datasampler()
+    run_server()
