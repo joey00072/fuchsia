@@ -14,7 +14,7 @@ from fuchsia.trainer import Trainer
 from fuchsia.config import FuchsiaConfig
 from fuchsia.dist_dataset import DatasetClient
 from fuchsia.vllm_client import VLLMClient
-from fuchsia.cpu_offloding import apply_cpu_gradient_checkpoint_monkey_patch
+from fuchsia.cpu_offloading import apply_cpu_gradient_checkpoint_monkey_patch
 
 # os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 # os.environ["CUDA_VISIBLE_DEVICES"] = "1"
