@@ -3,6 +3,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 import yaml
+from fuchsia.rollout_queue import normalize_rollout_transfer_mode
 
 
 
@@ -70,6 +71,11 @@ class GRPOConfig:
     
     loss_type: str = "grpo"
 
+    # Sample transfer transport
+    sample_transfer_mode: str = "api"  # Options: "api", "filesystem" ("http" alias supported)
+    sample_transfer_dir: str = "/tmp/fuchsia_sample_queue"
+    sample_transfer_poll_interval: float = 0.25
+
     # Importance sampling correction (off-policy stabilization)
     importance_sampling_correction: bool = True
     importance_ratio_type: str = "token"  # Options: "token", "sequence"
@@ -119,6 +125,9 @@ class GRPOConfig:
             raise ValueError(
                 "importance_sequence_mask_low must be smaller than importance_sequence_mask_high"
             )
+        self.sample_transfer_mode = normalize_rollout_transfer_mode(self.sample_transfer_mode)
+        if self.sample_transfer_poll_interval <= 0:
+            raise ValueError("sample_transfer_poll_interval must be > 0")
 
         # Set up logging
         logging.basicConfig(level=getattr(logging, self.log_level.upper(), logging.INFO))
@@ -147,6 +156,7 @@ class GRPOConfig:
         # Extract server configuration (including nested vllm)
         server_config = config.get("server", {})
         vllm_config = server_config.get("vllm", {})
+        transfer_config = server_config.get("transfer", {})
         
         # Extract LoRA configuration
         lora_config = config.get("lora", {})
@@ -234,6 +244,21 @@ class GRPOConfig:
             
             # Dataset configuration
             dataset_field=dataset_config.get("field", "prompt"),
+
+            # Transfer configuration
+            sample_transfer_mode=transfer_config.get(
+                "mode", server_config.get("sample_transfer_mode", "api")
+            ),
+            sample_transfer_dir=transfer_config.get(
+                "queue_dir",
+                server_config.get("sample_transfer_dir", "/tmp/fuchsia_sample_queue"),
+            ),
+            sample_transfer_poll_interval=float(
+                transfer_config.get(
+                    "poll_interval",
+                    server_config.get("sample_transfer_poll_interval", 0.25),
+                )
+            ),
             
             # Training configuration
             max_iterations=training_config.get("max_iterations", 1000),

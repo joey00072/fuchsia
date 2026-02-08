@@ -23,7 +23,12 @@ def main():
     grpo_config = GRPOConfig.from_yaml(Path(__file__).parent / "config.yaml")
     vllm_client = VLLMClient(init_communicator=False)
     vllm_client.sleep()
-    dataset = DatasetClient(vllm_client)
+    dataset = DatasetClient(
+        vllm_client,
+        transfer_mode=grpo_config.sample_transfer_mode,
+        queue_dir=grpo_config.sample_transfer_dir,
+        poll_interval=grpo_config.sample_transfer_poll_interval,
+    )
     
     print("CUDA AVAILABLE:", torch.cuda.is_available())
     

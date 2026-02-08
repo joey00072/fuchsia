@@ -134,7 +134,7 @@ class VLLMClient:
             except requests.exceptions.RequestException as exc:
                 # Check if the total timeout duration has passed
                 elapsed_time = time.time() - start_time
-                if (elapsed_time - start_time) >= total_timeout:
+                if elapsed_time >= total_timeout:
                     raise ConnectionError(
                         f"The vLLM server can't be reached at {self.host}:{self.server_port} after {total_timeout} "
                         "seconds. Make sure the server is running by running `Fuchsia serve`."
@@ -196,7 +196,7 @@ class VLLMClient:
         self._make_request(
             "init_communicator",
             method="post",
-            json={"host": "0.0.0.0", "port": self.group_port, "world_size": world_size},
+            json={"host": self.host, "port": self.group_port, "world_size": world_size},
         )
 
         pg = StatelessProcessGroup.create(

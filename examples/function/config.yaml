@@ -50,6 +50,10 @@ server:
   enable_prefix_caching: false
   buffer_size: *generation_batch_size
   generation_batch_size: *generation_batch_size
+  transfer:
+    mode: "api"         # "api" or "filesystem" ("http" alias supported)
+    queue_dir: "/tmp/fuchsia_sample_queue"
+    clear_on_start: false
   quantization: fp8
   vllm:
     max_tokens: *max_len

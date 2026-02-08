@@ -121,6 +121,11 @@ def create_default_config(output_path: str = "config.yaml") -> None:
             "buffer_size": 4,
             "generation_batch_size": 4,
             "quantization": None,
+            "transfer": {
+                "mode": "api",
+                "queue_dir": "/tmp/fuchsia_sample_queue",
+                "clear_on_start": False
+            },
             "vllm": {
                 "max_tokens": 512,
                 "n": 8,
@@ -204,6 +209,10 @@ server:
   buffer_size: 4
   generation_batch_size: *generation_batch_size
   quantization: null
+  transfer:
+    mode: "api"
+    queue_dir: "/tmp/fuchsia_sample_queue"
+    clear_on_start: false
   vllm:
     max_tokens: *max_len
     n: *group_size

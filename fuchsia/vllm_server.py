@@ -60,6 +60,7 @@ if libcuda_available:
 # Local imports
 from fuchsia.envs import Rollout, Environment, SingleTurnEnvironment, MultiTurnEnvironment
 from fuchsia.reward_utils import clean_completions
+from fuchsia.rollout_queue import create_rollout_queue, normalize_rollout_transfer_mode
 from fuchsia.utils import get_ip_addresses
 
 # Configure logging
@@ -174,6 +175,10 @@ class ServerConfig:
     vllm_max_tokens: int = 1024
     vllm_kv_quantization: bool = False
     generation_batch_size: int = 1
+
+    sample_transfer_mode: str = "api"  # Options: "api", "filesystem" ("http" is accepted as alias)
+    sample_transfer_dir: str = "/tmp/fuchsia_sample_queue"
+    sample_transfer_clear_on_start: bool = False
     
     single_gpu: bool = False
     
@@ -191,6 +196,7 @@ class ServerConfig:
         for key, value in kwargs.items():
             if not hasattr(self, key):
                 setattr(self, key, value)
+        self.sample_transfer_mode = normalize_rollout_transfer_mode(self.sample_transfer_mode)
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "ServerConfig":
@@ -213,6 +219,7 @@ class ServerConfig:
         
         # Extract nested vllm configuration
         vllm_config = server_config.get("vllm", {})
+        transfer_config = server_config.get("transfer", {})
         
         # Create ServerConfig with all values loaded from YAML
         server_config_obj = cls(
@@ -252,6 +259,16 @@ class ServerConfig:
             vllm_logprobs=vllm_config.get("logprobs", 1),
             vllm_max_tokens=vllm_config.get("max_tokens", 1024),
             vllm_kv_quantization=vllm_config.get("kv_quantization", False),
+            sample_transfer_mode=transfer_config.get(
+                "mode", server_config.get("sample_transfer_mode", "api")
+            ),
+            sample_transfer_dir=transfer_config.get(
+                "queue_dir",
+                server_config.get("sample_transfer_dir", "/tmp/fuchsia_sample_queue"),
+            ),
+            sample_transfer_clear_on_start=transfer_config.get(
+                "clear_on_start", server_config.get("sample_transfer_clear_on_start", False)
+            ),
         )
 
         return server_config_obj
@@ -337,7 +354,19 @@ class DataSamplerServer:
             self.dataset_field = config.dataset_field
             self.reward_functions = reward_functions or []
             self.buffer_size = config.buffer_size
-            self.buffer = []
+            self.rollout_queue = create_rollout_queue(
+                mode=config.sample_transfer_mode,
+                queue_dir=config.sample_transfer_dir,
+                clear_on_start=config.sample_transfer_clear_on_start,
+            )
+            self.sample_transfer_mode = self.rollout_queue.mode
+            if self.rollout_queue.queue_dir is not None:
+                logger.info(
+                    "Data sampler transfer mode: filesystem (%s)",
+                    self.rollout_queue.queue_dir,
+                )
+            else:
+                logger.info("Data sampler transfer mode: api (in-memory queue)")
             self.dataset_iter = iter(self.dataset)
             self._epoch = 1
             self._generation_batch_size = config.generation_batch_size
@@ -363,6 +392,20 @@ class DataSamplerServer:
                 self.buffer_fill()
 
         self.app = self._create_app()
+
+    def _rollout_queue_size(self) -> int:
+        if not self.is_data_sampler:
+            return 0
+        return self.rollout_queue.qsize()
+
+    def _rollout_queue_push(self, items_with_rewards: list[dict]) -> None:
+        self.rollout_queue.put_many(items_with_rewards)
+
+    def _rollout_queue_pop(self):
+        return self.rollout_queue.get()
+
+    def _rollout_queue_clear(self) -> int:
+        return self.rollout_queue.clear()
 
     def _create_app(self) -> FastAPI:
         app = FastAPI()
@@ -778,9 +821,11 @@ class DataSamplerServer:
                 "max_model_len": self.config.max_model_len,
                 "buffer_size": getattr(self.config, 'buffer_size', None) if self.is_data_sampler else None,
                 "dataset_field": getattr(self.config, 'dataset_field', None) if self.is_data_sampler else None,
+                "sample_transfer_mode": getattr(self, "sample_transfer_mode", None) if self.is_data_sampler else None,
+                "sample_transfer_dir": str(self.rollout_queue.queue_dir) if (self.is_data_sampler and self.rollout_queue.queue_dir is not None) else None,
                 "is_sleeping": getattr(self, '_is_sleeping', False),
                 "sleep_requested": getattr(self, '_sleep_requested', False),
-                "current_buffer_size": len(self.buffer) if self.is_data_sampler else None,
+                "current_buffer_size": self._rollout_queue_size() if self.is_data_sampler else None,
                 "is_filling": getattr(self, '_is_filling', False) if self.is_data_sampler else None,
             }
 
@@ -938,12 +983,14 @@ class DataSamplerServer:
             @app.post("/get_sample/")
             async def get_sample(background_tasks: BackgroundTasks):
                 """Returns a sample from the buffer and triggers background buffer fill."""
-                if len(self.buffer) == 0:
+                if self._rollout_queue_size() == 0:
                     await asyncio.sleep(5)
                     return {"sample": None}
-                items = self.buffer.pop(0)
+                items = self._rollout_queue_pop()
+                if items is None:
+                    return {"sample": None}
                 # Only trigger buffer fill if not sleeping and sleep not requested
-                if (len(self.buffer) < self.buffer_size and 
+                if (self._rollout_queue_size() < self.buffer_size and 
                     not getattr(self, '_is_sleeping', False) and 
                     not getattr(self, '_sleep_requested', False)):
                     background_tasks.add_task(self.buffer_fill)
@@ -970,8 +1017,9 @@ class DataSamplerServer:
             async def buffer_status():
                 """Returns the current status of the buffer."""
                 return {
-                    "current_size": len(self.buffer),
+                    "current_size": self._rollout_queue_size(),
                     "max_size": self.buffer_size,
+                    "transfer_mode": self.sample_transfer_mode,
                     "is_filling": self._is_filling,
                     "is_sleeping": getattr(self, '_is_sleeping', False),
                     "sleep_requested": getattr(self, '_sleep_requested', False),
@@ -981,8 +1029,7 @@ class DataSamplerServer:
             @app.post("/empty_buffer/")
             async def empty_buffer():
                 """Empties the buffer and returns the number of items removed."""
-                items_removed = len(self.buffer)
-                self.buffer.clear()
+                items_removed = self._rollout_queue_clear()
                 return {
                     "message": "Buffer emptied successfully",
                     "items_removed": items_removed,
@@ -1009,13 +1056,13 @@ class DataSamplerServer:
 
             self._is_filling = True
             try:
-                while len(self.buffer) < self.buffer_size:
+                while self._rollout_queue_size() < self.buffer_size:
                     # Check if sleep was requested during buffer fill
                     # if hasattr(self, '_sleep_requested') and self._sleep_requested:
                     #     logger.info("Sleep requested during buffer fill - stopping buffer fill")
                     #     break
                     
-                    print(f"Buffer Size: {len(self.buffer)}")
+                    print(f"Buffer Size: {self._rollout_queue_size()}")
                         
                     items = []
                     for _ in range(self._generation_batch_size):
@@ -1051,8 +1098,8 @@ class DataSamplerServer:
                         print(f"{item['mean']} {item['std']}")
                         print("-"*10)
                     logger.debug("==========")
-                    self.buffer.extend(items_with_rewards)
-                    logger.debug(f"buffer: {len(self.buffer[0]['completions'])}")
+                    self._rollout_queue_push(items_with_rewards)
+                    logger.debug("rollout queue size: %s", self._rollout_queue_size())
             finally:
                 self._is_filling = False
 
@@ -1223,6 +1270,9 @@ class DataSamplerServer:
         if self.is_data_sampler:
             status_text += f"\nBuffer Size: {self.buffer_size}"
             status_text += f"\nDataset Field: {self.dataset_field}"
+            status_text += f"\nSample Transfer: {self.sample_transfer_mode}"
+            if self.rollout_queue.queue_dir is not None:
+                status_text += f"\nSample Queue Dir: {self.rollout_queue.queue_dir}"
 
         # Display information
         console.print("\n")

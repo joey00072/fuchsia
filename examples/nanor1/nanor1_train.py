@@ -21,10 +21,15 @@ from fuchsia.cpu_offloding import apply_cpu_gradient_checkpoint_monkey_patch
 
 def main():
     grpo_config = GRPOConfig.from_yaml(Path(__file__).parent / "nanor1_config.yaml")
-    vllm_client = VLLMClient(init_communicator=not grpo.single_gpu)
-    if grpo.single_gpu:
+    vllm_client = VLLMClient(init_communicator=not grpo_config.single_gpu)
+    if grpo_config.single_gpu:
         vllm_client.sleep()
-    dataset = DatasetClient(vllm_client)
+    dataset = DatasetClient(
+        vllm_client,
+        transfer_mode=grpo_config.sample_transfer_mode,
+        queue_dir=grpo_config.sample_transfer_dir,
+        poll_interval=grpo_config.sample_transfer_poll_interval,
+    )
     
     print("CUDA AVAILABLE:", torch.cuda.is_available())
     
