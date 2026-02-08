@@ -54,7 +54,7 @@ class FuchsiaConfig:
     # Trainer settings
     batch_size: int = 1
     grad_accumulation_steps: int = 1
-    max_iterations: int = 1000
+    max_iterations: int = 1000000
     log_wandb: bool = False
     lr: float = 5e-6
     weight_decay: float = 0.0
@@ -176,6 +176,7 @@ class FuchsiaConfig:
     def from_yaml(cls, yaml_path: str) -> "FuchsiaConfig":
         with open(yaml_path, "r", encoding="utf-8") as handle:
             config = yaml.safe_load(handle) or {}
+        default_max_iterations = cls.__dataclass_fields__["max_iterations"].default
 
         # Shared section (PrimeRL-style): values used by both trainer and server.
         # New preferred shape:
@@ -387,7 +388,7 @@ class FuchsiaConfig:
             top_p=float(pick(generation.get("top_p"), shared_top_p, vllm.get("top_p"), default=1.0)),
             top_k=int(pick(generation.get("top_k"), shared_top_k, vllm.get("top_k"), default=-1)),
             min_p=float(pick(generation.get("min_p"), shared_min_p, vllm.get("min_p"), default=0.0)),
-            max_iterations=training.get("max_iterations", 1000),
+            max_iterations=training.get("max_iterations", default_max_iterations),
             save_every=training.get("save_steps", 25),
             using_lora=lora.get("enabled", False),
             lora_r=lora.get("r", 8),

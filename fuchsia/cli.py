@@ -401,7 +401,7 @@ def create_default_config(output_path: str = "config.yaml") -> None:
         },
         "training": {
             "max_epochs": 1,
-            "max_iterations": 1000,
+            "max_iterations": 1000000,
             "save_steps": 100,
             "eval_steps": 50,
             "output_dir": "jee_output"
@@ -512,7 +512,7 @@ dataset:
 # Training configuration
 training:
   max_epochs: 1
-  max_iterations: 1000
+  max_iterations: 1000000
   save_steps: 100
   eval_steps: 50
   output_dir: "jee_output"

@@ -743,12 +743,13 @@ class Trainer:
         total_vllm_cycle_time = time.perf_counter() - vllm_cycle_start_time
         self.logger.info(f"VLLM hotswap cycle completed in {total_vllm_cycle_time:.2f}s (VLLM wake/fill/sleep: {vllm_wake_time:.2f}s)")
 
-    def train(self, epochs: int = 1, max_iterations: int = 10000) -> None:
+    def train(self, epochs: int = 1, max_iterations: Optional[int] = None) -> None:
         
         idx = 0
         start_time = time.perf_counter()
+        target_max_iterations = self.max_iterations if max_iterations is None else max_iterations
         
-        while idx < max_iterations:
+        while idx < target_max_iterations:
             if not self._is_model_on_gpu:
                 self.load_model_to_gpu()
             

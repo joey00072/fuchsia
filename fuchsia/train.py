@@ -95,7 +95,7 @@ def run_training(config_path: str | Path) -> None:
     )
 
     print("[blue]Starting training[/blue]")
-    trainer.train()
+    trainer.train(max_iterations=trainer_config.max_iterations)
 
 
 def main(argv: list[str] | None = None) -> int:
