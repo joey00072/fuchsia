@@ -1,10 +1,10 @@
 # Fuchsia - RL Training Framework
 
-A flexible and efficient framework for Group Relative Policy Optimization (GRPO) training with support for LoRA fine-tuning, distributed training, and interactive environments.
+A flexible and efficient framework for rollout-based RL training with support for LoRA fine-tuning, distributed training, and interactive environments.
 
 ## Features
 
-- **GRPO Training**: Implementation of Group Relative Policy Optimization algorithm
+- **Trainer with Multiple Losses**: Supports `grpo`, `cispo`, `cxpo`, and `reinforce`
 - **LoRA Support**: Efficient fine-tuning with Low-Rank Adaptation
 - **Distributed Training**: Support for multi-GPU setups with VLLM backend
 - **Single GPU Training**: Works on single GPU with hotswap mode
@@ -25,7 +25,7 @@ pip install -r requirements.txt
 
 ## Quick Start
 
-Fuchsia uses a server-client architecture where a VLLM server generates completions and a training client performs GRPO updates.
+Fuchsia uses a server-client architecture where a VLLM server generates completions and a training client performs policy updates.
 
 ### 1. Start the Server
 
@@ -62,7 +62,7 @@ python gsm8k_train.py
 The `examples/function/` directory demonstrates training a model to use tools:
 
 - **Server** (`fn_server.py`): Serves completions with tool-calling environment
-- **Training** (`fn_train.py`): GRPO training with LoRA
+- **Training** (`fn_train.py`): Trainer-based RL training with LoRA
 - **Config** (`config.yaml`): Configuration for model, LoRA, and training parameters
 
 **Key Features:**
@@ -76,7 +76,7 @@ The `examples/function/` directory demonstrates training a model to use tools:
 The `examples/gsm8k/` directory shows training on mathematical reasoning:
 
 - **Server** (`gsm8k_server.py`): Serves math problems with thinking format
-- **Training** (`gsm8k_train.py`): GRPO training for reasoning tasks
+- **Training** (`gsm8k_train.py`): Trainer-based RL training for reasoning tasks
 - **Config** (`gsm8k_config.yaml`): Optimized settings for math problems
 
 **Key Features:**
@@ -106,10 +106,10 @@ lora:
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
 ```
 
-### GRPO Training Configuration
+### Trainer Configuration
 ```yaml
-grpo:
-  loss_type: "reinforce"                 # Loss type (reinforce/ppo)
+trainer:
+  loss_type: "reinforce"                 # Loss type (grpo/cispo/cxpo/reinforce)
   group_size: 8                          # Number of completions per prompt
   batch_size: 8                          # Training batch size
   lr: 0.00005                           # Learning rate
@@ -142,7 +142,7 @@ server:
 ## Architecture
 
 - **VLLM Server**: High-performance inference server for generating completions
-- **GRPO Trainer**: Handles policy optimization and LoRA updates
+- **Trainer**: Handles policy optimization and LoRA updates
 - **Environment**: Manages multi-turn interactions and reward calculation
 - **Dataset Client**: Interfaces between training and server for data flow
 
@@ -187,7 +187,7 @@ For training on limited GPU memory:
 
 1. **Enable gradient checkpointing with CPU offloading**:
 ```yaml
-grpo:
+trainer:
   gradient_checkpointing:
     enabled: true
     cpu_offloading: true
@@ -201,7 +201,7 @@ server:
 
 3. **Reduce batch sizes**:
 ```yaml
-grpo:
+trainer:
   batch_size: 2
   group_size: 4
 ```

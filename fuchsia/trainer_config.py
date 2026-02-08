@@ -8,9 +8,9 @@ from fuchsia.rollout_queue import normalize_rollout_transfer_mode
 
 
 @dataclass
-class GRPOConfig:
+class TrainerConfig:
     """
-    Configuration for GRPO training and generation.
+    Framework-level trainer configuration for rollout-based RL training.
     All parameters are user-configurable for maximum flexibility.
     """
     # Model configuration
@@ -131,15 +131,15 @@ class GRPOConfig:
 
         # Set up logging
         logging.basicConfig(level=getattr(logging, self.log_level.upper(), logging.INFO))
-        self.logger = logging.getLogger("GRPO") 
+        self.logger = logging.getLogger("Trainer") 
         
     @classmethod
-    def from_yaml(cls, yaml_path: str) -> "GRPOConfig":
+    def from_yaml(cls, yaml_path: str) -> "TrainerConfig":
         with open(yaml_path, "r") as f:
             config = yaml.safe_load(f)
         
-        # Extract GRPO configuration
-        grpo_config_dict = config.get("grpo", {})
+        # Extract trainer configuration
+        trainer_config_dict = config.get("trainer", {})
         
         # Extract generation configuration for generation parameters
         generation_config = config.get("generation", {})
@@ -162,71 +162,71 @@ class GRPOConfig:
         lora_config = config.get("lora", {})
         
         # Extract gradient checkpointing configuration
-        gradient_checkpointing_config = grpo_config_dict.get("gradient_checkpointing", {})
-        importance_sampling_config = grpo_config_dict.get("importance_sampling", {})
+        gradient_checkpointing_config = trainer_config_dict.get("gradient_checkpointing", {})
+        importance_sampling_config = trainer_config_dict.get("importance_sampling", {})
         
-        grpo_config = GRPOConfig(
-            # GRPO specific parameters
-            loss_type=grpo_config_dict.get("loss_type", "grpo"),
-            group_size=grpo_config_dict.get("group_size", 8),
-            batch_size=grpo_config_dict.get("batch_size", 1),
-            grad_accumulation_steps=grpo_config_dict.get("grad_accumulation_steps", 1),
-            lr=float(grpo_config_dict.get("lr", 5e-6)),
-            weight_decay=float(grpo_config_dict.get("weight_decay", 0.0)),
-            beta=float(grpo_config_dict.get("beta", 0.0)),
-            epsilon=float(grpo_config_dict.get("epsilon", 0.2)),
-            epsilon_high=float(grpo_config_dict.get("epsilon_high", 0.28)),
+        trainer_config = TrainerConfig(
+            # Trainer-specific parameters (loss can be grpo/cispo/cxpo/reinforce etc.)
+            loss_type=trainer_config_dict.get("loss_type", "grpo"),
+            group_size=trainer_config_dict.get("group_size", 8),
+            batch_size=trainer_config_dict.get("batch_size", 1),
+            grad_accumulation_steps=trainer_config_dict.get("grad_accumulation_steps", 1),
+            lr=float(trainer_config_dict.get("lr", 5e-6)),
+            weight_decay=float(trainer_config_dict.get("weight_decay", 0.0)),
+            beta=float(trainer_config_dict.get("beta", 0.0)),
+            epsilon=float(trainer_config_dict.get("epsilon", 0.2)),
+            epsilon_high=float(trainer_config_dict.get("epsilon_high", 0.28)),
             importance_sampling_correction=importance_sampling_config.get(
-                "enabled", grpo_config_dict.get("importance_sampling_correction", True)
+                "enabled", trainer_config_dict.get("importance_sampling_correction", True)
             ),
             importance_ratio_type=importance_sampling_config.get(
-                "ratio_type", grpo_config_dict.get("importance_ratio_type", "token")
+                "ratio_type", trainer_config_dict.get("importance_ratio_type", "token")
             ),
             importance_token_mask_high=float(
                 importance_sampling_config.get(
-                    "token_mask_high", grpo_config_dict.get("importance_token_mask_high", 8.0)
+                    "token_mask_high", trainer_config_dict.get("importance_token_mask_high", 8.0)
                 )
             ),
             importance_token_mask_low=float(
                 importance_sampling_config.get(
-                    "token_mask_low", grpo_config_dict.get("importance_token_mask_low", 0.125)
+                    "token_mask_low", trainer_config_dict.get("importance_token_mask_low", 0.125)
                 )
             ),
             importance_sequence_clip_high=float(
                 importance_sampling_config.get(
-                    "sequence_clip_high", grpo_config_dict.get("importance_sequence_clip_high", 10.0)
+                    "sequence_clip_high", trainer_config_dict.get("importance_sequence_clip_high", 10.0)
                 )
             ),
             importance_geo_mask_high=float(
                 importance_sampling_config.get(
-                    "geo_mask_high", grpo_config_dict.get("importance_geo_mask_high", 10.0)
+                    "geo_mask_high", trainer_config_dict.get("importance_geo_mask_high", 10.0)
                 )
             ),
             importance_geo_mask_low=float(
                 importance_sampling_config.get(
-                    "geo_mask_low", grpo_config_dict.get("importance_geo_mask_low", 0.1)
+                    "geo_mask_low", trainer_config_dict.get("importance_geo_mask_low", 0.1)
                 )
             ),
             importance_sequence_mask_low=float(
                 importance_sampling_config.get(
-                    "sequence_mask_low", grpo_config_dict.get("importance_sequence_mask_low", 0.0)
+                    "sequence_mask_low", trainer_config_dict.get("importance_sequence_mask_low", 0.0)
                 )
             ),
             importance_sequence_mask_high=float(
                 importance_sampling_config.get(
-                    "sequence_mask_high", grpo_config_dict.get("importance_sequence_mask_high", 100.0)
+                    "sequence_mask_high", trainer_config_dict.get("importance_sequence_mask_high", 100.0)
                 )
             ),
-            log_wandb=grpo_config_dict.get("log_wandb", False),
-            wandb_project=grpo_config_dict.get("wandb_project", "fuchsia"),
-            num_policy_updates=grpo_config_dict.get("num_policy_updates", 8),
-            lora_path=grpo_config_dict.get("lora_path", "lora_weights"),
-            single_gpu=grpo_config_dict.get("single_gpu", False),
+            log_wandb=trainer_config_dict.get("log_wandb", False),
+            wandb_project=trainer_config_dict.get("wandb_project", "fuchsia"),
+            num_policy_updates=trainer_config_dict.get("num_policy_updates", 8),
+            lora_path=trainer_config_dict.get("lora_path", "lora_weights"),
+            single_gpu=trainer_config_dict.get("single_gpu", False),
             
             # Learning rate scheduler parameters
-            use_scheduler=grpo_config_dict.get("use_scheduler", True),
-            warmup_steps=grpo_config_dict.get("warmup_steps", 8),
-            scheduler_type=grpo_config_dict.get("scheduler_type", "constant_with_warmup"),
+            use_scheduler=trainer_config_dict.get("use_scheduler", True),
+            warmup_steps=trainer_config_dict.get("warmup_steps", 8),
+            scheduler_type=trainer_config_dict.get("scheduler_type", "constant_with_warmup"),
             
             # Gradient checkpointing configuration
             gradient_checkpointing_enabled=gradient_checkpointing_config.get("enabled", False),
@@ -276,4 +276,4 @@ class GRPOConfig:
             max_model_len=model_config.get("max_model_len", 1024),
         )
 
-        return grpo_config
+        return trainer_config

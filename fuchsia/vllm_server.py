@@ -214,8 +214,8 @@ class ServerConfig:
         # Extract dataset configuration
         dataset_config = config.get("dataset", {})
         
-        # Extract GRPO configuration for shared values
-        grpo_config = config.get("grpo", {})
+        # Extract trainer configuration for shared values
+        trainer_config = config.get("trainer", {})
         
         # Extract nested vllm configuration
         vllm_config = server_config.get("vllm", {})
@@ -245,9 +245,9 @@ class ServerConfig:
             dataset_split=dataset_config.get("split", "train"),
             dataset_max_samples=dataset_config.get("max_samples", -1),
             
-            # GRPO/LoRA shared configuration
-            lora_path=grpo_config.get("lora_path", "lora_weights"),
-            single_gpu=grpo_config.get("single_gpu", False),
+            # Trainer/LoRA shared configuration
+            lora_path=trainer_config.get("lora_path", "lora_weights"),
+            single_gpu=trainer_config.get("single_gpu", False),
             
             # VLLM configuration
             vllm_n=vllm_config.get("n", 1),

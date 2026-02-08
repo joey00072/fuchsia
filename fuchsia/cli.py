@@ -36,7 +36,7 @@ def create_default_config(output_path: str = "config.yaml") -> None:
     Create a default configuration file with predefined values.
 
     This function generates a YAML configuration file with default settings for Fuchsia.
-    The configuration includes settings for generation, model, LoRA, GRPO training,
+    The configuration includes settings for generation, model, LoRA, trainer settings,
     server, dataset, and training parameters.
 
     Args:
@@ -47,7 +47,7 @@ def create_default_config(output_path: str = "config.yaml") -> None:
         - Generation parameters (max_len, temperature, etc.)
         - Model configuration (name, dtype, etc.)
         - LoRA settings (enabled, r, alpha, etc.)
-        - GRPO training configuration
+        - Trainer configuration
         - Server settings
         - Dataset configuration
         - Training parameters
@@ -88,7 +88,7 @@ def create_default_config(output_path: str = "config.yaml") -> None:
             "alpha": 16,
             "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
         },
-        "grpo": {
+        "trainer": {
             "group_size": 8,
             "micro_group_size": 1,
             "batch_size": 1,
@@ -175,8 +175,8 @@ lora:
   alpha: 16
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
 
-# GRPO training configuration
-grpo:
+# Trainer configuration
+trainer:
   group_size: *group_size
   micro_group_size: 1
   batch_size: 1

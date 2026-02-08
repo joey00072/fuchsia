@@ -21,9 +21,9 @@ try:
 except ImportError:
     CYCLE_DETECTION_AVAILABLE = False
 
-from fuchsia.grpo_config import GRPOConfig
+from fuchsia.trainer_config import TrainerConfig
 
-class GRPO:
+class Trainer:
     def __init__(
         self,
         model: Union[str, PreTrainedModel],
@@ -32,11 +32,11 @@ class GRPO:
         dataset: Iterator[Dict[str, Any]],
         optimizer: Optional[torch.optim.Optimizer] = None,
         reward_functions: Optional[List[Callable]] = None,
-        config: GRPOConfig = None,
+        config: TrainerConfig = None,
         vllm_client: Optional[VLLMClient] = None,
     ) -> None:
         self.config = config
-        self.logger = getattr(config, "logger", logging.getLogger("GRPO"))
+        self.logger = getattr(config, "logger", logging.getLogger("Trainer"))
         self.device = config.device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.logger.info(f"Using device: {self.device}")
         
@@ -143,7 +143,7 @@ class GRPO:
         reserved = torch.cuda.memory_reserved() / (1024**3)
         self.logger.info(f"Initial GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
 
-    def _setup_scheduler(self, config: GRPOConfig) -> None:
+    def _setup_scheduler(self, config: TrainerConfig) -> None:
         """Setup learning rate scheduler based on configuration."""
         if config.scheduler_type == "constant_with_warmup":
             self.scheduler = get_constant_schedule_with_warmup(

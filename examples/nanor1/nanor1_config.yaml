@@ -22,8 +22,8 @@ lora:
   alpha: 16
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
 
-# GRPO training configuration
-grpo:
+# Trainer configuration
+trainer:
   group_size: *group_size
   batch_size: *generation_batch_size
   grad_accumulation_steps: *generation_batch_size
