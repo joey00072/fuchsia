@@ -2,6 +2,7 @@ import contextlib
 import datetime
 import gc
 import logging
+import math
 import time
 from collections import defaultdict
 from typing import Callable, List, Optional, Union, Dict, Any, Tuple, Iterator
@@ -61,9 +62,16 @@ class Trainer:
         self.tokenizer = tokenizer
         self.dataset = dataset
         self.data_loader_iter = iter(self.dataset)
-        self.group_size = config.group_size
-        self.micro_batch = config.batch_size // config.grad_accumulation_steps
-        self.batch_size = config.batch_size
+        if config.group_size <= 0:
+            raise ValueError("group_size must be > 0")
+        if config.batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+        if config.grad_accumulation_steps <= 0:
+            raise ValueError("grad_accumulation_steps must be > 0")
+
+        self.group_size = int(config.group_size)
+        self.batch_size = int(config.batch_size)
+        self.grad_accumulation_steps = int(config.grad_accumulation_steps)
         self.max_iterations = config.max_iterations
         self.dtype = config.trainer_dtype
         self.beta = config.beta
@@ -309,24 +317,6 @@ class Trainer:
             out.append(picked_chunk)
 
         return torch.cat(out).view(B, T)
-
-    # def selective_log_softmax(self, logits: Tensor, index: Tensor) -> Tensor:
-    #     per_token_logps = []
-    #     for row_logits, row_labels in zip(logits, index):
-    #         row_logps = F.log_softmax(row_logits, dim=-1)
-    #         row_per_token_logps = row_logps.gather(
-    #             dim=-1, index=row_labels.unsqueeze(-1)
-    #         ).squeeze(-1)
-    #         per_token_logps.append(row_per_token_logps)
-    #     per_token_logps = torch.stack(per_token_logps)
-    #     return per_token_logps
-
-    # def get_per_token_logps(self, model: PreTrainedModel, input_ids: Tensor, training: bool = False) -> Tensor:
-    #     logits = model(input_ids=input_ids, training=training).logits
-    #     logits = logits[:, :-1, :]
-    #     input_ids = input_ids[:, 1:]
-    #     logps = self.selective_log_softmax(logits, input_ids)
-    #     return logps
 
     def get_per_token_logps(
         self,
@@ -743,21 +733,137 @@ class Trainer:
         total_vllm_cycle_time = time.perf_counter() - vllm_cycle_start_time
         self.logger.info(f"VLLM hotswap cycle completed in {total_vllm_cycle_time:.2f}s (VLLM wake/fill/sleep: {vllm_wake_time:.2f}s)")
 
+    def _resolve_group_micro_batch_size(self, group_size: int) -> int:
+        if group_size <= 0:
+            raise ValueError(f"group_size must be > 0, got {group_size}")
+        return max(1, math.ceil(group_size / self.grad_accumulation_steps))
+
+    @staticmethod
+    def _iter_micro_ranges(num_rows: int, micro_batch_size: int):
+        if micro_batch_size <= 0:
+            raise ValueError(f"micro_batch_size must be > 0, got {micro_batch_size}")
+        for start in range(0, num_rows, micro_batch_size):
+            yield start, min(start + micro_batch_size, num_rows)
+
+    def _compute_old_policy_log_probs(
+        self,
+        batch_inputs: Tensor,
+        micro_batch_size: int,
+    ) -> list[Tensor]:
+        pi_old: list[Tensor] = []
+        with torch.no_grad():
+            for group_inputs in batch_inputs:
+                group_log_probs: list[Tensor] = []
+                for start, end in self._iter_micro_ranges(group_inputs.shape[0], micro_batch_size):
+                    micro_inputs = group_inputs[start:end].to(self.device)
+                    micro_log_probs = self.get_per_token_logps(self.model, micro_inputs).cpu()
+                    group_log_probs.append(micro_log_probs)
+                pi_old.append(torch.cat(group_log_probs, dim=0))
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return pi_old
+
+    def _step_scheduler(self) -> None:
+        if not self.use_scheduler or self.scheduler is None:
+            return
+        self.scheduler.step()
+        current_lr = self.scheduler.get_last_lr()[0]
+        if self.log_wandb:
+            self.metrics["learning_rate"].append(current_lr)
+        self.logger.debug(f"Current learning rate: {current_lr:.2e}")
+
+    def _train_single_group(
+        self,
+        b_inputs: Tensor,
+        b_old_policy_log_probs: Tensor,
+        b_reward: Tensor,
+        b_loss_mask: Tensor,
+        b_ignore_sample: Tensor,
+        b_mean_rewards: Tensor,
+        b_std_rewards: Tensor,
+        micro_batch_size: int,
+    ) -> dict[str, float]:
+        micro_ranges = list(self._iter_micro_ranges(b_inputs.shape[0], micro_batch_size))
+        if not micro_ranges:
+            raise RuntimeError("No microbatches produced for group training step")
+
+        self.optimizer.zero_grad(set_to_none=True)
+
+        group_losses: list[float] = []
+        group_klds: list[float] = []
+        num_micro_steps = len(micro_ranges)
+
+        for start, end in micro_ranges:
+            inputs = b_inputs[start:end].to(self.device)
+            old_policy_log_probs = b_old_policy_log_probs[start:end].to(self.device)
+            reward_batch = b_reward[start:end].to(self.device)
+            loss_mask_batch = b_loss_mask[start:end].to(self.device)
+            ignore_sample_batch = b_ignore_sample[start:end].unsqueeze(-1).to(self.device)
+            mean_rewards = b_mean_rewards[start:end].to(self.device)
+            std_rewards = b_std_rewards[start:end].to(self.device)
+
+            loss, kld = self.compute_loss(
+                inputs,
+                old_policy_log_probs,
+                reward_batch,
+                mean_rewards,
+                std_rewards,
+                loss_mask_batch,
+                ignore_sample_batch,
+            )
+
+            group_losses.append(loss.item())
+            group_klds.append(kld)
+            (loss / num_micro_steps).backward()
+
+        self.optimizer.step()
+        self._step_scheduler()
+
+        avg_loss = sum(group_losses) / len(group_losses)
+        avg_kld = sum(group_klds) / len(group_klds)
+        return {
+            "loss": avg_loss,
+            "kld": avg_kld,
+            "total_reward": b_reward.mean().item(),
+            "mean_group_reward": b_mean_rewards.mean().item(),
+            "valid_samples": b_ignore_sample.sum().item(),
+        }
+
     def train(self, epochs: int = 1, max_iterations: Optional[int] = None) -> None:
-        
         idx = 0
         start_time = time.perf_counter()
         target_max_iterations = self.max_iterations if max_iterations is None else max_iterations
-        
+
         while idx < target_max_iterations:
             if not self._is_model_on_gpu:
                 self.load_model_to_gpu()
-            
-            x_batch_inputs, x_rewards, batch_mean_rewards, batch_std_rewards, loss_mask, ignore_samples, server_info = self.sample_batch()
+
+            (
+                x_batch_inputs,
+                x_rewards,
+                batch_mean_rewards,
+                batch_std_rewards,
+                loss_mask,
+                ignore_samples,
+                server_info,
+            ) = self.sample_batch()
             group_size = server_info["group_size"]
+            micro_batch_size = self._resolve_group_micro_batch_size(group_size)
+
+            expected_rows = self.batch_size * group_size
+            if x_batch_inputs.shape[0] != expected_rows:
+                self.logger.warning(
+                    "Skipping malformed batch: expected %s rows (batch_size=%s, group_size=%s), got %s",
+                    expected_rows,
+                    self.batch_size,
+                    group_size,
+                    x_batch_inputs.shape[0],
+                )
+                continue
+
             batch_mean_rewards = batch_mean_rewards.unsqueeze(-1).repeat_interleave(group_size, dim=-1)
-            batch_std_rewards  = batch_std_rewards.unsqueeze(-1).repeat_interleave(group_size, dim=-1)
-            
+            batch_std_rewards = batch_std_rewards.unsqueeze(-1).repeat_interleave(group_size, dim=-1)
+
             batch_inputs = x_batch_inputs.reshape(
                 self.batch_size, group_size, *x_batch_inputs.shape[1:]
             ).cpu()
@@ -770,102 +876,56 @@ class Trainer:
             x_rewards = x_rewards.cpu()
             old_policy_log_probs = server_info.get("old_policy_log_probs")
             if old_policy_log_probs is not None:
-                pi_old = old_policy_log_probs.reshape(
-                    self.batch_size, group_size, *old_policy_log_probs.shape[1:]
-                ).cpu()
+                pi_old = list(
+                    old_policy_log_probs.reshape(
+                        self.batch_size, group_size, *old_policy_log_probs.shape[1:]
+                    ).cpu()
+                )
             else:
-                pi_old = []
-                with torch.no_grad():
-                    for b_inputs in batch_inputs:
-                        # Process with microbatches to reduce memory usage
-                        b_old_policy_log_probs = []
-                        for start in range(0, b_inputs.shape[0], self.micro_batch):
-                            end = start + self.micro_batch
-                            micro_inputs = b_inputs[start:end].to(self.device)
-                            micro_log_probs = self.get_per_token_logps(
-                                self.model, micro_inputs
-                            ).cpu()
-                            b_old_policy_log_probs.append(micro_log_probs)
-                        # Concatenate microbatches back together
-                        x_old_policy_log_probs = torch.cat(b_old_policy_log_probs, dim=0)
-                        pi_old.append(x_old_policy_log_probs)
-                    torch.cuda.empty_cache()
+                pi_old = self._compute_old_policy_log_probs(batch_inputs, micro_batch_size)
 
-            self.optimizer.zero_grad()
-            
-            # Collect metrics for this outer loop iteration
             iteration_metrics = {
                 "total_reward": [],
                 "mean_group_reward": [],
                 "loss": [],
                 "valid_samples": [],
-                "kld": []
+                "kld": [],
             }
-            
-            for b_inputs, b_old_policy_log_probs, b_reward, b_loss_mask, b_ignore_sample, b_mean_rewards, b_std_rewards in zip(
+
+            for (
+                b_inputs,
+                b_old_policy_log_probs,
+                b_reward,
+                b_loss_mask,
+                b_ignore_sample,
+                b_mean_rewards,
+                b_std_rewards,
+            ) in zip(
                 batch_inputs, pi_old, x_rewards, loss_mask, ignore_samples, batch_mean_rewards, batch_std_rewards
             ):
+                if idx >= target_max_iterations:
+                    break
+
                 idx += 1
-                group_losses = []
-                group_klds = []
-                
-                reward = b_reward.to(self.device)
+                group_metrics = self._train_single_group(
+                    b_inputs,
+                    b_old_policy_log_probs,
+                    b_reward,
+                    b_loss_mask,
+                    b_ignore_sample,
+                    b_mean_rewards,
+                    b_std_rewards,
+                    micro_batch_size,
+                )
+                print(
+                    f"{idx:04d} loss: {group_metrics['loss']} "
+                    f"reward: {group_metrics['total_reward']}"
+                )
 
-                for start in range(0, b_inputs.shape[0], self.micro_batch):
-                    end = start + self.micro_batch
-                    inputs = b_inputs[start:end]
-                    old_policy_log_probs = b_old_policy_log_probs[start:end]
-                    reward_batch = b_reward[start:end]
-                    loss_mask_batch = b_loss_mask[start:end]
-                    ignore_sample_batch = b_ignore_sample[start:end]
-                    mean_rewards = b_mean_rewards[start:end]
-                    std_rewards = b_std_rewards[start:end]
-                    
-                    inputs = inputs.to(self.device)
-                    old_policy_log_probs = old_policy_log_probs.to(self.device)
-                    reward_batch = reward_batch.to(self.device)
-                    loss_mask_batch = loss_mask_batch.to(self.device)
-                    ignore_sample_batch = ignore_sample_batch.unsqueeze(-1).to(self.device)
-                    
-                    mean_rewards = mean_rewards.to(self.device)
-                    std_rewards = std_rewards.to(self.device)
+                for metric_name, metric_value in group_metrics.items():
+                    iteration_metrics[metric_name].append(metric_value)
 
-                    loss, kld = self.compute_loss(
-                        inputs,
-                        old_policy_log_probs,
-                        reward_batch,
-                        mean_rewards,
-                        std_rewards,
-                        loss_mask_batch,
-                        ignore_sample_batch
-                    )
-                    
-                    group_losses.append(loss.item())
-                    group_klds.append(kld)
-                    loss.backward()
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-
-                print(f"{idx:04d} loss: {sum(group_losses) / len(group_losses)} reward: {reward.mean()}")
-                
-                # Collect metrics for this group
-                iteration_metrics["total_reward"].append(reward.mean().item())
-                iteration_metrics["mean_group_reward"].append(batch_mean_rewards.mean().item())
-                iteration_metrics["loss"].append(sum(group_losses) / len(group_losses))
-                iteration_metrics["valid_samples"].append(b_ignore_sample.sum().item())
-                iteration_metrics["kld"].append(sum(group_klds) / len(group_klds))
-            
-
-            # Step the learning rate scheduler if enabled
-            if self.use_scheduler and self.scheduler is not None:
-                self.scheduler.step()
-                current_lr = self.scheduler.get_last_lr()[0]
-                if self.log_wandb:
-                    self.metrics["learning_rate"].append(current_lr)
-                self.logger.debug(f"Current learning rate: {current_lr:.2e}")
-
-            # Log metrics for this iteration (averaged across all groups)
-            if self.log_wandb:
+            if self.log_wandb and iteration_metrics["loss"]:
                 self.metrics["idx"].append(idx)
                 self.metrics["total_reward"].append(sum(iteration_metrics["total_reward"]) / len(iteration_metrics["total_reward"]))
                 self.metrics["mean_group_reward"].append(sum(iteration_metrics["mean_group_reward"]) / len(iteration_metrics["mean_group_reward"]))
@@ -873,13 +933,16 @@ class Trainer:
                 self.metrics["valid_samples"].append(sum(iteration_metrics["valid_samples"]))
                 self.metrics["kld"].append(sum(iteration_metrics["kld"]) / len(iteration_metrics["kld"]))
 
-            print(f"iter {idx}  >>> reward: {batch_mean_rewards.mean()}")
+            if not iteration_metrics["loss"]:
+                continue
+
+            print(f"iter {idx}  >>> reward: {sum(iteration_metrics['mean_group_reward']) / len(iteration_metrics['mean_group_reward'])}")
             print(f"Total time: {str(datetime.timedelta(seconds=int(time.perf_counter() - start_time)))}")
             self.log_metrics()
 
-            if idx % self.num_policy_updates == 0:
+            if self.num_policy_updates > 0 and idx % self.num_policy_updates == 0:
                 self.handle_policy_update()
             
-            if idx % self.config.save_every == 0:
+            if self.config.save_every > 0 and idx % self.config.save_every == 0:
                 self.tokenizer.save_pretrained(f"{self.lora_path}/{idx}")
                 self.model.save_pretrained(f"{self.lora_path}/{idx}", adapter_name="grpo")
