@@ -67,6 +67,30 @@ def create_default_config(output_path: str = "config.yaml") -> None:
 
     # Define the config with anchors
     default_config = {
+        "shared": {
+            "rollout": {
+                "group_size": 8
+            },
+            "sampling": {
+                "max_tokens": 512,
+                "repetition_penalty": 1.0,
+                "temperature": 0.6,
+                "top_k": -1,
+                "top_p": 1.0,
+                "min_p": 0.0,
+                "logprobs": 1
+            },
+            "runtime": {
+                "single_gpu": False,
+                "lora_path": "lora_weights"
+            },
+            "transfer": {
+                "mode": "api",
+                "queue_dir": "/tmp/fuchsia_sample_queue",
+                "poll_interval": 0.25,
+                "clear_on_start": False
+            }
+        },
         "generation": {
             "max_len": 512,
             "group_size": 8,
@@ -109,8 +133,7 @@ def create_default_config(output_path: str = "config.yaml") -> None:
             },
             "log_wandb": True,
             "wandb_project": "fuchsia-jee-deephermes",
-            "num_policy_updates": 8,
-            "lora_path": "/mnt/nvme0n1/joey/experiments/lora_weights3"
+            "num_policy_updates": 8
         },
         "server": {
             "host": "0.0.0.0",
@@ -124,15 +147,18 @@ def create_default_config(output_path: str = "config.yaml") -> None:
             "transfer": {
                 "mode": "api",
                 "queue_dir": "/tmp/fuchsia_sample_queue",
+                "poll_interval": 0.25,
                 "clear_on_start": False
             },
             "vllm": {
                 "max_tokens": 512,
                 "n": 8,
+                "repetition_penalty": 1.0,
                 "temperature": 0.6,
                 "top_p": 1.0,
                 "top_k": -1,
-                "min_p": 0.0
+                "min_p": 0.0,
+                "logprobs": 1
             }
         },
         "dataset": {
@@ -151,14 +177,35 @@ def create_default_config(output_path: str = "config.yaml") -> None:
     }
 
     # Create a YAML document with anchors
-    yaml_doc = """# Generation configuration (shared parameters)
+    yaml_doc = """# Shared configuration (used by both trainer and server)
+shared:
+  rollout:
+    group_size: &group_size 8
+  sampling:
+    max_tokens: &max_tokens 512
+    repetition_penalty: &repetition_penalty 1.0
+    temperature: &temperature 0.6
+    top_k: &top_k -1
+    top_p: &top_p 1.0
+    min_p: &min_p 0.0
+    logprobs: &logprobs 1
+  runtime:
+    single_gpu: false
+    lora_path: "lora_weights"
+  transfer:
+    mode: &transfer_mode "api"
+    queue_dir: &transfer_queue_dir "/tmp/fuchsia_sample_queue"
+    poll_interval: &transfer_poll_interval 0.25
+    clear_on_start: &transfer_clear_on_start false
+
+# Generation configuration (trainer-facing compatibility)
 generation: &generation
-  max_len: &max_len 512
-  group_size: &group_size 8
-  temperature: &temperature 0.6
-  top_k: &top_k -1
-  top_p: &top_p 1.0
-  min_p: &min_p 0.0
+  max_len: *max_tokens
+  group_size: *group_size
+  temperature: *temperature
+  top_k: *top_k
+  top_p: *top_p
+  min_p: *min_p
   batch_size: &generation_batch_size 4
 
 # Model configuration
@@ -166,7 +213,7 @@ model:
   name: "joey00072/Llama-3.2-1B-Instruct-cold-start-ft2"
   revision: null
   dtype: "bfloat16"
-  max_model_len: *max_len
+  max_model_len: *max_tokens
 
 # LoRA configuration
 lora:
@@ -197,7 +244,6 @@ trainer:
   log_wandb: true
   wandb_project: "fuchsia-jee-deephermes"
   num_policy_updates: 8
-  lora_path: "/mnt/nvme0n1/joey/experiments/lora_weights3"
 
 # Server configuration
 server:
@@ -210,16 +256,19 @@ server:
   generation_batch_size: *generation_batch_size
   quantization: null
   transfer:
-    mode: "api"
-    queue_dir: "/tmp/fuchsia_sample_queue"
-    clear_on_start: false
+    mode: *transfer_mode
+    queue_dir: *transfer_queue_dir
+    poll_interval: *transfer_poll_interval
+    clear_on_start: *transfer_clear_on_start
   vllm:
-    max_tokens: *max_len
+    max_tokens: *max_tokens
     n: *group_size
+    repetition_penalty: *repetition_penalty
     temperature: *temperature
     top_p: *top_p
     top_k: *top_k
     min_p: *min_p
+    logprobs: *logprobs
 
 # Dataset configuration
 dataset:

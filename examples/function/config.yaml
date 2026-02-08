@@ -1,11 +1,32 @@
-# Generation configuration (shared parameters)
+# Shared configuration (used by both trainer and server)
+shared:
+  rollout:
+    group_size: &group_size 8
+  sampling:
+    max_tokens: &max_tokens 2048
+    repetition_penalty: &repetition_penalty 1.0
+    temperature: &temperature 0.9
+    top_k: &top_k -1
+    top_p: &top_p 1.0
+    min_p: &min_p 0.0
+    logprobs: &logprobs 1
+  runtime:
+    single_gpu: true
+    lora_path: "./lora_weights"
+  transfer:
+    mode: &transfer_mode "api"
+    queue_dir: &transfer_queue_dir "/tmp/fuchsia_sample_queue"
+    poll_interval: &transfer_poll_interval 0.25
+    clear_on_start: &transfer_clear_on_start false
+
+# Generation configuration (trainer-facing compatibility)
 generation: &generation
-  max_len: &max_len 2048
-  group_size: &group_size 8
-  temperature: &temperature 0.9
-  top_k: &top_k -1
-  top_p: &top_p 1.0
-  min_p: &min_p 0.0
+  max_len: *max_tokens
+  group_size: *group_size
+  temperature: *temperature
+  top_k: *top_k
+  top_p: *top_p
+  min_p: *min_p
   batch_size: &generation_batch_size 4
 
 # Model configuration
@@ -13,7 +34,7 @@ model:
   name: "joey00072/exp-ntr-qwen3-4b-v0"
   revision: null
   dtype: "bfloat16"
-  max_model_len: *max_len
+  max_model_len: *max_tokens
 
 # LoRA configuration
 lora:
@@ -35,8 +56,6 @@ trainer:
   log_wandb: true
   wandb_project: "fuchsia-single-gpu-qlora"
   num_policy_updates: 1
-  lora_path: "./lora_weights"
-  single_gpu: true
   gradient_checkpointing:
     enabled: false
     cpu_offloading: false
@@ -51,17 +70,20 @@ server:
   buffer_size: *generation_batch_size
   generation_batch_size: *generation_batch_size
   transfer:
-    mode: "api"         # "api" or "filesystem" ("http" alias supported)
-    queue_dir: "/tmp/fuchsia_sample_queue"
-    clear_on_start: false
+    mode: *transfer_mode
+    queue_dir: *transfer_queue_dir
+    poll_interval: *transfer_poll_interval
+    clear_on_start: *transfer_clear_on_start
   quantization: fp8
   vllm:
-    max_tokens: *max_len
+    max_tokens: *max_tokens
     n: *group_size
+    repetition_penalty: *repetition_penalty
     temperature: *temperature
     top_p: *top_p
     top_k: *top_k
     min_p: *min_p
+    logprobs: *logprobs
 
 # Dataset configuration
 dataset:

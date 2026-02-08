@@ -1,4 +1,4 @@
 from fuchsia.trainer import Trainer
-from fuchsia.trainer_config import TrainerConfig
+from fuchsia.config import FuchsiaConfig
 
-__all__ = ["Trainer", "TrainerConfig"]
+__all__ = ["Trainer", "FuchsiaConfig"]

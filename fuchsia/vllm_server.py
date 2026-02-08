@@ -26,7 +26,6 @@ import threading
 import time
 import inspect
 from collections import defaultdict
-from dataclasses import dataclass
 from typing import Optional, Sequence, Callable
 
 # Third party imports
@@ -34,7 +33,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import uvicorn
-import yaml
 from datasets import Dataset, load_dataset
 from fastapi import BackgroundTasks, FastAPI
 from fastapi.responses import HTMLResponse
@@ -60,7 +58,8 @@ if libcuda_available:
 # Local imports
 from fuchsia.envs import Rollout, Environment, SingleTurnEnvironment, MultiTurnEnvironment
 from fuchsia.reward_utils import clean_completions
-from fuchsia.rollout_queue import create_rollout_queue, normalize_rollout_transfer_mode
+from fuchsia.rollout_queue import create_rollout_queue
+from fuchsia.config import FuchsiaConfig
 from fuchsia.utils import get_ip_addresses
 
 # Configure logging
@@ -147,131 +146,8 @@ class WeightSyncWorkerExtension:
             self.client_rank = None
 
 
-@dataclass
-class ServerConfig:
-    model: str
-    revision: Optional[str] = None
-    tensor_parallel_size: int = 1
-    host: str = "0.0.0.0"
-    port: int = 8000
-    gpu_memory_utilization: float = 0.5
-    dtype: str = "auto"
-    max_model_len: Optional[int] = 512
-    enable_prefix_caching: Optional[bool] = None
-    quantization: Optional[str] = None
-    
-    # Data sampler specific configs
-    dataset_field: str = "text"
-    buffer_size: int = 32
-    enable_lora: bool = False
-    lora_path: str = "lora_weights"
-    vllm_n: int = 1
-    vllm_repetition_penalty: float = 1.0
-    vllm_temperature: float = 0.9
-    vllm_top_p: float = 1.0
-    vllm_top_k: int = -1
-    vllm_min_p: float = 0.0
-    vllm_logprobs: int = 1
-    vllm_max_tokens: int = 1024
-    vllm_kv_quantization: bool = False
-    generation_batch_size: int = 1
 
-    sample_transfer_mode: str = "api"  # Options: "api", "filesystem" ("http" is accepted as alias)
-    sample_transfer_dir: str = "/tmp/fuchsia_sample_queue"
-    sample_transfer_clear_on_start: bool = False
-    
-    single_gpu: bool = False
-    
-    dataset_name: str = ""
-    dataset_split: str = "train"
-    dataset_max_samples: int = -1
-       
-
-    def __post_init__(self,**kwargs):
-        # Allow for dynamic attribute setting from config files
-        for key, value in self.__dict__.items():
-            if not hasattr(self, key):
-                setattr(self, key, value)
-        
-        for key, value in kwargs.items():
-            if not hasattr(self, key):
-                setattr(self, key, value)
-        self.sample_transfer_mode = normalize_rollout_transfer_mode(self.sample_transfer_mode)
-
-    @classmethod
-    def from_yaml(cls, yaml_path: str) -> "ServerConfig":
-        import yaml
-        
-        with open(yaml_path, "r") as f:
-            config = yaml.safe_load(f)
-    
-        # Extract server configuration
-        server_config = config.get("server", {})
-        
-        # Extract model configuration
-        model_config = config.get("model", {})
-        
-        # Extract dataset configuration
-        dataset_config = config.get("dataset", {})
-        
-        # Extract trainer configuration for shared values
-        trainer_config = config.get("trainer", {})
-        
-        # Extract nested vllm configuration
-        vllm_config = server_config.get("vllm", {})
-        transfer_config = server_config.get("transfer", {})
-        
-        # Create ServerConfig with all values loaded from YAML
-        server_config_obj = cls(
-            # Model configuration
-            model=model_config.get("name", ""),
-            revision=model_config.get("revision"),
-            dtype=model_config.get("dtype", "auto"),
-            max_model_len=model_config.get("max_model_len", 512),
-            
-            # Server configuration
-            host=server_config.get("host", "0.0.0.0"),
-            port=server_config.get("port", 8000),
-            gpu_memory_utilization=server_config.get("gpu_memory_utilization", 0.5),
-            tensor_parallel_size=server_config.get("tensor_parallel_size", 1),
-            enable_prefix_caching=server_config.get("enable_prefix_caching", None),
-            quantization=server_config.get("quantization"),
-            buffer_size=server_config.get("buffer_size", 32),
-            generation_batch_size=server_config.get("generation_batch_size", 1),
-            
-            # Dataset configuration
-            dataset_field=dataset_config.get("field", "text"),
-            dataset_name=dataset_config.get("name", ""),
-            dataset_split=dataset_config.get("split", "train"),
-            dataset_max_samples=dataset_config.get("max_samples", -1),
-            
-            # Trainer/LoRA shared configuration
-            lora_path=trainer_config.get("lora_path", "lora_weights"),
-            single_gpu=trainer_config.get("single_gpu", False),
-            
-            # VLLM configuration
-            vllm_n=vllm_config.get("n", 1),
-            vllm_repetition_penalty=vllm_config.get("repetition_penalty", 1.0),
-            vllm_temperature=vllm_config.get("temperature", 0.9),
-            vllm_top_p=vllm_config.get("top_p", 1.0),
-            vllm_top_k=vllm_config.get("top_k", -1),
-            vllm_min_p=vllm_config.get("min_p", 0.0),
-            vllm_logprobs=vllm_config.get("logprobs", 1),
-            vllm_max_tokens=vllm_config.get("max_tokens", 1024),
-            vllm_kv_quantization=vllm_config.get("kv_quantization", False),
-            sample_transfer_mode=transfer_config.get(
-                "mode", server_config.get("sample_transfer_mode", "api")
-            ),
-            sample_transfer_dir=transfer_config.get(
-                "queue_dir",
-                server_config.get("sample_transfer_dir", "/tmp/fuchsia_sample_queue"),
-            ),
-            sample_transfer_clear_on_start=transfer_config.get(
-                "clear_on_start", server_config.get("sample_transfer_clear_on_start", False)
-            ),
-        )
-
-        return server_config_obj
+ServerConfig = FuchsiaConfig
 
 
 # API Models
@@ -1300,7 +1176,7 @@ def run_server():
     args = parser.parse_args()
 
     if args.config:
-        config = load_config_from_yaml(args.config)
+        config = ServerConfig.from_yaml(args.config)
         for key, value in vars(args).items():
             if value is not None and key != "config":
                 setattr(config, key, value)

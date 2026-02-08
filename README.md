@@ -106,11 +106,29 @@ lora:
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
 ```
 
+### Shared Configuration
+```yaml
+shared:
+  rollout:
+    group_size: 8                       # Shared rollout count for trainer + server
+  sampling:
+    max_tokens: 2048
+    temperature: 0.8
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
+  runtime:
+    single_gpu: true
+    lora_path: "./lora_weights"
+  transfer:
+    mode: "api"                         # "api" or "filesystem"
+    queue_dir: "/tmp/fuchsia_sample_queue"
+```
+
 ### Trainer Configuration
 ```yaml
 trainer:
   loss_type: "reinforce"                 # Loss type (grpo/cispo/cxpo/reinforce)
-  group_size: 8                          # Number of completions per prompt
   batch_size: 8                          # Training batch size
   lr: 0.00005                           # Learning rate
   weight_decay: 0.2                     # Weight decay

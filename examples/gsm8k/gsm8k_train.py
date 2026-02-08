@@ -11,7 +11,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model
 
 from fuchsia.trainer import Trainer
-from fuchsia.trainer_config import TrainerConfig
+from fuchsia.config import FuchsiaConfig
 from fuchsia.dist_dataset import DatasetClient
 from fuchsia.vllm_client import VLLMClient
 from fuchsia.cpu_offloding import apply_cpu_gradient_checkpoint_monkey_patch
@@ -20,7 +20,7 @@ from fuchsia.cpu_offloding import apply_cpu_gradient_checkpoint_monkey_patch
 # os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 def main():
-    trainer_config = TrainerConfig.from_yaml(Path(__file__).parent / "gsm8k_config.yaml")
+    trainer_config = FuchsiaConfig.from_yaml(Path(__file__).parent / "gsm8k_config.yaml")
     vllm_client = VLLMClient(init_communicator=False)
     vllm_client.sleep()
     dataset = DatasetClient(

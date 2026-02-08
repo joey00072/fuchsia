@@ -14,14 +14,13 @@ from torch import Tensor
 from transformers import AutoModelForCausalLM, PreTrainedTokenizer, PreTrainedModel
 from transformers import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
 from fuchsia.vllm_client import VLLMClient
+from fuchsia.config import FuchsiaConfig
 
 try:
     from torch.utils.viz._cycles import warn_tensor_cycles
     CYCLE_DETECTION_AVAILABLE = True
 except ImportError:
     CYCLE_DETECTION_AVAILABLE = False
-
-from fuchsia.trainer_config import TrainerConfig
 
 class Trainer:
     def __init__(
@@ -32,7 +31,7 @@ class Trainer:
         dataset: Iterator[Dict[str, Any]],
         optimizer: Optional[torch.optim.Optimizer] = None,
         reward_functions: Optional[List[Callable]] = None,
-        config: TrainerConfig = None,
+        config: FuchsiaConfig = None,
         vllm_client: Optional[VLLMClient] = None,
     ) -> None:
         self.config = config
@@ -66,7 +65,7 @@ class Trainer:
         self.micro_batch = config.batch_size // config.grad_accumulation_steps
         self.batch_size = config.batch_size
         self.max_iterations = config.max_iterations
-        self.dtype = config.dtype
+        self.dtype = config.trainer_dtype
         self.beta = config.beta
         self.epsilon = config.epsilon
         self.epsilon_high = config.epsilon_high
@@ -143,7 +142,7 @@ class Trainer:
         reserved = torch.cuda.memory_reserved() / (1024**3)
         self.logger.info(f"Initial GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
 
-    def _setup_scheduler(self, config: TrainerConfig) -> None:
+    def _setup_scheduler(self, config: FuchsiaConfig) -> None:
         """Setup learning rate scheduler based on configuration."""
         if config.scheduler_type == "constant_with_warmup":
             self.scheduler = get_constant_schedule_with_warmup(
