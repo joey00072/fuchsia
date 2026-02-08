@@ -1,39 +1,54 @@
-import os
-import math
+#!/usr/bin/env python3
+"""Generic Fuchsia trainer entrypoint.
+
+This module centralizes the training bootstrap logic so examples only need to
+define server-side rollout and reward behavior.
+"""
+
+from __future__ import annotations
+
+import argparse
 from pathlib import Path
-from typing import Optional, Dict, Any
 
 import torch
-import yaml
-from rich import print
-from datasets import Dataset, load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model
+from rich import print
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from fuchsia.trainer import Trainer
 from fuchsia.config import FuchsiaConfig
-from fuchsia.dist_dataset import DatasetClient
-from fuchsia.vllm_client import VLLMClient
 from fuchsia.cpu_offloading import apply_cpu_gradient_checkpoint_monkey_patch
+from fuchsia.dist_dataset import DatasetClient
+from fuchsia.trainer import Trainer
+from fuchsia.vllm_client import VLLMClient
 
-# os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
-def main():
-    trainer_config = FuchsiaConfig.from_yaml(Path(__file__).parent / "nanor1_config.yaml")
-    vllm_client = VLLMClient(init_communicator=not trainer_config.single_gpu)
+def _resolve_client_host(config: FuchsiaConfig) -> str:
+    # 0.0.0.0 is a bind address, but the client should connect to localhost.
+    if config.host in {"0.0.0.0", "::"}:
+        return "127.0.0.1"
+    return config.host
+
+
+def run_training(config_path: str | Path) -> None:
+    trainer_config = FuchsiaConfig.from_yaml(str(config_path))
+
+    vllm_client = VLLMClient(
+        host=_resolve_client_host(trainer_config),
+        server_port=trainer_config.port,
+        init_communicator=not trainer_config.single_gpu,
+    )
     if trainer_config.single_gpu:
         vllm_client.sleep()
+
     dataset = DatasetClient(
         vllm_client,
         transfer_mode=trainer_config.sample_transfer_mode,
         queue_dir=trainer_config.sample_transfer_dir,
         poll_interval=trainer_config.sample_transfer_poll_interval,
     )
-    
+
     print("CUDA AVAILABLE:", torch.cuda.is_available())
-    
-    
+
     enable_gradient_checkpointing = trainer_config.gradient_checkpointing_enabled
     cpu_offloading = trainer_config.gradient_checkpointing_cpu_offloading
     if enable_gradient_checkpointing and cpu_offloading:
@@ -43,16 +58,15 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         device_map="cpu",
-        # load_in_4bit=True,
         use_cache=False,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=trainer_config.trainer_dtype,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    
+
     if enable_gradient_checkpointing:
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
-    
+
     lora_config = LoraConfig(
         r=trainer_config.lora_r,
         lora_alpha=trainer_config.lora_alpha,
@@ -64,9 +78,9 @@ def main():
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=trainer_config.lr,
-        weight_decay=trainer_config.weight_decay
+        weight_decay=trainer_config.weight_decay,
     )
-    
+
     model.train()
 
     print("[blue]Initializing trainer[/blue]")
@@ -75,7 +89,7 @@ def main():
         ref_model=None,
         tokenizer=tokenizer,
         dataset=dataset,
-        optimizer=optimizer,    
+        optimizer=optimizer,
         config=trainer_config,
         vllm_client=vllm_client,
     )
@@ -84,5 +98,17 @@ def main():
     trainer.train()
 
 
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Run Fuchsia generic trainer")
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="Path to YAML config file",
+    )
+    args = parser.parse_args(argv)
+    run_training(args.config)
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

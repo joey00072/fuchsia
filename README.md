@@ -27,32 +27,28 @@ pip install -r requirements.txt
 
 Fuchsia uses a server-client architecture where a VLLM server generates completions and a training client performs policy updates.
 
-### 1. Start the Server
+### 1. Run Server + Trainer Together (Recommended)
 
-First, start the VLLM server that will generate completions:
+Start both processes with one command:
 
 ```bash
-# For function calling example
-cd examples/function
-python fn_server.py
-
-# For GSM8K math problems
-cd examples/gsm8k
-python gsm8k_server.py
+# Pass only the server script
+fuchsia run examples/gsm8k/gsm8k_server.py
+fuchsia run examples/function/fn_server.py
 ```
 
-### 2. Run Training
+This command starts the server first, waits for its health endpoint, auto-detects the config in that folder, and then starts the generic trainer.
 
-In a separate terminal, run the training script:
+### 2. Manual Two-Terminal Mode
+
+If you want manual control, run the server and generic trainer separately:
 
 ```bash
-# For function calling example
-cd examples/function
-python fn_train.py
+# Terminal 1
+python examples/gsm8k/gsm8k_server.py
 
-# For GSM8K math problems
-cd examples/gsm8k
-python gsm8k_train.py
+# Terminal 2
+python -m fuchsia.train --config examples/gsm8k/gsm8k_config.yaml
 ```
 
 ## Examples
@@ -62,7 +58,7 @@ python gsm8k_train.py
 The `examples/function/` directory demonstrates training a model to use tools:
 
 - **Server** (`fn_server.py`): Serves completions with tool-calling environment
-- **Training** (`fn_train.py`): Trainer-based RL training with LoRA
+- **Training** (`fuchsia.train`): Generic trainer module driven by config
 - **Config** (`config.yaml`): Configuration for model, LoRA, and training parameters
 
 **Key Features:**
@@ -76,7 +72,7 @@ The `examples/function/` directory demonstrates training a model to use tools:
 The `examples/gsm8k/` directory shows training on mathematical reasoning:
 
 - **Server** (`gsm8k_server.py`): Serves math problems with thinking format
-- **Training** (`gsm8k_train.py`): Trainer-based RL training for reasoning tasks
+- **Training** (`fuchsia.train`): Generic trainer module driven by config
 - **Config** (`gsm8k_config.yaml`): Optimized settings for math problems
 
 **Key Features:**

@@ -12,6 +12,7 @@ Usage:
 Commands:
     config    Create or manage configuration files
     server    Run the vLLM server for model serving
+    run       Run server + trainer together (control plane)
 
 Examples:
     # Create a default config file
@@ -22,13 +23,244 @@ Examples:
 
     # Run the vLLM server
     fuchsia server --model path/to/model
+
+    # Run with a server script (trainer is auto-wired)
+    fuchsia run examples/gsm8k/gsm8k_server.py
 """
 
 import argparse
+import os
+import shlex
+import subprocess
 import sys
+import threading
+import time
+from difflib import get_close_matches
+import urllib.error
+import urllib.request
 import yaml
 from pathlib import Path
 from typing import Optional
+
+
+RUN_PRESETS = {
+    "gsm8k": "examples/gsm8k/gsm8k_server.py",
+    "function": "examples/function/fn_server.py",
+    "nanor1": "examples/nanor1/nanor1_server.py",
+}
+
+
+def _stream_process_output(process: subprocess.Popen, name: str) -> None:
+    if process.stdout is None:
+        return
+    for line in process.stdout:
+        print(f"[{name}] {line}", end="")
+
+
+def _terminate_process(process: Optional[subprocess.Popen], name: str, timeout: float = 10.0) -> None:
+    if process is None or process.poll() is not None:
+        return
+    print(f"Stopping {name} process (pid={process.pid})")
+    process.terminate()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"{name} did not exit in {timeout:.1f}s, killing it")
+        process.kill()
+        process.wait()
+
+
+def _wait_for_server_health(
+    health_url: str,
+    timeout_seconds: float,
+    poll_interval: float,
+    server_process: subprocess.Popen,
+) -> bool:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if server_process.poll() is not None:
+            return False
+        try:
+            with urllib.request.urlopen(health_url, timeout=2.0) as response:
+                if response.status == 200:
+                    return True
+        except (urllib.error.URLError, TimeoutError):
+            pass
+        time.sleep(poll_interval)
+    return False
+
+
+def _parse_extra_args(raw: Optional[str]) -> list[str]:
+    if raw is None:
+        return []
+    return shlex.split(raw)
+
+
+def _resolve_server_script(args: argparse.Namespace) -> Path:
+    server_script = None
+    if args.example:
+        server_script = RUN_PRESETS[args.example]
+    elif args.server_script is not None:
+        server_script = args.server_script
+    elif args.server_script_flag is not None:
+        server_script = args.server_script_flag
+
+    if not server_script:
+        raise ValueError(
+            "Missing server script. Use `fuchsia run <server.py>` or `--example`."
+        )
+
+    server_candidate = Path(server_script).expanduser()
+    if server_candidate.exists():
+        return server_candidate.resolve()
+
+    server_text = str(server_script)
+    if "/" not in server_text and "\\" not in server_text:
+        matches = sorted(Path("examples").rglob(server_text))
+        if len(matches) == 1:
+            return matches[0].resolve()
+        if len(matches) > 1:
+            options = ", ".join(str(path) for path in matches)
+            raise ValueError(
+                f"Ambiguous server script name '{server_script}'. "
+                f"Found multiple matches: {options}. Use an explicit path."
+            )
+
+        known = sorted(str(path.name) for path in Path("examples").rglob("*_server.py"))
+        suggestions = get_close_matches(server_text, known, n=3)
+        hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+        raise FileNotFoundError(f"Server script not found: {server_script}.{hint}")
+
+    raise FileNotFoundError(f"Server script not found: {server_script}")
+
+
+def _infer_config_path(server_path: Path) -> Path:
+    directory = server_path.parent
+    stem = server_path.stem
+    if stem.endswith("_server"):
+        stem = stem[: -len("_server")]
+
+    candidates = [
+        directory / f"{stem}_config.yaml",
+        directory / "config.yaml",
+        directory / f"{stem}.yaml",
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+
+    fallback = sorted(directory.glob("*config*.yaml"))
+    if len(fallback) == 1:
+        return fallback[0].resolve()
+    if len(fallback) > 1:
+        options = ", ".join(str(path) for path in fallback)
+        raise ValueError(
+            f"Could not infer config uniquely for {server_path}. "
+            f"Found multiple config candidates: {options}. Use --config."
+        )
+
+    raise FileNotFoundError(
+        f"Could not find config YAML next to server script {server_path}. "
+        "Use --config to specify one."
+    )
+
+
+def run_control_plane(args: argparse.Namespace) -> int:
+    server_path = _resolve_server_script(args)
+    python_bin = args.python
+
+    server_cmd = [python_bin, str(server_path), *_parse_extra_args(args.server_args)]
+
+    if args.trainer_script:
+        trainer_path = Path(args.trainer_script).expanduser().resolve()
+        if not trainer_path.exists():
+            raise FileNotFoundError(f"Trainer script not found: {trainer_path}")
+        trainer_cmd = [python_bin, str(trainer_path), *_parse_extra_args(args.trainer_args)]
+    else:
+        config_path = Path(args.config).expanduser().resolve() if args.config else _infer_config_path(server_path)
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        trainer_cmd = [
+            python_bin,
+            "-m",
+            "fuchsia.train",
+            "--config",
+            str(config_path),
+            *_parse_extra_args(args.trainer_args),
+        ]
+
+    print(f"Starting server: {' '.join(server_cmd)}")
+    server_process = subprocess.Popen(
+        server_cmd,
+        cwd=os.getcwd(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    )
+    threading.Thread(
+        target=_stream_process_output,
+        args=(server_process, "server"),
+        daemon=True,
+    ).start()
+
+    print(
+        f"Waiting for server health endpoint {args.health_url} "
+        f"(timeout={args.server_start_timeout:.1f}s)"
+    )
+    healthy = _wait_for_server_health(
+        args.health_url,
+        args.server_start_timeout,
+        args.poll_interval,
+        server_process,
+    )
+    if not healthy:
+        print("Server did not become healthy before timeout, aborting run.")
+        _terminate_process(server_process, "server")
+        return 1
+
+    print(f"Starting trainer: {' '.join(trainer_cmd)}")
+    trainer_process = subprocess.Popen(
+        trainer_cmd,
+        cwd=os.getcwd(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    )
+    threading.Thread(
+        target=_stream_process_output,
+        args=(trainer_process, "trainer"),
+        daemon=True,
+    ).start()
+
+    try:
+        while True:
+            trainer_rc = trainer_process.poll()
+            server_rc = server_process.poll()
+
+            if trainer_rc is not None:
+                if trainer_rc == 0:
+                    print("Trainer exited successfully; stopping server.")
+                else:
+                    print(f"Trainer exited with code {trainer_rc}; stopping server.")
+                _terminate_process(server_process, "server")
+                return trainer_rc
+
+            if server_rc is not None:
+                print(f"Server exited with code {server_rc}; stopping trainer.")
+                _terminate_process(trainer_process, "trainer")
+                return server_rc
+
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("Interrupted. Stopping trainer and server.")
+        _terminate_process(trainer_process, "trainer")
+        _terminate_process(server_process, "server")
+        return 130
 
 
 def create_default_config(output_path: str = "config.yaml") -> None:
@@ -319,6 +551,9 @@ Examples:
 
     # Run the vLLM server
     fuchsia server --model path/to/model
+
+    # Run with a server script (trainer auto-starts)
+    fuchsia run examples/gsm8k/gsm8k_server.py
 """
     )
 
@@ -396,6 +631,71 @@ Examples:
         help="Model quantization method (e.g., 'awq')"
     )
 
+    # Run command
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Run server and trainer together",
+        description=(
+            "Start a server script, wait for health, then start trainer. "
+            "By default trainer is `python -m fuchsia.train --config <auto-detected-config>`."
+        ),
+    )
+    run_parser.add_argument(
+        "server_script",
+        nargs="?",
+        help="Path to server Python script. Example: examples/gsm8k/gsm8k_server.py",
+    )
+    run_parser.add_argument(
+        "--example",
+        choices=sorted(RUN_PRESETS.keys()),
+        help="Use a built-in server preset (gsm8k, function, nanor1)",
+    )
+    run_parser.add_argument(
+        "--server-script",
+        dest="server_script_flag",
+        help="Alias for positional server script path",
+    )
+    run_parser.add_argument(
+        "--config",
+        help="Path to trainer config YAML. If omitted, inferred from server script directory.",
+    )
+    run_parser.add_argument(
+        "--trainer-script",
+        help="Optional custom trainer script override",
+    )
+    run_parser.add_argument(
+        "--python",
+        default=sys.executable,
+        help=f"Python executable to use (default: {sys.executable})",
+    )
+    run_parser.add_argument(
+        "--server-args",
+        default=None,
+        help='Extra args for server script as one quoted string. Example: --server-args "--foo 1"',
+    )
+    run_parser.add_argument(
+        "--trainer-args",
+        default=None,
+        help='Extra args for trainer process as one quoted string. Example: --trainer-args "--bar 2"',
+    )
+    run_parser.add_argument(
+        "--health-url",
+        default="http://127.0.0.1:8000/health/",
+        help="Health endpoint to wait for before starting trainer",
+    )
+    run_parser.add_argument(
+        "--server-start-timeout",
+        type=float,
+        default=600.0,
+        help="Maximum seconds to wait for server health",
+    )
+    run_parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=1.0,
+        help="Health polling interval in seconds",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "config":
@@ -419,6 +719,12 @@ Examples:
         server = VLLMServer(config)
         server.serve()
         return 0
+    elif args.command == "run":
+        try:
+            return run_control_plane(args)
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"Error: {exc}")
+            return 1
     elif args.command is None:
         parser.print_help()
         return 1
