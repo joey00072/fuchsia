@@ -180,9 +180,9 @@ class Trainer:
         offload_start_time = time.perf_counter()
         self.logger.info("Starting offload to CPU...")
         
-        # wake up cuda allocator
+        # Wake CUDA allocator (safety net)
         torch.randn(1).cuda()
-        
+
         for param in self.model.parameters():
             param.data = param.data.to("cpu", non_blocking=self.non_blocking)
             if hasattr(param, "_local_shard"): # this need for fsdp
@@ -204,7 +204,6 @@ class Trainer:
         self._is_optimizer_on_gpu = False
         
         self.clean_and_sync_memory()
-        time.sleep(1)
         
         offload_time = time.perf_counter() - offload_start_time
         allocated = torch.cuda.memory_allocated() / (1024**3)
@@ -218,9 +217,9 @@ class Trainer:
         gpu_load_start_time = time.perf_counter()
         self.logger.info("Starting model load to GPU...")
         
-        # wake up cuda allocator
+        # Wake CUDA allocator (safety net)
         torch.randn(1).cuda()
-        
+
         for param in self.model.parameters():
             param.data = param.data.to("cuda", non_blocking=self.non_blocking)
             
@@ -241,7 +240,6 @@ class Trainer:
         self._is_optimizer_on_gpu = True
         
         self.clean_and_sync_memory()
-        time.sleep(1)
         
         gpu_load_time = time.perf_counter() - gpu_load_start_time
         allocated_memory_gb = torch.cuda.memory_allocated() / (1024**3)
@@ -268,11 +266,83 @@ class Trainer:
         self.clean_and_sync_memory()
         
     def clean_and_sync_memory(self) -> None:
+        if not torch.cuda.is_available():
+            return
         self.logger.info("Cleaning and syncing memory...")
         torch.cuda.synchronize()
+        # Wake CUDA allocator (safety net)
         torch.randn(1).cuda()
         gc.collect()
         torch.cuda.empty_cache()
+
+    def _wait_for_trainer_memory_release(
+        self,
+        baseline_allocated_bytes: int,
+        baseline_reserved_bytes: int,
+        timeout: float = 30.0,
+        poll_interval: float = 0.25,
+    ) -> bool:
+        """
+        Wait until trainer-process CUDA memory drops significantly after offload.
+        """
+        if not torch.cuda.is_available():
+            return True
+
+        # Require strong drop from baseline while allowing small allocator residue.
+        target_allocated_bytes = min(int(baseline_allocated_bytes * 0.15), 512 * 1024 * 1024)  # <=15% or <=512MB
+        target_reserved_bytes = min(int(baseline_reserved_bytes * 0.35), 2 * 1024 * 1024 * 1024)  # <=35% or <=2GB
+        target_allocated_bytes = max(target_allocated_bytes, 64 * 1024 * 1024)  # floor 64MB
+        target_reserved_bytes = max(target_reserved_bytes, 256 * 1024 * 1024)   # floor 256MB
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            allocated = torch.cuda.memory_allocated()
+            reserved = torch.cuda.memory_reserved()
+            if allocated <= target_allocated_bytes and reserved <= target_reserved_bytes:
+                self.logger.info(
+                    "Trainer CUDA memory released: allocated %.2fGB, reserved %.2fGB",
+                    allocated / (1024**3),
+                    reserved / (1024**3),
+                )
+                return True
+            self.logger.info(
+                "Waiting trainer memory release: allocated %.2fGB (<= %.2fGB), reserved %.2fGB (<= %.2fGB)",
+                allocated / (1024**3),
+                target_allocated_bytes / (1024**3),
+                reserved / (1024**3),
+                target_reserved_bytes / (1024**3),
+            )
+            time.sleep(poll_interval)
+        return False
+
+    def _wait_for_global_free_memory(
+        self,
+        min_free_bytes: int,
+        timeout: float = 120.0,
+        poll_interval: float = 0.5,
+    ) -> bool:
+        """Wait for global device free memory (across processes) to reach a threshold."""
+        if not torch.cuda.is_available():
+            return True
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            if free_bytes >= min_free_bytes:
+                self.logger.info(
+                    "Global free GPU memory recovered: %.2fGB / %.2fGB",
+                    free_bytes / (1024**3),
+                    total_bytes / (1024**3),
+                )
+                return True
+            self.logger.info(
+                "Waiting for global GPU free memory: %.2fGB / %.2fGB (target %.2fGB)",
+                free_bytes / (1024**3),
+                total_bytes / (1024**3),
+                min_free_bytes / (1024**3),
+            )
+            time.sleep(poll_interval)
+        return False
 
     def selective_log_softmax(
         self,
@@ -704,29 +774,70 @@ class Trainer:
         self._perform_vllm_hotswap_cycle()
 
     def _perform_vllm_hotswap_cycle(self) -> None:
-        """Perform VLLM hotswap cycle: offload model, wake VLLM, fill buffer, wait for memory, load model back."""
+        """Perform VLLM hotswap cycle without fixed sleeps by polling explicit server/global memory state."""
         vllm_cycle_start_time = time.perf_counter()
         self.logger.info("Starting VLLM hotswap cycle...")
-        
+
+        trainer_alloc_before = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+        trainer_reserved_before = torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
+
         self.offload_to_cpu()
+        if torch.cuda.is_available():
+            if not self._wait_for_trainer_memory_release(
+                baseline_allocated_bytes=trainer_alloc_before,
+                baseline_reserved_bytes=trainer_reserved_before,
+                timeout=45.0,
+                poll_interval=0.25,
+            ):
+                raise RuntimeError(
+                    "Trainer model memory did not release sufficiently after offload; aborting hotswap reload cycle"
+                )
+
+        baseline_free_bytes = None
+        if torch.cuda.is_available():
+            baseline_free_bytes, total_bytes = torch.cuda.mem_get_info()
+            self.logger.info(
+                "Baseline global free GPU memory after trainer offload: %.2fGB / %.2fGB",
+                baseline_free_bytes / (1024**3),
+                total_bytes / (1024**3),
+            )
+
         vllm_wake_start_time = time.perf_counter()
-        self.vllm_client.wake_up()
-        self.vllm_client.fill_buffer()
-        time.sleep(5)
-        self.vllm_client.sleep()
-        
-        # Wait for GPU memory to drop below half capacity
-        while True:
-            allocated_memory_gb = torch.cuda.memory_allocated() / (1024**3)
-            reserved_memory_gb = torch.cuda.memory_reserved() / (1024**3)
-            total_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            
-            if allocated_memory_gb < total_memory_gb / 2:
-                self.logger.info(f"GPU memory below half capacity: {allocated_memory_gb:.2f}GB / {total_memory_gb:.2f}GB")
-                break
-            
-            self.logger.info(f"Waiting for GPU memory to drop below half capacity: {allocated_memory_gb:.2f}GB / {total_memory_gb:.2f}GB")
-            time.sleep(2)
+        wake_response = self.vllm_client.wake_up()
+        if isinstance(wake_response, dict) and wake_response.get("error"):
+            raise RuntimeError(f"Failed to wake up VLLM server: {wake_response['error']}")
+
+        fill_response = self.vllm_client.fill_buffer()
+        if isinstance(fill_response, dict) and fill_response.get("error"):
+            self.logger.warning("VLLM buffer fill request returned error: %s", fill_response["error"])
+
+        # Ensure the queue has enough samples for at least one trainer batch before sleeping again.
+        min_buffer_items = max(1, min(self.batch_size, getattr(self.config, "buffer_size", self.batch_size)))
+        if not self.vllm_client.wait_for_buffer_ready(min_size=min_buffer_items, timeout=120.0, poll_interval=0.5):
+            self.logger.warning(
+                "Buffer did not reach %s ready items before sleep request; continuing with sleep",
+                min_buffer_items,
+            )
+
+        sleep_response = self.vllm_client.sleep(max_retries=40, retry_sleep_time=1, max_retry_sleep_time=4)
+        if not (isinstance(sleep_response, dict) and sleep_response.get("sleep", False)):
+            raise RuntimeError(f"Failed to put VLLM server to sleep: {sleep_response}")
+
+        if not self.vllm_client.wait_until_sleeping(timeout=120.0, poll_interval=0.5):
+            raise RuntimeError("VLLM server did not reach steady sleeping state before trainer reload")
+
+        if baseline_free_bytes is not None:
+            # vLLM should release most of the memory it used while awake.
+            target_free_bytes = int(baseline_free_bytes * 0.95)
+            if not self._wait_for_global_free_memory(
+                min_free_bytes=target_free_bytes,
+                timeout=120.0,
+                poll_interval=0.5,
+            ):
+                self.logger.warning(
+                    "Global free GPU memory did not recover to target %.2fGB before trainer reload",
+                    target_free_bytes / (1024**3),
+                )
             
         vllm_wake_time = time.perf_counter() - vllm_wake_start_time
         self.load_model_to_gpu()

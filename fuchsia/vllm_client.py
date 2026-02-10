@@ -394,6 +394,57 @@ class VLLMClient:
         logger.error(f"Failed to trigger buffer fill after {max_retries} attempts. Continuing anyway...")
         return {"buffer_fill": False, "error": "Max retries exceeded"}
 
+    def buffer_status(self):
+        """
+        Get VLLM buffer/sleep status.
+        Returns an empty dict when status is unavailable.
+        """
+        try:
+            return self._make_request("buffer_status", method="get", max_retries=2)
+        except Exception as e:
+            logger.warning(f"Failed to fetch buffer status: {e}")
+            return {}
+
+    def wait_for_buffer_ready(
+        self,
+        min_size: int = 1,
+        timeout: float = 120.0,
+        poll_interval: float = 0.5,
+    ) -> bool:
+        """
+        Wait until the rollout buffer has at least `min_size` items and is not actively filling.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = self.buffer_status()
+            if not status:
+                time.sleep(poll_interval)
+                continue
+            current_size = int(status.get("current_size", 0))
+            is_filling = bool(status.get("is_filling", False))
+            if current_size >= min_size and not is_filling:
+                return True
+            time.sleep(poll_interval)
+        return False
+
+    def wait_until_sleeping(self, timeout: float = 120.0, poll_interval: float = 0.5) -> bool:
+        """
+        Wait until server reports sleeping and no pending sleep/fill operations.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = self.buffer_status()
+            if not status:
+                time.sleep(poll_interval)
+                continue
+            is_sleeping = bool(status.get("is_sleeping", False))
+            sleep_requested = bool(status.get("sleep_requested", False))
+            is_filling = bool(status.get("is_filling", False))
+            if is_sleeping and not sleep_requested and not is_filling:
+                return True
+            time.sleep(poll_interval)
+        return False
+
     def sleep(self, max_retries=100, retry_sleep_time=2, max_retry_sleep_time=8):
         """
         Put the VLLM server to sleep with built-in fault tolerance.
@@ -403,6 +454,8 @@ class VLLMClient:
             try:
                 response = self._make_request("sleep", method="post", max_retries=2)
                 if response and response.get("sleep", False):
+                    if not self.wait_until_sleeping(timeout=60.0, poll_interval=0.5):
+                        logger.warning("Sleep acknowledged but server did not report steady sleeping state within timeout")
                     logger.info("VLLM client successfully put to sleep")
                     return response
                 else:
@@ -427,7 +480,6 @@ class VLLMClient:
         for attempt in range(max_retries):
             try:
                 res = self._make_request("wake_up", method="post", max_retries=2)
-                time.sleep(retry_wake_up_time)
                 logger.info("VLLM client successfully woken up")
                 return res
             except Exception as e:

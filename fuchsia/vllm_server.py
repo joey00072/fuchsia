@@ -429,18 +429,19 @@ class DataSamplerServer:
             """Puts the LLM engine to sleep, offloading weights to CPU and clearing KV cache."""
             try:
                 if self.is_data_sampler:
-                    # Check if generation is currently in progress without blocking
+                    # Signal sleep intent first so in-flight buffer fill can stop at the next safe point.
+                    self._sleep_requested = True
+                    # Check if generation is currently in progress without blocking.
                     generation_in_progress = not self._generation_lock.acquire(blocking=False)
                     if generation_in_progress:
                         logger.info("Generation in progress - cannot sleep now")
                         return {
                             "message": "Generation in progress - cannot sleep now", 
-                            "sleep": False
+                            "sleep": False,
+                            "sleep_requested": True,
                         }
                     
                     try:
-                        # Signal that sleep has been requested
-                        self._sleep_requested = True
                         logger.info("Sleep requested - proceeding with sleep...")
                         self._is_sleeping = True
                     finally:
@@ -478,6 +479,7 @@ class DataSamplerServer:
                 torch.randn(1).cuda()
                 await asyncio.sleep(1)
                 if self.is_data_sampler:
+                    self._sleep_requested = False
                     self._is_sleeping = False
                 return {"message": "LLM engine has been woken up successfully"}
             except Exception as e:
@@ -529,6 +531,7 @@ class DataSamplerServer:
                     "is_filling": self._is_filling,
                     "is_sleeping": getattr(self, '_is_sleeping', False),
                     "sleep_requested": getattr(self, '_sleep_requested', False),
+                    "generation_in_progress": self._generation_lock.locked(),
                     "epoch": self._epoch,
                 }
 
@@ -563,10 +566,10 @@ class DataSamplerServer:
             self._is_filling = True
             try:
                 while self._rollout_queue_size() < self.buffer_size:
-                    # Check if sleep was requested during buffer fill
-                    # if hasattr(self, '_sleep_requested') and self._sleep_requested:
-                    #     logger.info("Sleep requested during buffer fill - stopping buffer fill")
-                    #     break
+                    # Stop early if sleep was requested during buffer fill.
+                    if hasattr(self, '_sleep_requested') and self._sleep_requested:
+                        logger.info("Sleep requested during buffer fill - stopping buffer fill")
+                        break
                     
                     print(f"Buffer Size: {self._rollout_queue_size()}")
                         
