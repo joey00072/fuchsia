@@ -17,7 +17,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from fuchsia.config import FuchsiaConfig
 from fuchsia.cpu_offloading import apply_cpu_gradient_checkpoint_monkey_patch
-from fuchsia.dist_dataset import DatasetClient
+from fuchsia.dist_dataset import DatasetClient, PreparedRolloutBatchDataset
 from fuchsia.trainer import Trainer
 from fuchsia.vllm_client import VLLMClient
 
@@ -40,7 +40,7 @@ def run_training(config_path: str | Path) -> None:
     if trainer_config.single_gpu:
         vllm_client.sleep()
 
-    dataset = DatasetClient(
+    rollout_stream = DatasetClient(
         vllm_client,
         transfer_mode=trainer_config.sample_transfer_mode,
         queue_dir=trainer_config.sample_transfer_dir,
@@ -66,6 +66,16 @@ def run_training(config_path: str | Path) -> None:
     if enable_gradient_checkpointing:
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
+
+    dataset = PreparedRolloutBatchDataset(
+        source=rollout_stream,
+        tokenizer=tokenizer,
+        batch_size=trainer_config.batch_size,
+        device=trainer_config.device,
+        dtype=trainer_config.trainer_dtype,
+        debug=trainer_config.debug,
+        non_blocking=trainer_config.non_blocking,
+    )
 
     lora_config = LoraConfig(
         r=trainer_config.lora_r,

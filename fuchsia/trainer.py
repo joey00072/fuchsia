@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from torch import Tensor
+from torch.utils.data import DataLoader, IterableDataset
 from transformers import AutoModelForCausalLM, PreTrainedTokenizer, PreTrainedModel
 from transformers import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
 from fuchsia.vllm_client import VLLMClient
@@ -29,7 +30,7 @@ class Trainer:
         model: Union[str, PreTrainedModel],
         ref_model: Optional[PreTrainedModel],
         tokenizer: PreTrainedTokenizer,
-        dataset: Iterator[Dict[str, Any]],
+        dataset: Union[Iterator[Dict[str, Any]], IterableDataset],
         optimizer: Optional[torch.optim.Optimizer] = None,
         reward_functions: Optional[List[Callable]] = None,
         config: FuchsiaConfig = None,
@@ -61,7 +62,13 @@ class Trainer:
         self.ref_model = ref_model
         self.tokenizer = tokenizer
         self.dataset = dataset
-        self.data_loader_iter = iter(self.dataset)
+        if isinstance(dataset, IterableDataset):
+            # Dataset emits already-prepared trainer batches.
+            self.data_loader = DataLoader(dataset, batch_size=None)
+            self.data_loader_iter = iter(self.data_loader)
+        else:
+            self.data_loader = None
+            self.data_loader_iter = iter(self.dataset)
         if config.group_size <= 0:
             raise ValueError("group_size must be > 0")
         if config.batch_size <= 0:
@@ -529,217 +536,49 @@ class Trainer:
 
         return loss.mean(), avg_kld
 
-    def _get_pad_token_id(self) -> int:
-        if self.tokenizer.pad_token_id is not None:
-            return int(self.tokenizer.pad_token_id)
-        if self.tokenizer.eos_token_id is not None:
-            return int(self.tokenizer.eos_token_id)
-        return 0
-
-    def _build_batch_from_text(
-        self,
-        prompts: list[str],
-        completions: list[str],
-    ) -> Tuple[Tensor, Tensor, list[str], list[str]]:
-        pad_token_id = self._get_pad_token_id()
-        encoded_prompts = self.tokenizer(prompts, padding=True, return_tensors="pt")
-        prompt_input_ids = encoded_prompts["input_ids"]
-        prompt_attention_mask = encoded_prompts["attention_mask"]
-        prompt_lengths = prompt_attention_mask.sum(dim=1).tolist()
-        decoded_prompts = self.tokenizer.batch_decode(prompt_input_ids, skip_special_tokens=False)
-
-        full_text_outputs = [prompt + completion for prompt, completion in zip(decoded_prompts, completions)]
-        output_ids = self.tokenizer(
-            full_text_outputs, padding=True, padding_side="right", return_tensors="pt"
-        )["input_ids"]
-
-        loss_mask = torch.zeros(output_ids.shape, dtype=torch.bool)
-        for row_idx, prompt_len in enumerate(prompt_lengths):
-            seq_len = int((output_ids[row_idx] != pad_token_id).sum().item())
-            start = min(int(prompt_len), output_ids.shape[1])
-            if seq_len > start:
-                loss_mask[row_idx, start:seq_len] = True
-
-        decoded_outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=False)
-        return output_ids, loss_mask[:, 1:], decoded_prompts, decoded_outputs
-
-    def _build_batch_from_server_tokens(
-        self,
-        prompts: list[str],
-        completion_ids: list[list[int]],
-        completion_logprobs: list[list[float]],
-    ) -> Tuple[Tensor, Tensor, Tensor, list[str], list[str]]:
-        pad_token_id = self._get_pad_token_id()
-        encoded_prompts = self.tokenizer(prompts, padding=True, return_tensors="pt")
-        prompt_input_ids = encoded_prompts["input_ids"]
-        prompt_attention_mask = encoded_prompts["attention_mask"]
-        decoded_prompts = self.tokenizer.batch_decode(prompt_input_ids, skip_special_tokens=False)
-
-        prompt_token_lists = [
-            prompt_input_ids[idx][prompt_attention_mask[idx].bool()].tolist()
-            for idx in range(prompt_input_ids.shape[0])
-        ]
-        sequences = [
-            prompt_tokens + completion_token_ids
-            for prompt_tokens, completion_token_ids in zip(prompt_token_lists, completion_ids)
-        ]
-        max_seq_len = max(len(seq) for seq in sequences)
-        batch_size = len(sequences)
-
-        output_ids = torch.full((batch_size, max_seq_len), pad_token_id, dtype=torch.long)
-        loss_mask = torch.zeros((batch_size, max_seq_len), dtype=torch.bool)
-        old_policy_log_probs = torch.zeros((batch_size, max_seq_len - 1), dtype=torch.float32)
-
-        for row_idx, (prompt_tokens, completion_token_ids, completion_token_logprobs, seq) in enumerate(
-            zip(prompt_token_lists, completion_ids, completion_logprobs, sequences)
-        ):
-            seq_len = len(seq)
-            prompt_len = len(prompt_tokens)
-            completion_len = len(completion_token_ids)
-
-            if seq_len > 0:
-                output_ids[row_idx, :seq_len] = torch.tensor(seq, dtype=torch.long)
-            if completion_len > 0:
-                loss_mask[row_idx, prompt_len : prompt_len + completion_len] = True
-                start_idx = max(prompt_len - 1, 0)
-                old_policy_log_probs[row_idx, start_idx : start_idx + completion_len] = torch.tensor(
-                    completion_token_logprobs, dtype=torch.float32
-                )
-
-        decoded_outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=False)
-        return output_ids, loss_mask[:, 1:], old_policy_log_probs, decoded_prompts, decoded_outputs
-
-    def _build_batch_from_server_completion_ids(
-        self,
-        prompts: list[str],
-        completion_ids: list[list[int]],
-    ) -> Tuple[Tensor, Tensor, list[str], list[str]]:
-        pad_token_id = self._get_pad_token_id()
-        encoded_prompts = self.tokenizer(prompts, padding=True, return_tensors="pt")
-        prompt_input_ids = encoded_prompts["input_ids"]
-        prompt_attention_mask = encoded_prompts["attention_mask"]
-        decoded_prompts = self.tokenizer.batch_decode(prompt_input_ids, skip_special_tokens=False)
-
-        prompt_token_lists = [
-            prompt_input_ids[idx][prompt_attention_mask[idx].bool()].tolist()
-            for idx in range(prompt_input_ids.shape[0])
-        ]
-        sequences = [
-            prompt_tokens + completion_token_ids
-            for prompt_tokens, completion_token_ids in zip(prompt_token_lists, completion_ids)
-        ]
-        max_seq_len = max(len(seq) for seq in sequences)
-        batch_size = len(sequences)
-
-        output_ids = torch.full((batch_size, max_seq_len), pad_token_id, dtype=torch.long)
-        loss_mask = torch.zeros((batch_size, max_seq_len), dtype=torch.bool)
-
-        for row_idx, (prompt_tokens, completion_token_ids, seq) in enumerate(
-            zip(prompt_token_lists, completion_ids, sequences)
-        ):
-            seq_len = len(seq)
-            prompt_len = len(prompt_tokens)
-            completion_len = len(completion_token_ids)
-            if seq_len > 0:
-                output_ids[row_idx, :seq_len] = torch.tensor(seq, dtype=torch.long)
-            if completion_len > 0:
-                loss_mask[row_idx, prompt_len : prompt_len + completion_len] = True
-
-        decoded_outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=False)
-        return output_ids, loss_mask[:, 1:], decoded_prompts, decoded_outputs
-
-    def _can_use_server_logprobs(
-        self,
-        completions: list[str],
-        completion_ids: list[list[int]],
-        completion_logprobs: list[list[float] | None],
-    ) -> bool:
-        for completion_text, completion_token_ids, completion_token_logprobs in zip(
-            completions, completion_ids, completion_logprobs
-        ):
-            if not isinstance(completion_token_ids, list):
-                return False
-            if not isinstance(completion_token_logprobs, list):
-                return False
-            if len(completion_token_ids) != len(completion_token_logprobs):
-                return False
-            text_token_ids = self.tokenizer(completion_text, add_special_tokens=False)["input_ids"]
-            if text_token_ids != completion_token_ids:
-                return False
-        return True
-
     def sample_batch(self) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, dict]:
-        while True:
-            inputs_texts = []
-            completions = []
-            completion_ids = []
-            completion_logprobs = []
-            rewards = []
-            mean_rewards = []
-            std_rewards = []
-            ignore_sample = []
-            for _ in range(self.batch_size):
-                item = next(self.data_loader_iter)
-                
-                rewards.append(item["rewards"])
-                mean_rewards.append(item["mean"])
-                std_rewards.append(item["std"])
-                group_size = len(item["completions"])
-                
-                for idx in range(len(item["completions"])):
-                    prompt = item["inputs"]
-                    inputs_texts.append(prompt)
-                    completions.append(item["completions"][idx])
-                    completion_ids.append(item["completion_ids"][idx])
-                    item_completion_logprobs = item.get("completion_logprobs")
-                    sample_completion_logprobs = None
-                    if isinstance(item_completion_logprobs, list) and idx < len(item_completion_logprobs):
-                        sample_completion_logprobs = item_completion_logprobs[idx]
-                    completion_logprobs.append(sample_completion_logprobs)
-                    ignore_sample.append(item["finish_reason"][idx] != "length")
-            
-            if any(len(r) != group_size for r in rewards):
-                continue
-            break
-
-        use_server_logprobs = self._can_use_server_logprobs(completions, completion_ids, completion_logprobs)
-        server_old_policy_log_probs = None
-        if use_server_logprobs:
-            outputs, shifted_loss_mask, server_old_policy_log_probs, decoded, decoded_outputs = (
-                self._build_batch_from_server_tokens(inputs_texts, completion_ids, completion_logprobs)
-            )
-        else:
-            outputs, shifted_loss_mask, decoded, decoded_outputs = self._build_batch_from_server_completion_ids(
-                inputs_texts, completion_ids
+        prepared = next(self.data_loader_iter)
+        if not isinstance(prepared, dict):
+            raise RuntimeError(
+                f"Prepared dataset must yield dict batches, got {type(prepared)}"
             )
 
-        self.metrics["samples"].append({"prompt": decoded, "completions": completions})
-        
-        avg_token_lengths = 0
-        for completion in completions:
-            avg_token_lengths += len(self.tokenizer.encode(completion))
-        avg_token_lengths /= len(completions)
-        
-        self.metrics["avg_token_lengths"].append(avg_token_lengths)
-        
-        if self.config.debug:   
-            print("\n\n\n")
-            print("-" * 10)
-            print(decoded_outputs[0].replace("<|endoftext|>", "").replace("<|finetune_right_pad_id|>", "").replace("<|end_of_text|>", ""))
-            print("-" * 10)
-            print("\n\n\n")
+        metrics = prepared.get("metrics", {})
+        if isinstance(metrics, dict):
+            prompts = metrics.get("prompt")
+            completions = metrics.get("completions")
+            if prompts is not None and completions is not None:
+                self.metrics["samples"].append({"prompt": prompts, "completions": completions})
+            avg_token_lengths = metrics.get("avg_token_lengths")
+            if avg_token_lengths is not None:
+                self.metrics["avg_token_lengths"].append(avg_token_lengths)
+
+            if self.config.debug:
+                decoded_outputs = metrics.get("decoded_outputs") or []
+                if decoded_outputs:
+                    print("\n\n\n")
+                    print("-" * 10)
+                    print(
+                        decoded_outputs[0]
+                        .replace("<|endoftext|>", "")
+                        .replace("<|finetune_right_pad_id|>", "")
+                        .replace("<|end_of_text|>", "")
+                    )
+                    print("-" * 10)
+                    print("\n\n\n")
+
+        server_info = prepared.get("server_info", {})
+        if not isinstance(server_info, dict):
+            server_info = {}
 
         return (
-            outputs,
-            torch.tensor(rewards, dtype=self.dtype).float(),
-            torch.tensor(mean_rewards, dtype=self.dtype).float(),
-            torch.tensor(std_rewards, dtype=self.dtype).float(),
-            shifted_loss_mask,
-            torch.tensor(ignore_sample, dtype=torch.bool).to(torch.int8),
-            {
-                "group_size": group_size,
-                "old_policy_log_probs": server_old_policy_log_probs,
-            }
+            prepared["outputs"],
+            prepared["rewards"],
+            prepared["mean_rewards"],
+            prepared["std_rewards"],
+            prepared["loss_mask"],
+            prepared["ignore_sample"],
+            server_info,
         )
 
     def log_metrics(self) -> None:
@@ -866,8 +705,8 @@ class Trainer:
             for group_inputs in batch_inputs:
                 group_log_probs: list[Tensor] = []
                 for start, end in self._iter_micro_ranges(group_inputs.shape[0], micro_batch_size):
-                    micro_inputs = group_inputs[start:end].to(self.device)
-                    micro_log_probs = self.get_per_token_logps(self.model, micro_inputs).cpu()
+                    micro_inputs = group_inputs[start:end]
+                    micro_log_probs = self.get_per_token_logps(self.model, micro_inputs)
                     group_log_probs.append(micro_log_probs)
                 pi_old.append(torch.cat(group_log_probs, dim=0))
         if torch.cuda.is_available():
@@ -905,13 +744,13 @@ class Trainer:
         num_micro_steps = len(micro_ranges)
 
         for start, end in micro_ranges:
-            inputs = b_inputs[start:end].to(self.device)
-            old_policy_log_probs = b_old_policy_log_probs[start:end].to(self.device)
-            reward_batch = b_reward[start:end].to(self.device)
-            loss_mask_batch = b_loss_mask[start:end].to(self.device)
-            ignore_sample_batch = b_ignore_sample[start:end].unsqueeze(-1).to(self.device)
-            mean_rewards = b_mean_rewards[start:end].to(self.device)
-            std_rewards = b_std_rewards[start:end].to(self.device)
+            inputs = b_inputs[start:end]
+            old_policy_log_probs = b_old_policy_log_probs[start:end]
+            reward_batch = b_reward[start:end]
+            loss_mask_batch = b_loss_mask[start:end]
+            ignore_sample_batch = b_ignore_sample[start:end].unsqueeze(-1)
+            mean_rewards = b_mean_rewards[start:end]
+            std_rewards = b_std_rewards[start:end]
 
             loss, kld = self.compute_loss(
                 inputs,
@@ -977,20 +816,19 @@ class Trainer:
 
             batch_inputs = x_batch_inputs.reshape(
                 self.batch_size, group_size, *x_batch_inputs.shape[1:]
-            ).cpu()
+            )
             loss_mask = loss_mask.reshape(
                 self.batch_size, group_size, *loss_mask.shape[1:]
-            ).cpu()
+            )
             ignore_samples = ignore_samples.reshape(
                 self.batch_size, group_size
-            ).cpu()
-            x_rewards = x_rewards.cpu()
+            )
             old_policy_log_probs = server_info.get("old_policy_log_probs")
             if old_policy_log_probs is not None:
                 pi_old = list(
                     old_policy_log_probs.reshape(
                         self.batch_size, group_size, *old_policy_log_probs.shape[1:]
-                    ).cpu()
+                    )
                 )
             else:
                 pi_old = self._compute_old_policy_log_probs(batch_inputs, micro_batch_size)
