@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, List
 
@@ -53,7 +54,9 @@ class FuchsiaConfig:
 
     # Trainer settings
     batch_size: int = 1
-    grad_accumulation_steps: int = 1
+    # Deprecated alias for micro_batch_size; kept for backward compatibility with old YAMLs.
+    grad_accumulation_steps: Optional[int] = None
+    micro_batch_size: Optional[int] = None
     max_iterations: int = 1000000
     log_wandb: bool = False
     lr: float = 5e-6
@@ -75,6 +78,7 @@ class FuchsiaConfig:
     scheduler_type: str = "constant_with_warmup"
     gradient_checkpointing_enabled: bool = False
     gradient_checkpointing_cpu_offloading: bool = False
+    gradient_checkpointing_mode: str = "activation"
     max_new_tokens: int = 512
     temperature: float = 0.9
     repetition_penalty: float = 1.1
@@ -85,6 +89,7 @@ class FuchsiaConfig:
     save_every: int = 25
     async_buffer_fill: bool = True
     debug: bool = True
+    debug_log_dir: str = "debug_logs"
     single_gpu: bool = False
     non_blocking: bool = False
     loss_type: str = "grpo"
@@ -97,6 +102,7 @@ class FuchsiaConfig:
     importance_geo_mask_low: float = 0.1
     importance_sequence_mask_low: float = 0.0
     importance_sequence_mask_high: float = 100.0
+    output_dir: str = "output"
     device: Optional[str] = None
 
     logger: logging.Logger = field(init=False, repr=False)
@@ -164,6 +170,43 @@ class FuchsiaConfig:
         self.sample_transfer_mode = normalize_rollout_transfer_mode(self.sample_transfer_mode)
         if self.sample_transfer_poll_interval <= 0:
             raise ValueError("sample_transfer_poll_interval must be > 0")
+        if self.grad_accumulation_steps is not None and self.grad_accumulation_steps <= 0:
+            raise ValueError("grad_accumulation_steps must be > 0 when provided")
+        if self.micro_batch_size is not None and self.micro_batch_size <= 0:
+            raise ValueError("micro_batch_size must be > 0 when provided")
+        if self.micro_batch_size is not None and self.grad_accumulation_steps is not None:
+            raise ValueError(
+                "Ambiguous trainer batch config: set only `trainer.micro_batch_size` (preferred) "
+                "or only legacy `trainer.grad_accumulation_steps`."
+            )
+        # Canonicalize checkpointing mode. Keep cpu_offloading as a legacy alias.
+        mode = str(self.gradient_checkpointing_mode).lower()
+        if mode == "activation" and self.gradient_checkpointing_cpu_offloading:
+            mode = "activation_offload"
+        mode_aliases = {
+            "offload": "activation_offload",
+            "cpu_offload": "activation_offload",
+            "cpu_offloading": "activation_offload",
+            "unsloth": "activation_offload",
+        }
+        mode = mode_aliases.get(mode, mode)
+        allowed_modes = {"activation", "activation_offload"}
+        if mode not in allowed_modes:
+            raise ValueError(
+                "Unsupported gradient_checkpointing.mode: "
+                f"{self.gradient_checkpointing_mode}. "
+                f"Supported values: {sorted(allowed_modes)}"
+            )
+        self.gradient_checkpointing_mode = mode
+        self.gradient_checkpointing_cpu_offloading = (
+            self.gradient_checkpointing_mode == "activation_offload"
+        )
+        if not self.debug_log_dir:
+            self.debug_log_dir = "debug_logs"
+        # Resolve relative debug log path under output_dir for predictable run artifacts.
+        debug_path = Path(self.debug_log_dir)
+        if not debug_path.is_absolute():
+            self.debug_log_dir = str(Path(self.output_dir) / debug_path)
 
         logging.basicConfig(level=getattr(logging, self.log_level.upper(), logging.INFO))
         self.logger = logging.getLogger("Trainer")
@@ -216,6 +259,8 @@ class FuchsiaConfig:
         lora = config.get("lora", {})
 
         gradient_checkpointing = trainer.get("gradient_checkpointing", {})
+        if isinstance(gradient_checkpointing, bool):
+            gradient_checkpointing = {"enabled": gradient_checkpointing}
         importance = trainer.get("importance_sampling", {})
 
         def pick(*values, default=None):
@@ -250,6 +295,21 @@ class FuchsiaConfig:
 
         model_name = model.get("name", "")
         model_revision = model.get("revision")
+
+        # Normalize legacy grad_accumulation_steps into micro_batch_size so trainer logic has one knob.
+        grad_accumulation_steps = trainer.get("grad_accumulation_steps")
+        micro_batch_size = trainer.get("micro_batch_size")
+        if micro_batch_size is None and grad_accumulation_steps is not None:
+            grad_steps = int(grad_accumulation_steps)
+            micro_batch_size = max(1, (rollout_group_size + grad_steps - 1) // grad_steps)
+            grad_accumulation_steps = None
+
+        gc_cpu_offloading = bool(gradient_checkpointing.get("cpu_offloading", False))
+        gc_mode_raw = gradient_checkpointing.get("mode")
+        if gc_mode_raw is None:
+            gc_mode = "activation_offload" if gc_cpu_offloading else "activation"
+        else:
+            gc_mode = str(gc_mode_raw).lower()
 
         return cls(
             model=model_name,
@@ -320,7 +380,8 @@ class FuchsiaConfig:
             loss_type=trainer.get("loss_type", "grpo"),
             group_size=rollout_group_size,
             batch_size=trainer.get("batch_size", 1),
-            grad_accumulation_steps=trainer.get("grad_accumulation_steps", 1),
+            grad_accumulation_steps=grad_accumulation_steps,
+            micro_batch_size=micro_batch_size,
             lr=float(trainer.get("lr", 5e-6)),
             weight_decay=float(trainer.get("weight_decay", 0.0)),
             beta=float(trainer.get("beta", 0.0)),
@@ -377,9 +438,8 @@ class FuchsiaConfig:
             warmup_steps=trainer.get("warmup_steps", 8),
             scheduler_type=trainer.get("scheduler_type", "constant_with_warmup"),
             gradient_checkpointing_enabled=gradient_checkpointing.get("enabled", False),
-            gradient_checkpointing_cpu_offloading=gradient_checkpointing.get(
-                "cpu_offloading", False
-            ),
+            gradient_checkpointing_cpu_offloading=gc_cpu_offloading,
+            gradient_checkpointing_mode=gc_mode,
             max_new_tokens=int(pick(generation.get("max_len"), shared_max_tokens, vllm.get("max_tokens"), default=512)),
             temperature=float(pick(generation.get("temperature"), shared_temperature, vllm.get("temperature"), default=0.9)),
             repetition_penalty=float(
@@ -390,6 +450,13 @@ class FuchsiaConfig:
             min_p=float(pick(generation.get("min_p"), shared_min_p, vllm.get("min_p"), default=0.0)),
             max_iterations=training.get("max_iterations", default_max_iterations),
             save_every=training.get("save_steps", 25),
+            output_dir=training.get("output_dir", "output"),
+            debug=bool(trainer.get("debug", True)),
+            debug_log_dir=str(trainer.get("debug_log_dir", "debug_logs")),
+            log_level=trainer.get("log_level", "INFO"),
+            async_buffer_fill=bool(trainer.get("async_buffer_fill", True)),
+            non_blocking=bool(trainer.get("non_blocking", False)),
+            device=trainer.get("device"),
             using_lora=lora.get("enabled", False),
             lora_r=lora.get("r", 8),
             lora_alpha=lora.get("alpha", 16),

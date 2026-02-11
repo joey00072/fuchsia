@@ -2,9 +2,10 @@ import contextlib
 import datetime
 import gc
 import logging
-import math
+import os
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Callable, List, Optional, Union, Dict, Any, Tuple, Iterator
 
 import torch
@@ -40,6 +41,10 @@ class Trainer:
         self.logger = getattr(config, "logger", logging.getLogger("Trainer"))
         self.device = config.device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.logger.info(f"Using device: {self.device}")
+        self.debug_enabled = bool(getattr(config, "debug", False))
+        self.debug_logger: logging.Logger | None = None
+        self.debug_log_path: str | None = None
+        self._setup_debug_logger()
         
         self.vllm_client = vllm_client if vllm_client is not None else VLLMClient()
 
@@ -73,12 +78,11 @@ class Trainer:
             raise ValueError("group_size must be > 0")
         if config.batch_size <= 0:
             raise ValueError("batch_size must be > 0")
-        if config.grad_accumulation_steps <= 0:
-            raise ValueError("grad_accumulation_steps must be > 0")
-
         self.group_size = int(config.group_size)
         self.batch_size = int(config.batch_size)
-        self.grad_accumulation_steps = int(config.grad_accumulation_steps)
+        self.micro_batch_size_override = (
+            int(config.micro_batch_size) if getattr(config, "micro_batch_size", None) is not None else None
+        )
         self.max_iterations = config.max_iterations
         self.dtype = config.trainer_dtype
         self.beta = config.beta
@@ -121,20 +125,92 @@ class Trainer:
         
         if self.using_lora and self.beta > 0:
             self.ref_model = model
+        
+        self.model.to(self.dtype)
+        if self.beta > 0 and ref_model is not None:
+            self.ref_model = self.model
+        
+        # Set up proper memory management
+        self._setup_memory_management()
 
         self.log_wandb = config.log_wandb
         if self.log_wandb:
             wandb.init(project=config.wandb_project)
 
         self.metrics = defaultdict(list)
-        
-        self.model.to(self.dtype)
-        if self.beta > 0 and ref_model is not None:
-            self.ref_model = self.model
 
+        self._debug_log(
+            "trainer_init model=%s device=%s batch_size=%s group_size=%s micro_batch_size=%s "
+            "single_gpu=%s output_dir=%s",
+            self.model_name,
+            self.device,
+            self.batch_size,
+            self.group_size,
+            self.micro_batch_size_override,
+            self.single_gpu,
+            getattr(self.config, "output_dir", "output"),
+        )
+        self._debug_gpu_memory("trainer_init")
 
-        # Set up proper memory management
-        self._setup_memory_management()
+    def _setup_debug_logger(self) -> None:
+        if not self.debug_enabled:
+            return
+        try:
+            base_dir = Path(getattr(self.config, "debug_log_dir", "debug_logs"))
+            base_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            unique = f"{timestamp}_{os.getpid()}_{id(self) & 0xFFFF:04x}"
+            log_path = base_dir / f"trainer_debug_{unique}.log"
+
+            logger_name = f"TrainerDebug.{os.getpid()}.{id(self)}"
+            self.debug_logger = logging.getLogger(logger_name)
+            self.debug_logger.setLevel(logging.DEBUG)
+            self.debug_logger.propagate = False
+            self.debug_logger.handlers.clear()
+
+            handler = logging.FileHandler(log_path, encoding="utf-8")
+            handler.setLevel(logging.DEBUG)
+            formatter = logging.Formatter(
+                "%(asctime)s | %(levelname)s | %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+            handler.setFormatter(formatter)
+            self.debug_logger.addHandler(handler)
+            self.debug_log_path = str(log_path)
+            self.logger.info("Debug diagnostics log: %s", self.debug_log_path)
+        except Exception as exc:
+            self.logger.warning("Failed to initialize debug logger: %s", exc)
+            self.debug_logger = None
+            self.debug_log_path = None
+
+    def _debug_log(self, message: str, *args: Any) -> None:
+        if self.debug_logger is not None:
+            self.debug_logger.debug(message, *args)
+
+    def _debug_gpu_memory(self, tag: str, **fields: Any) -> None:
+        if not self.debug_enabled:
+            return
+        if not torch.cuda.is_available():
+            self._debug_log("gpu_memory tag=%s cuda_available=false", tag)
+            return
+        alloc_gb = torch.cuda.memory_allocated() / (1024**3)
+        reserved_gb = torch.cuda.memory_reserved() / (1024**3)
+        max_alloc_gb = torch.cuda.max_memory_allocated() / (1024**3)
+        max_reserved_gb = torch.cuda.max_memory_reserved() / (1024**3)
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        payload = " ".join(f"{k}={v}" for k, v in fields.items())
+        self._debug_log(
+            "gpu_memory tag=%s alloc_gb=%.3f reserved_gb=%.3f max_alloc_gb=%.3f "
+            "max_reserved_gb=%.3f free_gb=%.3f total_gb=%.3f %s",
+            tag,
+            alloc_gb,
+            reserved_gb,
+            max_alloc_gb,
+            max_reserved_gb,
+            free_bytes / (1024**3),
+            total_bytes / (1024**3),
+            payload,
+        )
 
     def _setup_memory_management(self) -> None:
         """Setup CUDA memory management for optimal performance."""
@@ -356,7 +432,7 @@ class Trainer:
         logits: Tensor,                 # (B, T, V)
         labels: Tensor,                 # (B, T)
         *,
-        chunk_size: int = 128,          # 0 ⇒ disable chunking
+        chunk_size: int = 32,           # 0 ⇒ disable chunking
         ignore_index: int = -100,
     ) -> Tensor:
         """
@@ -368,39 +444,39 @@ class Trainer:
         """
 
         B, T, V = logits.shape
-        logits = logits.reshape(-1, V)          # (B·T, V)
-        labels = labels.reshape(-1, 1)          # (B·T, 1)
-
-        # ---- no chunking --------------------------------------------------------
+        # Keep the original 3D layout. Flatten+reshape can materialize a full copy when
+        # logits are non-contiguous (common with fused attention kernels), causing large spikes.
         if chunk_size == 0:
-            logps    = F.log_softmax(logits, dim=-1)
-            picked   = logps.gather(-1, labels.clamp_min(0)).squeeze(-1)
-            picked   = torch.where(labels.squeeze(-1) == ignore_index,
-                                torch.zeros_like(picked),
-                                picked)
-            return picked.view(B, T)
+            safe_labels = labels.clamp_min(0).unsqueeze(-1)
+            picked = logits.gather(-1, safe_labels).squeeze(-1) - torch.logsumexp(logits, dim=-1)
+            return torch.where(labels == ignore_index, torch.zeros_like(picked), picked)
 
-        # ---- chunked path -------------------------------------------------------
         out: list[Tensor] = []
-        for logits_chunk, labels_chunk in zip(
-                logits.split(chunk_size),
-                labels.split(chunk_size)
-        ):
-            logps_chunk  = F.log_softmax(logits_chunk, dim=-1)
-            picked_chunk = logps_chunk.gather(-1, labels_chunk.clamp_min(0)).squeeze(-1)
-            picked_chunk = torch.where(labels_chunk.squeeze(-1) == ignore_index,
-                                    torch.zeros_like(picked_chunk),
-                                    picked_chunk)
+        rows_per_step = max(int(chunk_size), 1)
+        tokens_per_step = max(1, rows_per_step // max(B, 1))
+        for token_start in range(0, T, tokens_per_step):
+            token_end = min(token_start + tokens_per_step, T)
+            logits_chunk = logits[:, token_start:token_end, :]
+            labels_chunk = labels[:, token_start:token_end]
+            safe_labels = labels_chunk.clamp_min(0).unsqueeze(-1)
+            picked_chunk = logits_chunk.gather(-1, safe_labels).squeeze(-1) - torch.logsumexp(
+                logits_chunk, dim=-1
+            )
+            picked_chunk = torch.where(
+                labels_chunk == ignore_index,
+                torch.zeros_like(picked_chunk),
+                picked_chunk,
+            )
             out.append(picked_chunk)
 
-        return torch.cat(out).view(B, T)
+        return torch.cat(out, dim=1)
 
     def get_per_token_logps(
         self,
         model,
         input_ids: Tensor,
         *,
-        chunk_size: int = 128,
+        chunk_size: int = 32,
         training: bool = False,
     ) -> Tensor:
         """
@@ -616,11 +692,24 @@ class Trainer:
         """Perform VLLM hotswap cycle without fixed sleeps by polling explicit server/global memory state."""
         vllm_cycle_start_time = time.perf_counter()
         self.logger.info("Starting VLLM hotswap cycle...")
+        self._debug_gpu_memory("hotswap_start")
+        pre_status = self.vllm_client.buffer_status()
+        self._debug_log("hotswap_status phase=start status=%s", pre_status)
 
         trainer_alloc_before = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
         trainer_reserved_before = torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
+        pre_offload_free_bytes = None
+        total_bytes = None
+        if torch.cuda.is_available():
+            pre_offload_free_bytes, total_bytes = torch.cuda.mem_get_info()
+            self.logger.info(
+                "Global free GPU memory before trainer offload: %.2fGB / %.2fGB",
+                pre_offload_free_bytes / (1024**3),
+                total_bytes / (1024**3),
+            )
 
         self.offload_to_cpu()
+        self._debug_gpu_memory("after_offload_to_cpu")
         if torch.cuda.is_available():
             if not self._wait_for_trainer_memory_release(
                 baseline_allocated_bytes=trainer_alloc_before,
@@ -634,6 +723,25 @@ class Trainer:
 
         baseline_free_bytes = None
         if torch.cuda.is_available():
+            if pre_offload_free_bytes is not None and total_bytes is not None:
+                expected_recovery_bytes = max(
+                    int(trainer_alloc_before * 0.70),
+                    256 * 1024 * 1024,
+                )
+                min_free_before_wake = min(
+                    pre_offload_free_bytes + expected_recovery_bytes,
+                    int(total_bytes * 0.97),
+                )
+                min_free_before_wake = max(min_free_before_wake, pre_offload_free_bytes)
+                if not self._wait_for_global_free_memory(
+                    min_free_bytes=min_free_before_wake,
+                    timeout=90.0,
+                    poll_interval=0.25,
+                ):
+                    raise RuntimeError(
+                        "Global free GPU memory did not recover enough after trainer offload; "
+                        "aborting wake-up to avoid overlapping allocations"
+                    )
             baseline_free_bytes, total_bytes = torch.cuda.mem_get_info()
             self.logger.info(
                 "Baseline global free GPU memory after trainer offload: %.2fGB / %.2fGB",
@@ -645,25 +753,78 @@ class Trainer:
         wake_response = self.vllm_client.wake_up()
         if isinstance(wake_response, dict) and wake_response.get("error"):
             raise RuntimeError(f"Failed to wake up VLLM server: {wake_response['error']}")
-
-        fill_response = self.vllm_client.fill_buffer()
-        if isinstance(fill_response, dict) and fill_response.get("error"):
-            self.logger.warning("VLLM buffer fill request returned error: %s", fill_response["error"])
+        if not self.vllm_client.wait_until_awake(timeout=120.0, poll_interval=1.0):
+            raise RuntimeError("VLLM server did not reach steady awake state before buffer fill")
+        self._debug_log("hotswap_status phase=awake status=%s", self.vllm_client.buffer_status())
+        self._debug_gpu_memory("after_wake")
 
         # Ensure the queue has enough samples for at least one trainer batch before sleeping again.
         min_buffer_items = max(1, min(self.batch_size, getattr(self.config, "buffer_size", self.batch_size)))
-        if not self.vllm_client.wait_for_buffer_ready(min_size=min_buffer_items, timeout=120.0, poll_interval=0.5):
+        buffer_ready = False
+        fill_attempts = 3
+        for attempt in range(1, fill_attempts + 1):
+            pre_status = self.vllm_client.buffer_status()
+            already_filling = False
+            if isinstance(pre_status, dict):
+                already_filling = bool(
+                    pre_status.get("is_filling", False)
+                    or pre_status.get("fill_slot_claimed", False)
+                )
+            assume_filling = already_filling
+            if not already_filling:
+                fill_response = self.vllm_client.fill_buffer()
+                if isinstance(fill_response, dict) and fill_response.get("error"):
+                    self.logger.warning(
+                        "VLLM buffer fill request returned error on attempt %s/%s: %s",
+                        attempt,
+                        fill_attempts,
+                        fill_response["error"],
+                    )
+                elif isinstance(fill_response, dict):
+                    response_message = str(fill_response.get("message", "")).lower()
+                    if "start" in response_message or "progress" in response_message:
+                        assume_filling = True
+            else:
+                self.logger.info(
+                    "Buffer fill already in progress before attempt %s/%s (status=%s)",
+                    attempt,
+                    fill_attempts,
+                    pre_status,
+                )
+
+            wait_timeout = 180.0 if attempt == 1 else 120.0
+            if self.vllm_client.wait_for_buffer_ready(
+                min_size=min_buffer_items,
+                timeout=wait_timeout,
+                poll_interval=1.0,
+                filling_grace_timeout=900.0,
+                assume_filling=assume_filling,
+            ):
+                buffer_ready = True
+                break
+            status = self.vllm_client.buffer_status()
             self.logger.warning(
-                "Buffer did not reach %s ready items before sleep request; continuing with sleep",
-                min_buffer_items,
+                "Buffer not ready after fill attempt %s/%s (status=%s)",
+                attempt,
+                fill_attempts,
+                status,
             )
+
+        if not buffer_ready:
+            raise RuntimeError(
+                f"Buffer failed to reach ready state (min_size={min_buffer_items}) before sleep; "
+                "aborting hotswap cycle to avoid trainer stall"
+            )
+        self._debug_log("hotswap_status phase=buffer_ready status=%s", self.vllm_client.buffer_status())
 
         sleep_response = self.vllm_client.sleep(max_retries=40, retry_sleep_time=1, max_retry_sleep_time=4)
         if not (isinstance(sleep_response, dict) and sleep_response.get("sleep", False)):
             raise RuntimeError(f"Failed to put VLLM server to sleep: {sleep_response}")
 
-        if not self.vllm_client.wait_until_sleeping(timeout=120.0, poll_interval=0.5):
+        if not self.vllm_client.wait_until_sleeping(timeout=120.0, poll_interval=1.0):
             raise RuntimeError("VLLM server did not reach steady sleeping state before trainer reload")
+        self._debug_log("hotswap_status phase=sleeping status=%s", self.vllm_client.buffer_status())
+        self._debug_gpu_memory("after_sleep")
 
         if baseline_free_bytes is not None:
             # vLLM should release most of the memory it used while awake.
@@ -673,20 +834,41 @@ class Trainer:
                 timeout=120.0,
                 poll_interval=0.5,
             ):
-                self.logger.warning(
-                    "Global free GPU memory did not recover to target %.2fGB before trainer reload",
-                    target_free_bytes / (1024**3),
+                raise RuntimeError(
+                    "Global free GPU memory did not recover to target "
+                    f"{target_free_bytes / (1024**3):.2f}GB before trainer reload"
                 )
             
         vllm_wake_time = time.perf_counter() - vllm_wake_start_time
         self.load_model_to_gpu()
+        self._debug_gpu_memory("after_model_reload")
         total_vllm_cycle_time = time.perf_counter() - vllm_cycle_start_time
         self.logger.info(f"VLLM hotswap cycle completed in {total_vllm_cycle_time:.2f}s (VLLM wake/fill/sleep: {vllm_wake_time:.2f}s)")
+        self._debug_log(
+            "hotswap_timing total_seconds=%.3f wake_fill_sleep_seconds=%.3f",
+            total_vllm_cycle_time,
+            vllm_wake_time,
+        )
 
     def _resolve_group_micro_batch_size(self, group_size: int) -> int:
         if group_size <= 0:
             raise ValueError(f"group_size must be > 0, got {group_size}")
-        return max(1, math.ceil(group_size / self.grad_accumulation_steps))
+        if self.micro_batch_size_override is not None:
+            resolved = min(group_size, self.micro_batch_size_override)
+            self._debug_log(
+                "microbatch_resolve source=config group_size=%s configured=%s resolved=%s",
+                group_size,
+                self.micro_batch_size_override,
+                resolved,
+            )
+            return resolved
+        self._debug_log(
+            "microbatch_resolve source=default group_size=%s resolved=%s",
+            group_size,
+            group_size,
+        )
+        # Default: process full rollout group as one microbatch when override is not set.
+        return group_size
 
     @staticmethod
     def _iter_micro_ranges(num_rows: int, micro_batch_size: int):
@@ -736,6 +918,21 @@ class Trainer:
         micro_ranges = list(self._iter_micro_ranges(b_inputs.shape[0], micro_batch_size))
         if not micro_ranges:
             raise RuntimeError("No microbatches produced for group training step")
+        microbatch_share = micro_batch_size / max(int(b_inputs.shape[0]), 1)
+        self._debug_log(
+            "group_step rows=%s micro_batch_size=%s micro_steps=%s microbatch_share=%.4f seq_len=%s",
+            b_inputs.shape[0],
+            micro_batch_size,
+            len(micro_ranges),
+            microbatch_share,
+            b_inputs.shape[1] if b_inputs.ndim >= 2 else -1,
+        )
+        self._debug_gpu_memory(
+            "group_step_start",
+            rows=b_inputs.shape[0],
+            micro_batch_size=micro_batch_size,
+            micro_steps=len(micro_ranges),
+        )
 
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -768,6 +965,7 @@ class Trainer:
 
         self.optimizer.step()
         self._step_scheduler()
+        self._debug_gpu_memory("group_step_end")
 
         avg_loss = sum(group_losses) / len(group_losses)
         avg_kld = sum(group_klds) / len(group_klds)
@@ -799,6 +997,25 @@ class Trainer:
             ) = self.sample_batch()
             group_size = server_info["group_size"]
             micro_batch_size = self._resolve_group_micro_batch_size(group_size)
+            microbatch_share = micro_batch_size / max(group_size, 1)
+            self._debug_log(
+                "train_batch idx=%s group_size=%s micro_batch_size=%s microbatch_share=%.4f "
+                "rows=%s seq_len=%s loss_mask_tokens=%s",
+                idx,
+                group_size,
+                micro_batch_size,
+                microbatch_share,
+                x_batch_inputs.shape[0],
+                x_batch_inputs.shape[1] if x_batch_inputs.ndim >= 2 else -1,
+                int(loss_mask.sum().item()) if torch.is_tensor(loss_mask) else -1,
+            )
+            self._debug_gpu_memory(
+                "train_batch_loaded",
+                idx=idx,
+                group_size=group_size,
+                micro_batch_size=micro_batch_size,
+                microbatch_share=f"{microbatch_share:.4f}",
+            )
 
             expected_rows = self.batch_size * group_size
             if x_batch_inputs.shape[0] != expected_rows:

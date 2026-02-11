@@ -220,7 +220,7 @@ class DataSamplerServer:
         # Data sampler specific initialization
         self.dataset = dataset
         self.is_data_sampler = dataset is not None
-        self._lora_idx = 1
+        self._lora_request_id = 1
         
         self.environment = environment or SingleTurnEnvironment(reward_functions=reward_functions)
         
@@ -229,6 +229,10 @@ class DataSamplerServer:
             self.dataset_field = config.dataset_field
             self.reward_functions = reward_functions or []
             self.buffer_size = config.buffer_size
+            if config.generation_batch_size <= 0:
+                raise ValueError(
+                    f"generation_batch_size must be > 0, got {config.generation_batch_size}"
+                )
             self.rollout_queue = create_rollout_queue(
                 mode=config.sample_transfer_mode,
                 queue_dir=config.sample_transfer_dir,
@@ -259,9 +263,16 @@ class DataSamplerServer:
             self.enable_lora = config.enable_lora
             self.lora_path = config.lora_path
             self._is_filling = False
+            self._fill_claim_lock = threading.Lock()
             self._is_sleeping = False  # Track sleep state
             self._sleep_requested = False  # Track if sleep has been requested
             self._generation_lock = threading.Lock()  # Lock for generation operations
+            self._last_fill_started_at: float | None = None
+            self._last_fill_finished_at: float | None = None
+            self._last_fill_heartbeat_at: float | None = None
+            self._last_fill_duration_seconds: float | None = None
+            self._last_fill_error: str | None = None
+            self._last_fill_generated_groups: int = 0
 
         self.app = self._create_app()
 
@@ -278,6 +289,46 @@ class DataSamplerServer:
 
     def _rollout_queue_clear(self) -> int:
         return self.rollout_queue.clear()
+
+    def _try_schedule_buffer_fill(
+        self,
+        *,
+        reason: str | None = None,
+    ) -> bool:
+        """
+        Schedule exactly one outstanding buffer fill worker.
+        Returns True when a new fill worker was started.
+        """
+        if not self.is_data_sampler:
+            return False
+        if getattr(self, "_is_sleeping", False):
+            return False
+        if getattr(self, "_sleep_requested", False):
+            return False
+        if self._rollout_queue_size() >= self.buffer_size:
+            return False
+
+        # Claim slot at enqueue time so duplicate background tasks cannot pile up.
+        if not self._fill_claim_lock.acquire(blocking=False):
+            return False
+
+        # Start a dedicated daemon worker so request lifecycle/cancellation cannot
+        # drop the claimed slot and strand the buffer in a "claimed forever" state.
+        worker = threading.Thread(
+            target=self.buffer_fill,
+            kwargs={"claim_acquired": True},
+            daemon=True,
+            name="fuchsia-buffer-fill",
+        )
+        try:
+            worker.start()
+        except Exception:
+            self._fill_claim_lock.release()
+            raise
+
+        if reason:
+            logger.debug("Scheduled buffer fill (%s)", reason)
+        return True
 
     def _create_app(self) -> FastAPI:
         app = FastAPI()
@@ -429,8 +480,6 @@ class DataSamplerServer:
             """Puts the LLM engine to sleep, offloading weights to CPU and clearing KV cache."""
             try:
                 if self.is_data_sampler:
-                    # Signal sleep intent first so in-flight buffer fill can stop at the next safe point.
-                    self._sleep_requested = True
                     # Check if generation is currently in progress without blocking.
                     generation_in_progress = not self._generation_lock.acquire(blocking=False)
                     if generation_in_progress:
@@ -438,10 +487,11 @@ class DataSamplerServer:
                         return {
                             "message": "Generation in progress - cannot sleep now", 
                             "sleep": False,
-                            "sleep_requested": True,
+                            "sleep_requested": False,
                         }
                     
                     try:
+                        self._sleep_requested = True
                         logger.info("Sleep requested - proceeding with sleep...")
                         self._is_sleeping = True
                     finally:
@@ -479,6 +529,9 @@ class DataSamplerServer:
                 torch.randn(1).cuda()
                 await asyncio.sleep(1)
                 if self.is_data_sampler:
+                    # Rotate LoRA request id once per wake cycle (policy step),
+                    # instead of per generation call, to avoid adapter churn.
+                    self._lora_request_id += 1
                     self._sleep_requested = False
                     self._is_sleeping = False
                 return {"message": "LLM engine has been woken up successfully"}
@@ -489,19 +542,20 @@ class DataSamplerServer:
         # Add data sampler specific endpoints if in data sampler mode
         if self.is_data_sampler:
             @app.post("/get_sample/")
-            async def get_sample(background_tasks: BackgroundTasks):
+            async def get_sample():
                 """Returns a sample from the buffer and triggers background buffer fill."""
                 if self._rollout_queue_size() == 0:
-                    await asyncio.sleep(5)
+                    self._try_schedule_buffer_fill(
+                        reason="queue-empty",
+                    )
+                    await asyncio.sleep(1)
                     return {"sample": None}
                 items = self._rollout_queue_pop()
                 if items is None:
                     return {"sample": None}
-                # Only trigger buffer fill if not sleeping and sleep not requested
-                if (self._rollout_queue_size() < self.buffer_size and 
-                    not getattr(self, '_is_sleeping', False) and 
-                    not getattr(self, '_sleep_requested', False)):
-                    background_tasks.add_task(self.buffer_fill)
+                if self._try_schedule_buffer_fill(
+                    reason="low-watermark",
+                ):
                     logger.info("requesting buffer fill")
                 elif getattr(self, '_is_sleeping', False):
                     logger.info("Skipping buffer fill request - LLM is sleeping")
@@ -510,29 +564,42 @@ class DataSamplerServer:
                 return {"sample": items}
 
             @app.post("/buffer_fill/")
-            async def buffer_fill(background_tasks: BackgroundTasks):
+            async def buffer_fill():
                 """Fills the buffer with new samples if not already filling."""
-                if self._is_filling:
-                    return {"message": "Buffer fill already in progress"}
                 if getattr(self, '_is_sleeping', False):
                     return {"message": "Buffer fill skipped - LLM is sleeping"}
                 if getattr(self, '_sleep_requested', False):
                     return {"message": "Buffer fill skipped - sleep requested"}
-                background_tasks.add_task(self.buffer_fill)
+                if self._rollout_queue_size() >= self.buffer_size:
+                    return {"message": "Buffer already full"}
+                if not self._try_schedule_buffer_fill(reason="manual-request"):
+                    return {"message": "Buffer fill already in progress"}
                 return {"message": "Buffer filling started"}
 
             @app.get("/buffer_status/")
             async def buffer_status():
                 """Returns the current status of the buffer."""
+                now = time.time()
+                current_fill_elapsed = None
+                if self._is_filling and self._last_fill_started_at is not None:
+                    current_fill_elapsed = max(0.0, now - self._last_fill_started_at)
                 return {
                     "current_size": self._rollout_queue_size(),
                     "max_size": self.buffer_size,
                     "transfer_mode": self.sample_transfer_mode,
                     "is_filling": self._is_filling,
+                    "fill_slot_claimed": self._fill_claim_lock.locked(),
                     "is_sleeping": getattr(self, '_is_sleeping', False),
                     "sleep_requested": getattr(self, '_sleep_requested', False),
                     "generation_in_progress": self._generation_lock.locked(),
                     "epoch": self._epoch,
+                    "last_fill_started_at": self._last_fill_started_at,
+                    "last_fill_finished_at": self._last_fill_finished_at,
+                    "last_fill_heartbeat_at": self._last_fill_heartbeat_at,
+                    "last_fill_duration_seconds": self._last_fill_duration_seconds,
+                    "last_fill_error": self._last_fill_error,
+                    "last_fill_generated_groups": self._last_fill_generated_groups,
+                    "current_fill_elapsed_seconds": current_fill_elapsed,
                 }
 
             @app.post("/empty_buffer/")
@@ -546,71 +613,158 @@ class DataSamplerServer:
 
         return app
 
-    def buffer_fill(self):
+    def buffer_fill(self, claim_acquired: bool = False):
         """Fills the buffer with new samples."""
-        if not self.is_data_sampler or self._is_filling:
+        if not self.is_data_sampler:
             return
-        
+
+        lock_acquired_here = False
+        # Ensure only one buffer fill worker can run or wait-for-lock at a time.
+        if not claim_acquired:
+            if not self._fill_claim_lock.acquire(blocking=False):
+                return
+            lock_acquired_here = True
+
+        fill_started_at: float | None = None
+        fill_started = False
         # Don't fill buffer if LLM is sleeping or sleep is requested
         if (hasattr(self, '_is_sleeping') and self._is_sleeping) or \
            (hasattr(self, '_sleep_requested') and self._sleep_requested):
             logger.info("Skipping buffer fill - LLM is sleeping or sleep requested")
+            if claim_acquired or lock_acquired_here:
+                self._fill_claim_lock.release()
             return
 
-        with self._generation_lock:
-            # Check if sleep was requested while waiting for the lock
-            if hasattr(self, '_sleep_requested') and self._sleep_requested:
-                logger.info("Sleep requested - aborting buffer fill")
-                return
+        try:
+            with self._generation_lock:
+                # Check if sleep was requested while waiting for the lock
+                if hasattr(self, '_sleep_requested') and self._sleep_requested:
+                    logger.info("Sleep requested - aborting buffer fill")
+                    return
 
-            self._is_filling = True
-            try:
-                while self._rollout_queue_size() < self.buffer_size:
-                    # Stop early if sleep was requested during buffer fill.
-                    if hasattr(self, '_sleep_requested') and self._sleep_requested:
-                        logger.info("Sleep requested during buffer fill - stopping buffer fill")
-                        break
-                    
-                    print(f"Buffer Size: {self._rollout_queue_size()}")
-                        
-                    items = []
-                    for _ in range(self._generation_batch_size):
-                        try:
-                            item = next(self.dataset_iter)
+                self._is_filling = True
+                fill_started = True
+                fill_started_at = time.time()
+                self._last_fill_started_at = fill_started_at
+                self._last_fill_heartbeat_at = fill_started_at
+                self._last_fill_finished_at = None
+                self._last_fill_duration_seconds = None
+                self._last_fill_error = None
+                self._last_fill_generated_groups = 0
+                consecutive_empty_batches = 0
+                max_empty_batches = max(8, self.buffer_size * 2)
+                try:
+                    while self._rollout_queue_size() < self.buffer_size:
+                        self._last_fill_heartbeat_at = time.time()
+                        # Stop early if sleep was requested during buffer fill.
+                        if hasattr(self, '_sleep_requested') and self._sleep_requested:
+                            logger.info("Sleep requested during buffer fill - stopping buffer fill")
+                            break
+
+                        logger.debug("Buffer Size: %s", self._rollout_queue_size())
+
+                        items = []
+                        for _ in range(self._generation_batch_size):
+                            try:
+                                item = next(self.dataset_iter)
+                            except StopIteration:
+                                self.dataset_iter = iter(self.dataset)
+                                self._epoch += 1
+                                try:
+                                    item = next(self.dataset_iter)
+                                except StopIteration as exc:
+                                    raise RuntimeError(
+                                        "Dataset iterator is empty; cannot fill rollout buffer"
+                                    ) from exc
                             items.append(item)
-                        except StopIteration:
-                            self.dataset_iter = iter(self.dataset)
-                            self._epoch += 1
 
-                    start_time = time.perf_counter()
-                    
-                    generation_kwargs = {}
-                    if self.config.single_gpu and os.path.exists(self.lora_path):
-                        generation_kwargs["lora_request"] = LoRARequest("grpo", self._lora_idx, self.lora_path)
-                        self._lora_idx += 1
-                    # items_with_rewards = self.process_sample(items)
-                    rollouts:list[Rollout] = []
-                    for item in items:
-                        r = Rollout(prompt=item[self.dataset_field], item=item)
-                        rollouts.append(r)
-                        
-                    rollouts = self.environment.generate(rollouts, self.llm, self._sampling_params, vllm_generate_kwargs=generation_kwargs, tokenizer=self.tokenizer)
-                    items_with_rewards = self.environment.payload(rollouts, tokenizer=self.tokenizer)
-                    end_time = time.perf_counter()
-                    print(f"time taken: {end_time - start_time}")
-                    if len(items_with_rewards) == 0:
-                        continue
-                    print("==========")
-                    for item in items_with_rewards:
-                        print(f"{item['all_rewards']}")
-                        print(f"{len(item['rewards'])} {item['rewards']}")
-                        print(f"{item['mean']} {item['std']}")
-                        print("-"*10)
-                    logger.debug("==========")
-                    self._rollout_queue_push(items_with_rewards)
-                    logger.debug("rollout queue size: %s", self._rollout_queue_size())
-            finally:
-                self._is_filling = False
+                        if not items:
+                            raise RuntimeError("Buffer fill produced no source items")
+
+                        start_time = time.perf_counter()
+
+                        generation_kwargs = {}
+                        if self.config.single_gpu and os.path.exists(self.lora_path):
+                            generation_kwargs["lora_request"] = LoRARequest(
+                                "grpo", self._lora_request_id, self.lora_path
+                            )
+                        items_with_rewards: list[dict] = []
+                        # Avoid very large generate() calls (32 prompts) that can intermittently
+                        # wedge after many sleep/wake cycles, but keep enough batching for speed.
+                        max_items_per_generate_call = 2 if self.config.single_gpu else self._generation_batch_size
+                        max_items_per_generate_call = max(1, int(max_items_per_generate_call))
+                        for start_idx in range(0, len(items), max_items_per_generate_call):
+                            chunk_items = items[start_idx : start_idx + max_items_per_generate_call]
+                            rollouts: list[Rollout] = []
+                            for item in chunk_items:
+                                prompt_text = item[self.dataset_field]
+                                prompt_ids = self.tokenizer(
+                                    prompt_text, add_special_tokens=False
+                                )["input_ids"]
+                                rollouts.append(
+                                    Rollout(prompt=prompt_text, prompt_ids=prompt_ids, item=item)
+                                )
+
+                            # Keep heartbeat alive while vLLM generation is running.
+                            heartbeat_stop = threading.Event()
+                            heartbeat_thread = threading.Thread(
+                                target=self._fill_heartbeat_loop,
+                                args=(heartbeat_stop,),
+                                daemon=True,
+                                name="fuchsia-fill-heartbeat",
+                            )
+                            heartbeat_thread.start()
+                            try:
+                                rollouts = self.environment.generate(
+                                    rollouts,
+                                    self.llm,
+                                    self._sampling_params,
+                                    vllm_generate_kwargs=generation_kwargs,
+                                    tokenizer=self.tokenizer,
+                                )
+                            finally:
+                                heartbeat_stop.set()
+                                heartbeat_thread.join(timeout=1.0)
+
+                            payload = self.environment.payload(rollouts, tokenizer=self.tokenizer)
+                            if payload:
+                                items_with_rewards.extend(payload)
+                        end_time = time.perf_counter()
+                        logger.debug("buffer fill generation time: %.3fs", end_time - start_time)
+                        if len(items_with_rewards) == 0:
+                            consecutive_empty_batches += 1
+                            logger.warning(
+                                "Buffer fill generated empty reward payload (%s/%s)",
+                                consecutive_empty_batches,
+                                max_empty_batches,
+                            )
+                            if consecutive_empty_batches >= max_empty_batches:
+                                self._last_fill_error = (
+                                    "Buffer fill repeatedly produced zero payload batches"
+                                )
+                                break
+                            continue
+
+                        consecutive_empty_batches = 0
+                        logger.debug("==========")
+                        self._rollout_queue_push(items_with_rewards)
+                        self._last_fill_generated_groups += len(items_with_rewards)
+                        self._last_fill_heartbeat_at = time.time()
+                        logger.debug("rollout queue size: %s", self._rollout_queue_size())
+                except Exception as exc:
+                    self._last_fill_error = str(exc)
+                    raise
+                finally:
+                    self._is_filling = False
+                    fill_finished_at = time.time()
+                    self._last_fill_finished_at = fill_finished_at
+                    if fill_started_at is not None:
+                        self._last_fill_duration_seconds = max(
+                            0.0, fill_finished_at - fill_started_at
+                        )
+        finally:
+            if claim_acquired or lock_acquired_here:
+                self._fill_claim_lock.release()
 
     def process_sample(self, items):
         """Processes samples and calculates rewards."""
@@ -627,8 +781,7 @@ class DataSamplerServer:
         
         generation_kwargs = {}
         if self.config.single_gpu and os.path.exists(self.lora_path):
-            generation_kwargs["lora_request"] = LoRARequest("grpo", self._lora_idx, self.lora_path)
-            self._lora_idx += 1
+            generation_kwargs["lora_request"] = LoRARequest("grpo", self._lora_request_id, self.lora_path)
         
         print(f">>>>> Generation_kwargs: {generation_kwargs} <<<<<")
         all_outputs = self.llm.generate(prompts, sampling_params=self._sampling_params, **generation_kwargs)
@@ -649,15 +802,18 @@ class DataSamplerServer:
 
         all_outputs = []
         for g_idx, item in enumerate(items):
+            prompt_text = item[self.dataset_field]
+            prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
             output = {
                 "item": [item] * self.config.vllm_n,
+                "prompt_ids": prompt_ids,
                 "completions": [],
                 "completion_ids": [],
                 "completion_logprobs": [],
                 "stop_reason": [],
                 "finish_reason": [],
                 "epoch": self._epoch,
-                "inputs": item[self.dataset_field]
+                "inputs": prompt_text
             }
             
             for idx in range(self.config.vllm_n):
@@ -676,6 +832,11 @@ class DataSamplerServer:
             all_outputs.append(output)
 
         return all_outputs
+
+    def _fill_heartbeat_loop(self, stop_event: threading.Event, interval: float = 2.0) -> None:
+        """Background heartbeat for long-running fill generations."""
+        while not stop_event.wait(interval):
+            self._last_fill_heartbeat_at = time.time()
 
     def calculate_rewards(self, items, completions, completion_ids):
         if not self.is_data_sampler:

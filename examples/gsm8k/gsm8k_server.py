@@ -16,6 +16,7 @@ SYSTEM_PROMPT = """Respond in following format:
 </thinking>
 <answer>{number}</answer>
 """
+STOP_TOKENS = ["</answer>", "<|eot_id|>"]
 
 CURRICULUM_LEARNING = 0
 HARD_REWARD_FILTER_THRESHOLD = 5.1
@@ -195,7 +196,12 @@ def main():
     dataset = dataset.shuffle()
     dataset = prepare_dataset(dataset, tokenizer)
     
-    server = DataSamplerServer(server_config, dataset, [reward_function_1])
+    server = DataSamplerServer(
+        server_config,
+        dataset,
+        [reward_function_1],
+        stop=STOP_TOKENS,
+    )
     server.serve()
 
 

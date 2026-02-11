@@ -132,7 +132,7 @@ trainer:
   num_policy_updates: 1                 # Updates per iteration
   gradient_checkpointing:
     enabled: true                        # Enable gradient checkpointing
-    cpu_offloading: true                # Offload to CPU for memory savings
+    mode: "activation_offload"          # "activation" or "activation_offload"
 ```
 
 ### Server Configuration
@@ -204,7 +204,7 @@ For training on limited GPU memory:
 trainer:
   gradient_checkpointing:
     enabled: true
-    cpu_offloading: true
+    mode: "activation_offload"
 ```
 
 2. **Use quantization**:

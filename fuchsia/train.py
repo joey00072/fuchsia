@@ -15,8 +15,8 @@ from peft import LoraConfig, get_peft_model
 from rich import print
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from fuchsia.activation_checkpointing import apply_activation_checkpointing
 from fuchsia.config import FuchsiaConfig
-from fuchsia.cpu_offloading import apply_cpu_gradient_checkpoint_monkey_patch
 from fuchsia.dist_dataset import DatasetClient, PreparedRolloutBatchDataset
 from fuchsia.trainer import Trainer
 from fuchsia.vllm_client import VLLMClient
@@ -50,9 +50,7 @@ def run_training(config_path: str | Path) -> None:
     print("CUDA AVAILABLE:", torch.cuda.is_available())
 
     enable_gradient_checkpointing = trainer_config.gradient_checkpointing_enabled
-    cpu_offloading = trainer_config.gradient_checkpointing_cpu_offloading
-    if enable_gradient_checkpointing and cpu_offloading:
-        apply_cpu_gradient_checkpoint_monkey_patch()
+    gradient_checkpointing_mode = trainer_config.gradient_checkpointing_mode
 
     model_name = trainer_config.model_name
     model = AutoModelForCausalLM.from_pretrained(
@@ -64,13 +62,23 @@ def run_training(config_path: str | Path) -> None:
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     if enable_gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
+        # Some recent HF model implementations do not honor native gc flags in forward.
+        # Keep native flag for compatible models and add explicit layer wrappers below.
+        try:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": True}
+            )
+        except TypeError:
+            model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        model.config.use_cache = False
 
     dataset = PreparedRolloutBatchDataset(
         source=rollout_stream,
         tokenizer=tokenizer,
         batch_size=trainer_config.batch_size,
+        max_seq_len=trainer_config.max_model_len,
         device=trainer_config.device,
         dtype=trainer_config.trainer_dtype,
         debug=trainer_config.debug,
@@ -84,6 +92,20 @@ def run_training(config_path: str | Path) -> None:
     )
     if trainer_config.using_lora:
         model = get_peft_model(model, lora_config)
+        if enable_gradient_checkpointing and hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+
+    if enable_gradient_checkpointing:
+        wrapped_layers = apply_activation_checkpointing(
+            model,
+            freq=1,
+            preserve_rng_state=False,
+            mode=gradient_checkpointing_mode,
+        )
+        print(
+            "[blue]Activation checkpointing wrappers applied: "
+            f"{wrapped_layers} layers (mode={gradient_checkpointing_mode})[/blue]"
+        )
 
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),

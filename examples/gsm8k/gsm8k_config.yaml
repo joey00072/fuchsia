@@ -45,9 +45,11 @@ lora:
 
 # Trainer configuration
 trainer:
+  debug: true
+  debug_log_dir: "debug_logs"
   group_size: *group_size
   batch_size: *generation_batch_size
-  grad_accumulation_steps: *generation_batch_size
+  micro_batch_size: 1
   lr: 0.00001
   weight_decay: 0.1
   beta: 0.01
@@ -59,7 +61,7 @@ trainer:
   loss_type: "cispo"
   gradient_checkpointing:
     enabled: true
-    cpu_offloading: true
+    mode: "activation_offload"
 
 # Server configuration
 server:

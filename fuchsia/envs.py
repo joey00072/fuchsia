@@ -26,6 +26,7 @@ class Rollout:
     finish_reason: str = ""
     completed: bool = False
     state: dict = field(default_factory=dict)
+    prompt_ids: list[int] = field(default_factory=list)
     completion_ids: list[int] = field(default_factory=list)
     completion_logprobs: list[float] = field(default_factory=list)
     
@@ -174,8 +175,11 @@ class Environment:
             ##  Update the rollouts with the vllm outputs
             new_rollouts = []
             for rollout, outputs in zip(active_rollouts, vllm_outputs):
+                prompt_token_ids = list(getattr(outputs, "prompt_token_ids", []) or [])
                 for idx,output in enumerate(outputs.outputs):
                     new_rollout = rollout.clone() if idx != len(outputs.outputs) - 1 else rollout
+                    if not new_rollout.prompt_ids and prompt_token_ids:
+                        new_rollout.prompt_ids = prompt_token_ids
                     new_rollout.last_completion = output.text
                     new_rollout.completion += output.text
                     new_rollout.completion_ids.extend(list(output.token_ids))
@@ -231,6 +235,7 @@ class Environment:
             
             output = {
                 "item": [first_rollout.item] * len(group),
+                "prompt_ids": list(first_rollout.prompt_ids),
                 "completions": [],
                 "completion_ids": [],
                 "completion_logprobs": [],

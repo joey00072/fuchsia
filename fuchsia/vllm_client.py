@@ -19,7 +19,7 @@
 import atexit
 import logging
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 from torch import nn
@@ -394,56 +394,220 @@ class VLLMClient:
         logger.error(f"Failed to trigger buffer fill after {max_retries} attempts. Continuing anyway...")
         return {"buffer_fill": False, "error": "Max retries exceeded"}
 
-    def buffer_status(self):
+    def buffer_status(
+        self,
+        *,
+        timeout: float = 5.0,
+        max_retries: int = 0,
+        log_failures: bool = False,
+    ):
         """
         Get VLLM buffer/sleep status.
         Returns an empty dict when status is unavailable.
         """
         try:
-            return self._make_request("buffer_status", method="get", max_retries=2)
+            return self._make_request(
+                "buffer_status",
+                method="get",
+                max_retries=max_retries,
+                timeout=timeout,
+            )
         except Exception as e:
-            logger.warning(f"Failed to fetch buffer status: {e}")
+            if log_failures:
+                logger.warning(f"Failed to fetch buffer status: {e}")
+            else:
+                logger.debug("Buffer status probe failed: %s", e)
             return {}
+
+    def _wait_for_status(
+        self,
+        predicate: Callable[[dict], bool],
+        timeout: float,
+        poll_interval: float,
+        max_poll_interval: float,
+        backoff_factor: float,
+    ) -> bool:
+        """
+        Poll buffer status with exponential backoff until `predicate` is satisfied or timeout elapses.
+        """
+        deadline = time.monotonic() + timeout
+        current_interval = max(float(poll_interval), 0.1)
+        max_interval = max(current_interval, float(max_poll_interval))
+
+        while time.monotonic() < deadline:
+            status = self.buffer_status(
+                timeout=max(1.0, min(poll_interval * 2.0, 3.0)),
+                max_retries=0,
+                log_failures=False,
+            )
+            if status and predicate(status):
+                return True
+            time.sleep(current_interval)
+            current_interval = min(current_interval * max(float(backoff_factor), 1.0), max_interval)
+        return False
 
     def wait_for_buffer_ready(
         self,
         min_size: int = 1,
         timeout: float = 120.0,
-        poll_interval: float = 0.5,
+        poll_interval: float = 1.0,
+        max_poll_interval: float = 5.0,
+        backoff_factor: float = 1.5,
+        filling_grace_timeout: float = 600.0,
+        assume_filling: bool = False,
     ) -> bool:
         """
         Wait until the rollout buffer has at least `min_size` items and is not actively filling.
         """
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            status = self.buffer_status()
-            if not status:
-                time.sleep(poll_interval)
-                continue
-            current_size = int(status.get("current_size", 0))
-            is_filling = bool(status.get("is_filling", False))
-            if current_size >= min_size and not is_filling:
-                return True
-            time.sleep(poll_interval)
-        return False
+        def _to_float(value) -> float | None:
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
 
-    def wait_until_sleeping(self, timeout: float = 120.0, poll_interval: float = 0.5) -> bool:
+        start_time = time.monotonic()
+        base_deadline = start_time + timeout
+        filling_deadline: float | None = (
+            start_time + float(filling_grace_timeout) if assume_filling else None
+        )
+        current_interval = max(float(poll_interval), 0.1)
+        max_interval = max(current_interval, float(max_poll_interval))
+        last_fill_heartbeat: float | None = None
+        last_fill_started: float | None = None
+        last_generated_groups: int | None = None
+        seen_fill_activity = bool(assume_filling)
+
+        while True:
+            now = time.monotonic()
+            status_timeout = max(3.0, min(current_interval * 2.0, 8.0))
+            status = self.buffer_status(
+                timeout=status_timeout,
+                max_retries=0,
+                log_failures=False,
+            )
+            if status:
+                current_size = int(status.get("current_size", 0))
+                slot_claimed = bool(status.get("fill_slot_claimed", False))
+                generation_in_progress = bool(status.get("generation_in_progress", False))
+                fill_started = _to_float(status.get("last_fill_started_at"))
+                fill_finished = _to_float(status.get("last_fill_finished_at"))
+                has_unfinished_fill = (
+                    fill_started is not None
+                    and (fill_finished is None or fill_finished < fill_started)
+                )
+                is_filling = bool(
+                    status.get("is_filling", False)
+                    or slot_claimed
+                    or has_unfinished_fill
+                    or generation_in_progress
+                )
+                if current_size >= min_size and not is_filling:
+                    return True
+
+                if is_filling:
+                    seen_fill_activity = True
+                    heartbeat = status.get("last_fill_heartbeat_at")
+                    try:
+                        parsed_heartbeat = float(heartbeat) if heartbeat is not None else None
+                    except (TypeError, ValueError):
+                        parsed_heartbeat = None
+
+                    if filling_deadline is None:
+                        filling_deadline = now + float(filling_grace_timeout)
+                    elif (
+                        parsed_heartbeat is not None
+                        and (last_fill_heartbeat is None or parsed_heartbeat > last_fill_heartbeat)
+                    ):
+                        filling_deadline = now + float(filling_grace_timeout)
+                    if (
+                        fill_started is not None
+                        and (last_fill_started is None or fill_started > last_fill_started)
+                    ):
+                        filling_deadline = now + float(filling_grace_timeout)
+                    generated_groups = status.get("last_fill_generated_groups")
+                    try:
+                        parsed_generated_groups = int(generated_groups)
+                    except (TypeError, ValueError):
+                        parsed_generated_groups = None
+                    if (
+                        parsed_generated_groups is not None
+                        and (
+                            last_generated_groups is None
+                            or parsed_generated_groups > last_generated_groups
+                        )
+                    ):
+                        filling_deadline = now + float(filling_grace_timeout)
+                    last_fill_heartbeat = parsed_heartbeat
+                    last_fill_started = fill_started
+                    last_generated_groups = parsed_generated_groups
+                else:
+                    fill_completed = (
+                        fill_started is not None
+                        and fill_finished is not None
+                        and fill_finished >= fill_started
+                    )
+                    if fill_completed and filling_deadline is not None:
+                        # Fill worker completed but could not produce enough items; allow caller to retry.
+                        return False
+                    if not seen_fill_activity:
+                        filling_deadline = None
+                        last_fill_heartbeat = None
+
+            if filling_deadline is not None:
+                if now >= filling_deadline:
+                    return False
+            elif now >= base_deadline:
+                return False
+
+            time.sleep(current_interval)
+            current_interval = min(current_interval * max(float(backoff_factor), 1.0), max_interval)
+
+    def wait_until_sleeping(
+        self,
+        timeout: float = 120.0,
+        poll_interval: float = 1.0,
+        max_poll_interval: float = 5.0,
+        backoff_factor: float = 1.5,
+    ) -> bool:
         """
         Wait until server reports sleeping and no pending sleep/fill operations.
         """
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            status = self.buffer_status()
-            if not status:
-                time.sleep(poll_interval)
-                continue
+        def _sleeping(status: dict) -> bool:
             is_sleeping = bool(status.get("is_sleeping", False))
             sleep_requested = bool(status.get("sleep_requested", False))
             is_filling = bool(status.get("is_filling", False))
-            if is_sleeping and not sleep_requested and not is_filling:
-                return True
-            time.sleep(poll_interval)
-        return False
+            return is_sleeping and not sleep_requested and not is_filling
+
+        return self._wait_for_status(
+            predicate=_sleeping,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            max_poll_interval=max_poll_interval,
+            backoff_factor=backoff_factor,
+        )
+
+    def wait_until_awake(
+        self,
+        timeout: float = 120.0,
+        poll_interval: float = 1.0,
+        max_poll_interval: float = 5.0,
+        backoff_factor: float = 1.5,
+    ) -> bool:
+        """
+        Wait until server reports awake state (not sleeping and no pending sleep request).
+        """
+        def _awake(status: dict) -> bool:
+            is_sleeping = bool(status.get("is_sleeping", False))
+            sleep_requested = bool(status.get("sleep_requested", False))
+            return (not is_sleeping) and (not sleep_requested)
+
+        return self._wait_for_status(
+            predicate=_awake,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            max_poll_interval=max_poll_interval,
+            backoff_factor=backoff_factor,
+        )
 
     def sleep(self, max_retries=100, retry_sleep_time=2, max_retry_sleep_time=8):
         """
@@ -454,7 +618,7 @@ class VLLMClient:
             try:
                 response = self._make_request("sleep", method="post", max_retries=2)
                 if response and response.get("sleep", False):
-                    if not self.wait_until_sleeping(timeout=60.0, poll_interval=0.5):
+                    if not self.wait_until_sleeping(timeout=60.0, poll_interval=1.0):
                         logger.warning("Sleep acknowledged but server did not report steady sleeping state within timeout")
                     logger.info("VLLM client successfully put to sleep")
                     return response
@@ -480,6 +644,10 @@ class VLLMClient:
         for attempt in range(max_retries):
             try:
                 res = self._make_request("wake_up", method="post", max_retries=2)
+                if not self.wait_until_awake(timeout=60.0, poll_interval=1.0):
+                    logger.warning(
+                        "Wake acknowledged but server did not report steady awake state within timeout"
+                    )
                 logger.info("VLLM client successfully woken up")
                 return res
             except Exception as e:

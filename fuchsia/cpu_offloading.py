@@ -15,52 +15,120 @@
 # limitations under the License.
 
 # this is referred to unsloth's cpu offloading implementation
-# but its different and not as good as unsloth's :)
+# but its different and intentionally lightweight.
+
+from __future__ import annotations
+
+from collections.abc import Sequence
 
 import torch
 import transformers
-import inspect
+
+_CHECKPOINT_WRAPPER_KWARGS = {
+    "preserve_rng_state",
+    "use_reentrant",
+    "determinism_check",
+    "debug",
+    "context_fn",
+    "early_stop",
+}
 
 
 class CPUGradientCheckpointer(torch.autograd.Function):
+    """Checkpoint the first activation tensor by parking it on CPU between fwd/bwd."""
+
     @staticmethod
-    @torch.amp.custom_fwd(device_type='cuda')
-    def forward(ctx, forward_fn, activations, *kwargs):
-        
+    def forward(ctx, run_fn, activations):
         with torch.no_grad():
-            output = forward_fn(activations, *kwargs)
-            
-        cpu_activations = activations.to("cpu", non_blocking=True)
-        
-        ctx.save_for_backward(cpu_activations)
-        ctx.forward_fn = forward_fn
-        ctx.kwargs = kwargs
+            outputs = run_fn(activations)
 
-        return output
+        ctx.run_fn = run_fn
+        ctx.device = activations.device
+        ctx.save_for_backward(activations.to("cpu", non_blocking=True))
+        return outputs
 
     @staticmethod
-    @torch.amp.custom_bwd(device_type='cuda')
-    def backward(ctx, grad_output):
-
+    def backward(ctx, *grad_outputs):
         (cpu_activations,) = ctx.saved_tensors
-
-        gpu_activations = cpu_activations.to("cuda", non_blocking=True).detach()
-        gpu_activations.requires_grad = True
+        replay_activations = cpu_activations.to(ctx.device, non_blocking=True).detach()
+        replay_activations.requires_grad_(True)
 
         with torch.enable_grad():
-            output = ctx.forward_fn(gpu_activations, *ctx.kwargs)
+            outputs = ctx.run_fn(replay_activations)
 
-        torch.autograd.backward(output, grad_output)
+        if torch.is_tensor(outputs):
+            outputs_seq = (outputs,)
+        elif isinstance(outputs, Sequence):
+            outputs_seq = tuple(outputs)
+        else:
+            raise TypeError(
+                f"Unsupported checkpoint output type: {type(outputs)!r}"
+            )
 
-        return (None, gpu_activations.grad,) + (None,) * len(ctx.kwargs)
+        tensor_outputs: list[torch.Tensor] = []
+        tensor_grads: list[torch.Tensor] = []
+        for idx, out in enumerate(outputs_seq):
+            if not torch.is_tensor(out) or not out.requires_grad:
+                continue
+            grad = grad_outputs[idx] if idx < len(grad_outputs) else None
+            if grad is None:
+                if out.numel() != 1:
+                    raise RuntimeError(
+                        "Missing gradient for non-scalar checkpoint output"
+                    )
+                grad = torch.ones_like(out)
+            tensor_outputs.append(out)
+            tensor_grads.append(grad)
+
+        if tensor_outputs:
+            torch.autograd.backward(tensor_outputs, tensor_grads)
+
+        return None, replay_activations.grad
 
 
+def _find_primary_activation_index(args: tuple[object, ...]) -> int | None:
+    for idx, value in enumerate(args):
+        if torch.is_tensor(value) and value.is_floating_point():
+            return idx
+    return None
+
+
+def cpu_offloaded_checkpoint(function, *args, **kwargs):
+    """
+    Checkpoint function compatible with checkpoint_wrapper(checkpoint_fn=...).
+    It offloads the first floating activation tensor to CPU between fwd and bwd.
+    """
+    if not args:
+        return function(*args, **kwargs)
+
+    forward_kwargs = dict(kwargs)
+    for key in _CHECKPOINT_WRAPPER_KWARGS:
+        forward_kwargs.pop(key, None)
+
+    hidden_idx = _find_primary_activation_index(args)
+    if hidden_idx is None:
+        return function(*args, **forward_kwargs)
+
+    hidden_states = args[hidden_idx]
+    prefix = args[:hidden_idx]
+    suffix = args[hidden_idx + 1 :]
+
+    def run_fn(replay_hidden_states):
+        call_args = (*prefix, replay_hidden_states, *suffix)
+        return function(*call_args, **forward_kwargs)
+
+    return CPUGradientCheckpointer.apply(run_fn, hidden_states)
 
 
 def apply_cpu_gradient_checkpoint_monkey_patch():
     def new_gradient_checkpointing_enable(self):
-        self._set_gradient_checkpointing(enable=True, gradient_checkpointing_func=CPUGradientCheckpointer.apply)
-
+        self._set_gradient_checkpointing(
+            enable=True,
+            gradient_checkpointing_func=cpu_offloaded_checkpoint,
+        )
         if getattr(self, "_hf_peft_config_loaded", False):
             self.enable_input_require_grads()
-    transformers.modeling_utils.PreTrainedModel.gradient_checkpointing_enable = new_gradient_checkpointing_enable
+
+    transformers.modeling_utils.PreTrainedModel.gradient_checkpointing_enable = (
+        new_gradient_checkpointing_enable
+    )
