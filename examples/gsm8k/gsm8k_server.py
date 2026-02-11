@@ -1,4 +1,5 @@
-from fuchsia.vllm_server import DataSamplerServer, ServerConfig, Rollout
+from fuchsia.config import FuchsiaConfig
+from fuchsia.vllm_server import VLLMServer, Rollout
 from fuchsia.reward_utils import clean_completion
 from datasets import load_dataset
 from rich import print
@@ -190,13 +191,13 @@ def prepare_dataset(dataset, tokenizer) -> Dataset:
 def main():
 
 
-    server_config = ServerConfig.from_yaml(Path(__file__).parent / "gsm8k_config.yaml")
+    server_config = FuchsiaConfig.from_yaml(Path(__file__).parent / "gsm8k_config.yaml")
     tokenizer = AutoTokenizer.from_pretrained(server_config.model)
     dataset = load_dataset(server_config.dataset_name, server_config.dataset_split)["train"]
     dataset = dataset.shuffle()
     dataset = prepare_dataset(dataset, tokenizer)
     
-    server = DataSamplerServer(
+    server = VLLMServer(
         server_config,
         dataset,
         [reward_function_1],

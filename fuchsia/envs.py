@@ -1,11 +1,9 @@
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from vllm import LLM, SamplingParams
 from typing import Callable, Any
 import inspect
 import numpy as np
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from rich import print
 from collections import defaultdict
 from copy import deepcopy
 from transformers import AutoTokenizer
@@ -57,6 +55,26 @@ class Rollout:
         new_rollout.id = str(uuid.uuid4())
         new_rollout.group_id = self.group_id
         return new_rollout
+
+
+@dataclass
+class RolloutSample:
+    item: list[dict]
+    prompt_ids: list[int]
+    completions: list[str]
+    completion_ids: list[list[int]]
+    completion_logprobs: list[list[float]]
+    stop_reason: list[str]
+    finish_reason: list[str]
+    epoch: int
+    inputs: str
+    all_rewards: dict[str, list[float]] = field(default_factory=dict)
+    rewards: list[float] = field(default_factory=list)
+    mean: float = 0.0
+    std: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass
@@ -122,19 +140,67 @@ class Environment:
             step_logprobs = raw_logprobs[idx] if idx < len(raw_logprobs) else None
             completion_logprobs.append(cls._extract_step_logprob(token_id, step_logprobs))
         return completion_logprobs
+
+    def _mark_length_limited_rollout(
+        self,
+        rollout: Rollout,
+        *,
+        tokenizer: AutoTokenizer | None,
+        max_model_len: int,
+        token_length: int,
+    ) -> None:
+        rollout.completed = True
+        rollout.finish_reason = "length"
+        rollout.stop_reason = "length"
+        if tokenizer is not None and tokenizer.eos_token is not None:
+            rollout.stop = [tokenizer.eos_token]
+        rollout.state["context_token_length"] = int(token_length)
+        rollout.state["context_limit"] = int(max_model_len)
+        rollout.state["context_limit_exceeded"] = True
+
+        # Keep token arrays consistent if completion ids exceed remaining context.
+        if rollout.prompt_ids:
+            max_completion_len = max(0, max_model_len - len(rollout.prompt_ids))
+            if len(rollout.completion_ids) > max_completion_len:
+                rollout.completion_ids = rollout.completion_ids[:max_completion_len]
+                rollout.completion_logprobs = rollout.completion_logprobs[:max_completion_len]
+                if tokenizer is not None:
+                    rollout.completion = tokenizer.decode(
+                        rollout.completion_ids,
+                        skip_special_tokens=False,
+                    )
+
+    def _enforce_context_limit(
+        self,
+        rollouts: list[Rollout],
+        process_kwargs: dict[str, Any],
+    ) -> None:
+        tokenizer = process_kwargs.get("tokenizer")
+        max_model_len = process_kwargs.get("max_model_len")
+        if tokenizer is None or not isinstance(max_model_len, int) or max_model_len <= 0:
+            return
+
+        for rollout in rollouts:
+            if rollout.completed:
+                continue
+            token_length = len(tokenizer.encode(rollout.input))
+            if token_length >= max_model_len:
+                self._mark_length_limited_rollout(
+                    rollout,
+                    tokenizer=tokenizer,
+                    max_model_len=max_model_len,
+                    token_length=token_length,
+                )
     
     def generate(
         self,   
         rollouts: list[Rollout] | Rollout,
         llm: LLM,
         sampling_params: SamplingParams | None = None,
-        vllm_generate_kwargs: dict = {},
+        vllm_generate_kwargs: dict | None = None,
         tokenizer: AutoTokenizer = None,
         **kwargs,
     ):
-        
-        print(self)
-        print("--------------------------------")
         process_kwargs = {
             "tokenizer": tokenizer,
             "max_model_len": llm.llm_engine.model_config.max_model_len,
@@ -144,6 +210,7 @@ class Environment:
             sampling_params = self.sampling_params
             
         sampling_params:SamplingParams = deepcopy(sampling_params)
+        generate_kwargs = vllm_generate_kwargs or {}
         
         if self.stop:
             sampling_params.stop = self.stop
@@ -157,10 +224,10 @@ class Environment:
         
         
         step = 0
-        while (
-            step < self.max_steps and
-            not all([rollout.completed for rollout in all_rollouts.values()])
-            ):
+        while step < self.max_steps:
+            self._enforce_context_limit(list(all_rollouts.values()), process_kwargs)
+            if all(rollout.completed for rollout in all_rollouts.values()):
+                break
             
             step += 1
             active_rollouts = [rollout for rollout in all_rollouts.values() if not rollout.completed]
@@ -169,7 +236,7 @@ class Environment:
             vllm_outputs = llm.generate(
                 inputs,
                 sampling_params=sampling_params,
-                **vllm_generate_kwargs,
+                **generate_kwargs,
             )
             
             ##  Update the rollouts with the vllm outputs
@@ -210,72 +277,70 @@ class Environment:
             if rollout.finish_reason in ["stop", "length"]:
                 rollout.completed = True
         return rollouts
+
+    def _group_rollouts(self, rollouts: list[Rollout]) -> dict[str, list[Rollout]]:
+        grouped_rollouts: dict[str, list[Rollout]] = {}
+        for rollout in rollouts:
+            grouped_rollouts.setdefault(rollout.group_id, []).append(rollout)
+        return grouped_rollouts
+
+    def _build_group_payload(self, group: list[Rollout]) -> RolloutSample:
+        first_rollout = group[0]
+        output = RolloutSample(
+            item=[first_rollout.item] * len(group),
+            prompt_ids=list(first_rollout.prompt_ids),
+            completions=[],
+            completion_ids=[],
+            completion_logprobs=[],
+            stop_reason=[],
+            finish_reason=[],
+            epoch=first_rollout.epoch,
+            inputs=first_rollout.prompt,
+        )
+        for rollout in group:
+            output.completions.append(rollout.completion)
+            output.completion_ids.append(rollout.completion_ids)
+            output.completion_logprobs.append(rollout.completion_logprobs)
+            output.stop_reason.append(rollout.stop_reason)
+            output.finish_reason.append(rollout.finish_reason)
+        return output
+
+    def should_keep_sample(self, sample: RolloutSample) -> bool:
+        return sample.std != 0.0
+
+    def _filter_payload_samples(self, samples: list[RolloutSample]) -> list[RolloutSample]:
+        return [sample for sample in samples if self.should_keep_sample(sample)]
     
     def payload(
         self,
         rollouts: list[Rollout] | Rollout,
         calculate_rewards: bool = True,
         tokenizer: AutoTokenizer | None = None,
-    ):
+    ) -> list[RolloutSample]:
         rollouts = [rollouts] if isinstance(rollouts, Rollout) else rollouts
-        
-        # Group rollouts by their original prompt/item (since we clone rollouts for n>1)
-        grouped_rollouts = {}
-        for rollout in rollouts:
-            key = rollout.group_id 
-            if key not in grouped_rollouts:
-                grouped_rollouts[key] = []
-            grouped_rollouts[key].append(rollout)
-        
-        samples = []
-        for prompt, group in grouped_rollouts.items():
-            # print(f"GROUP: calculating rewards for {len(group)} rollouts")
-            # Take the first rollout to get shared properties
-            first_rollout = group[0]
-            
-            output = {
-                "item": [first_rollout.item] * len(group),
-                "prompt_ids": list(first_rollout.prompt_ids),
-                "completions": [],
-                "completion_ids": [],
-                "completion_logprobs": [],
-                "stop_reason": [],
-                "finish_reason": [],
-                "epoch": first_rollout.epoch,
-                "inputs": first_rollout.prompt
-            }
-            
-            # Add data from each rollout in the group
-            for rollout in group:
-                output["completions"].append(rollout.completion)
-                output["completion_ids"].append(rollout.completion_ids)
-                output["completion_logprobs"].append(rollout.completion_logprobs)
-                output["stop_reason"].append(rollout.stop_reason)
-                output["finish_reason"].append(rollout.finish_reason)
 
+        samples: list[RolloutSample] = []
+        grouped_rollouts = self._group_rollouts(rollouts)
+        for group in grouped_rollouts.values():
+            output = self._build_group_payload(group)
             if calculate_rewards and self.reward_functions:
-                output["all_rewards"], output["rewards"], output["mean"], output["std"] = (
+                output.all_rewards, output.rewards, output.mean, output.std = (
                     self.calculate_rewards(
-                        output["item"],
-                        output["completions"],
-                        output["completion_ids"],
+                        output.item,
+                        output.completions,
+                        output.completion_ids,
                         group,
                         tokenizer=tokenizer,
                     )
                 )
             else:
-                output["all_rewards"], output["rewards"], output["mean"], output["std"] = {}, [], 0.0, 0.0
-                 
+                output.all_rewards, output.rewards, output.mean, output.std = {}, [], 0.0, 0.0
+
             samples.append(output)
-        #output["rewards"]
-        print(f"{[s['all_rewards'] for s in samples]}")
-        samples = [s for s in samples if s["std"] != 0.0]
-        return samples
+        return self._filter_payload_samples(samples)
 
     def calculate_rewards(self, items, completions, completion_ids, rollouts, tokenizer: AutoTokenizer | None = None):
         """Calculate rewards using the environment's reward functions."""
-        import numpy as np
-        # print(f"calculating rewards for {len(rollouts)} rollouts")
         all_rewards = {}
         if not self.reward_functions:
             return {}, [], 0.0, 0.0
@@ -367,17 +432,8 @@ class MultiTurnEnvironment(Environment):
                 rollout.completed = True
         for rollout in rollouts:
             self.step_rollout(rollout)
-            
-        tokenizer = process_kwargs["tokenizer"]
-        max_model_len = process_kwargs["max_model_len"]
-        for rollout in rollouts:
-            token_length = len(tokenizer.encode(rollout.input))
-            if token_length > max_model_len:
-                rollout.completed = True
-                rollout.finish_reason = "length"
-                rollout.stop_reason = "length"
-                rollout.stop = [tokenizer.eos_token]
-                rollout.completion = tokenizer.decode(rollout.completion_ids[:max_model_len])
+
+        self._enforce_context_limit(rollouts, process_kwargs)
                 
         return rollouts 
 

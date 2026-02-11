@@ -14,7 +14,8 @@ from numpy import roll
 from transformers import AutoTokenizer
 
 from fuchsia.envs import MultiTurnEnvironment, Rollout
-from fuchsia.vllm_server import DataSamplerServer, ServerConfig
+from fuchsia.config import FuchsiaConfig
+from fuchsia.vllm_server import VLLMServer
 
 import multiprocessing
 from IPython.core.interactiveshell import InteractiveShell
@@ -217,28 +218,19 @@ class PythonInterpreterEnvironment(MultiTurnEnvironment):
                 last_rollout.completion = completion.replace(FILL_TOKEN, last_rollout.item["completion"])
                 
             
-        tokenizer = process_kwargs["tokenizer"]
-        max_model_len = process_kwargs["max_model_len"]
-        for rollout in rollouts:
-            token_length = len(tokenizer.encode(rollout.input))
-            if token_length > max_model_len:
-                rollout.completed = True
-                rollout.finish_reason = "length"
-                rollout.stop_reason = "length"
-                rollout.stop = [tokenizer.eos_token]
-                rollout.completion = tokenizer.decode(tokenizer.encode(rollout.input)[:max_model_len])
+        self._enforce_context_limit(rollouts, process_kwargs)
     
     
         return rollouts 
 
 
 def main():
-    server_config = ServerConfig.from_yaml(Path(__file__).parent / "config.yaml")
+    server_config = FuchsiaConfig.from_yaml(Path(__file__).parent / "config.yaml")
     tokenizer = AutoTokenizer.from_pretrained(server_config.model)
     dataset = load_dataset(server_config.dataset_name, server_config.dataset_split)["train"]
     dataset = prepare_dataset(dataset, tokenizer)
     
-    server = DataSamplerServer(server_config, dataset, environment=PythonInterpreterEnvironment())
+    server = VLLMServer(server_config, dataset, environment=PythonInterpreterEnvironment())
     server.serve()
 
 

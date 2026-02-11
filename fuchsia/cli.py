@@ -702,9 +702,10 @@ Examples:
         create_default_config(args.output)
         return 0
     elif args.command == "server":
-        from .vllm_server import ServerConfig, VLLMServer
+        from .config import FuchsiaConfig
+        from .vllm_server import VLLMServer
 
-        config = ServerConfig(
+        config = FuchsiaConfig(
             model=args.model,
             revision=args.revision,
             tensor_parallel_size=args.tensor_parallel_size,
