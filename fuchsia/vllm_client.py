@@ -15,29 +15,616 @@
 # derived from https://github.com/huggingface/trl/blob/main/trl/extras/vllm_client.py
 # from original pr of binary-husky (https://github.com/binary-husky) pr https://github.com/huggingface/trl/pull/3094
 
+# this is so much differ from the original code, but still keeping its spirit
+
+from __future__ import annotations
 
 import atexit
+from dataclasses import dataclass
 import logging
 import time
 from typing import Callable, Optional
 
-import torch
-from torch import nn
-
-
+from peft import PeftModel
 import requests
 from requests import ConnectionError
-
-
+import torch
+from torch import nn
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.utils import StatelessProcessGroup
-
-from peft import PeftModel
 
 logger = logging.getLogger(__name__)
 
 
+def _as_optional_float(value) -> Optional[float]:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_optional_int(value) -> Optional[int]:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class _FillSnapshot:
+    current_size: int
+    is_filling: bool
+    fill_started: Optional[float]
+    fill_finished: Optional[float]
+    heartbeat: Optional[float]
+    generated_groups: Optional[int]
+
+
+@dataclass
+class _FillTracker:
+    seen_activity: bool = False
+    last_heartbeat: Optional[float] = None
+    last_fill_started: Optional[float] = None
+    last_generated_groups: Optional[int] = None
+
+    def observe(self, snap: _FillSnapshot) -> bool:
+        progressed = False
+        if snap.heartbeat is not None and (
+            self.last_heartbeat is None or snap.heartbeat > self.last_heartbeat
+        ):
+            progressed = True
+        if snap.fill_started is not None and (
+            self.last_fill_started is None or snap.fill_started > self.last_fill_started
+        ):
+            progressed = True
+        if snap.generated_groups is not None and (
+            self.last_generated_groups is None
+            or snap.generated_groups > self.last_generated_groups
+        ):
+            progressed = True
+
+        self.last_heartbeat = snap.heartbeat
+        self.last_fill_started = snap.fill_started
+        self.last_generated_groups = snap.generated_groups
+        self.seen_activity = True
+        return progressed
+
+    def clear_idle_markers(self) -> None:
+        self.last_heartbeat = None
+
+
+class _VLLMTransport:
+    """HTTP transport with retry/backoff and small typed defaults."""
+
+    def __init__(self, session: requests.Session, host: str, server_port: int):
+        self._session = session
+        self.host = host
+        self.server_port = server_port
+        self.base_url = f"http://{host}:{server_port}"
+
+    def request(
+        self,
+        endpoint: str,
+        *,
+        method: str = "get",
+        json: Optional[dict] = None,
+        timeout: float = 10.0,
+        retries: int = 2,
+        retry_delay: float = 1.0,
+        retry_backoff: float = 1.5,
+    ) -> dict:
+        url = f"{self.base_url}/{endpoint.strip('/')}/"
+        current_delay = max(float(retry_delay), 0.1)
+        for attempt in range(retries + 1):
+            try:
+                response = self._session.request(
+                    method=method.upper(),
+                    url=url,
+                    json=json,
+                    timeout=max(float(timeout), 0.1),
+                )
+                if response.status_code == 200:
+                    return response.json() if response.content else {}
+                raise RuntimeError(
+                    f"HTTP {response.status_code} calling {url}: {response.text}"
+                )
+            except (requests.exceptions.RequestException, RuntimeError) as exc:
+                if attempt >= retries:
+                    raise ConnectionError(f"Failed to call {url}: {exc}") from exc
+                time.sleep(current_delay)
+                current_delay *= max(float(retry_backoff), 1.0)
+        raise ConnectionError(f"Unexpected request failure for {url}")
+
+    def request_or_default(
+        self,
+        endpoint: str,
+        *,
+        default: dict,
+        warn_message: Optional[str] = None,
+        warn_level: int = logging.WARNING,
+        method: str = "get",
+        json: Optional[dict] = None,
+        timeout: float = 10.0,
+        retries: int = 2,
+    ) -> dict:
+        try:
+            return self.request(
+                endpoint,
+                method=method,
+                json=json,
+                timeout=timeout,
+                retries=retries,
+            )
+        except Exception as exc:
+            if warn_message:
+                logger.log(warn_level, "%s: %s", warn_message, exc)
+            return default
+
+    def wait_for_health(self, total_timeout: float, retry_interval: float) -> None:
+        if total_timeout <= 0:
+            self.request("health", timeout=2.0, retries=0)
+            return
+        deadline = time.monotonic() + float(total_timeout)
+        wait = max(float(retry_interval), 0.1)
+        while time.monotonic() < deadline:
+            try:
+                self.request("health", timeout=2.0, retries=0)
+                return
+            except Exception:
+                time.sleep(wait)
+        raise ConnectionError(
+            f"The vLLM server can't be reached at {self.host}:{self.server_port} "
+            f"after {total_timeout} seconds."
+        )
+
+
+class _CommunicatorSync:
+    """Owns NCCL communicator lifecycle and param broadcast/update RPC."""
+
+    def __init__(self, transport: _VLLMTransport, host: str, group_port: int):
+        self._transport = transport
+        self._host = host
+        self._group_port = group_port
+        self.rank = 0
+        self.pynccl_comm: Optional[PyNcclCommunicator] = None
+
+    def init(self) -> None:
+        response = self._transport.request(
+            "get_tensor_parallel_size",
+            timeout=10.0,
+            retries=2,
+        )
+        tensor_parallel_size = int(response["tensor_parallel_size"])
+        world_size = tensor_parallel_size + 1
+        self.rank = tensor_parallel_size
+
+        self._transport.request(
+            "init_communicator",
+            method="post",
+            json={
+                "host": self._host,
+                "port": self._group_port,
+                "world_size": world_size,
+            },
+            timeout=20.0,
+            retries=2,
+        )
+
+        pg = StatelessProcessGroup.create(
+            host=self._host,
+            port=self._group_port,
+            rank=self.rank,
+            world_size=world_size,
+        )
+        self.pynccl_comm = PyNcclCommunicator(pg, device="cuda:0")
+
+    def close(self, *, enabled: bool) -> dict:
+        if not enabled:
+            return {"close_communicator": True, "skipped": True}
+        result = self._transport.request_or_default(
+            "close_communicator",
+            method="post",
+            timeout=10.0,
+            retries=2,
+            default={"close_communicator": False, "error": "request_failed"},
+            warn_message="Failed to close communicator cleanly",
+        )
+        self.pynccl_comm = None
+        return result
+
+    def push_named_param(self, name: str, weights: torch.Tensor) -> None:
+        self._transport.request(
+            "update_named_param",
+            method="post",
+            json={
+                "name": name,
+                "dtype": str(weights.dtype),
+                "shape": tuple(weights.shape),
+            },
+            timeout=15.0,
+            retries=2,
+        )
+        if self.pynccl_comm is None:
+            return
+        self.pynccl_comm.broadcast(
+            weights,
+            src=self.rank,
+            stream=torch.cuda.current_stream(),
+        )
+        self.pynccl_comm.group.barrier()
+
+
+class _ModelSync:
+    """Model/LoRA parameter sync logic used by the trainer update step."""
+
+    def __init__(self, communicator: _CommunicatorSync):
+        self._communicator = communicator
+
+    def _update_lora_params(self, model: PeftModel) -> None:
+        target_modules = model.peft_config["default"].target_modules
+        alpha = model.peft_config["default"].lora_alpha
+        rank = model.peft_config["default"].r
+        weights = {name: param.data for name, param in model.named_parameters()}
+
+        for name, param in model.named_parameters():
+            if "lora" in name:
+                continue
+            if not any(target in name for target in target_modules):
+                continue
+
+            if "bias" in name:
+                server_name = name.replace("base_model.model.", "")
+                self._communicator.push_named_param(server_name, param.data.clone())
+                continue
+
+            prefix = name.replace(".base_layer.weight", "")
+            a_name = f"{prefix}.lora_A.default.weight"
+            b_name = f"{prefix}.lora_B.default.weight"
+            delta = (weights[b_name].clone() @ weights[a_name].clone()) * (alpha / rank)
+            merged = param.data.clone() + delta
+            server_name = (
+                name.replace("base_model.model.", "")
+                .replace(".base_layer.weight", ".weight")
+            )
+            self._communicator.push_named_param(server_name, merged)
+
+    def _update_dense_params(self, model: nn.Module) -> None:
+        for name, param in model.named_parameters():
+            self._communicator.push_named_param(name, param.data)
+
+    def update_model_params(
+        self,
+        model: nn.Module,
+        tokenizer=None,
+        *,
+        lora: bool = False,
+        single_gpu: bool = False,
+        lora_path: Optional[str] = None,
+    ) -> None:
+        if single_gpu:
+            if tokenizer is not None and lora_path is not None:
+                tokenizer.save_pretrained(lora_path)
+            if lora_path is not None:
+                model.save_pretrained(lora_path, adapter_name="grpo")
+            return
+
+        if lora:
+            if not isinstance(model, PeftModel):
+                raise ValueError("Model is not a PeftModel")
+            self._update_lora_params(model)
+            return
+
+        self._update_dense_params(model)
+
+
+class _BufferController:
+    """Rollout queue / sleep-wake orchestration over the server HTTP API."""
+
+    def __init__(self, transport: _VLLMTransport):
+        self._transport = transport
+
+    @staticmethod
+    def _next_backoff_interval(current: float, *, factor: float, max_interval: float) -> float:
+        return min(current * max(float(factor), 1.0), max_interval)
+
+    @staticmethod
+    def _is_fill_in_progress(
+        status: dict,
+        *,
+        fill_started: Optional[float] = None,
+        fill_finished: Optional[float] = None,
+    ) -> bool:
+        if fill_started is None:
+            fill_started = _as_optional_float(status.get("last_fill_started_at"))
+        if fill_finished is None:
+            fill_finished = _as_optional_float(status.get("last_fill_finished_at"))
+        has_unfinished_fill = (
+            fill_started is not None
+            and (fill_finished is None or fill_finished < fill_started)
+        )
+        return bool(
+            status.get("is_filling", False)
+            or status.get("fill_slot_claimed", False)
+            or status.get("generation_in_progress", False)
+            or has_unfinished_fill
+        )
+
+    def _build_fill_snapshot(self, status: dict) -> _FillSnapshot:
+        fill_started = _as_optional_float(status.get("last_fill_started_at"))
+        fill_finished = _as_optional_float(status.get("last_fill_finished_at"))
+        return _FillSnapshot(
+            current_size=int(status.get("current_size", 0)),
+            is_filling=self._is_fill_in_progress(
+                status,
+                fill_started=fill_started,
+                fill_finished=fill_finished,
+            ),
+            fill_started=fill_started,
+            fill_finished=fill_finished,
+            heartbeat=_as_optional_float(status.get("last_fill_heartbeat_at")),
+            generated_groups=_as_optional_int(status.get("last_fill_generated_groups")),
+        )
+
+    @staticmethod
+    def _fill_completed(snap: _FillSnapshot) -> bool:
+        return (
+            snap.fill_started is not None
+            and snap.fill_finished is not None
+            and snap.fill_finished >= snap.fill_started
+        )
+
+    def get_sample(self) -> Optional[dict]:
+        response = self._transport.request_or_default(
+            "get_sample",
+            method="post",
+            timeout=10.0,
+            retries=2,
+            default={},
+            warn_message="Failed to fetch sample",
+        )
+        return response.get("sample")
+
+    def empty_buffer(self) -> dict:
+        return self._transport.request_or_default(
+            "empty_buffer",
+            method="post",
+            timeout=15.0,
+            retries=2,
+            default={"empty_buffer": False, "error": "request_failed"},
+            warn_message="Failed to empty vLLM buffer",
+        )
+
+    def fill_buffer(self, num_samples: Optional[int] = None) -> dict:
+        payload = {"num_samples": int(num_samples)} if num_samples is not None else None
+        return self._transport.request_or_default(
+            "buffer_fill",
+            method="post",
+            json=payload,
+            timeout=30.0,
+            retries=2,
+            default={"buffer_fill": False, "error": "request_failed"},
+            warn_message="Failed to request buffer fill",
+        )
+
+    def buffer_status(
+        self,
+        *,
+        timeout: float = 5.0,
+        max_retries: int = 0,
+        log_failures: bool = False,
+    ) -> dict:
+        warn_message = (
+            "Failed to fetch buffer status" if log_failures else "Buffer status probe failed"
+        )
+        warn_level = logging.WARNING if log_failures else logging.DEBUG
+        return self._transport.request_or_default(
+            "buffer_status",
+            method="get",
+            timeout=timeout,
+            retries=max_retries,
+            default={},
+            warn_message=warn_message,
+            warn_level=warn_level,
+        )
+
+    def _wait_for_status(
+        self,
+        predicate: Callable[[dict], bool],
+        *,
+        timeout: float,
+        poll_interval: float,
+        max_poll_interval: float,
+        backoff_factor: float,
+    ) -> bool:
+        deadline = time.monotonic() + timeout
+        current_interval = max(float(poll_interval), 0.1)
+        max_interval = max(current_interval, float(max_poll_interval))
+        while time.monotonic() < deadline:
+            status = self.buffer_status(
+                timeout=max(1.0, min(current_interval * 2.0, 8.0)),
+                max_retries=0,
+                log_failures=False,
+            )
+            if status and predicate(status):
+                return True
+            time.sleep(current_interval)
+            current_interval = self._next_backoff_interval(
+                current_interval,
+                factor=backoff_factor,
+                max_interval=max_interval,
+            )
+        return False
+
+    def wait_for_buffer_ready(
+        self,
+        *,
+        min_size: int = 1,
+        timeout: float = 120.0,
+        poll_interval: float = 1.0,
+        max_poll_interval: float = 5.0,
+        backoff_factor: float = 1.5,
+        filling_grace_timeout: float = 600.0,
+        assume_filling: bool = False,
+    ) -> bool:
+        start_time = time.monotonic()
+        base_deadline = start_time + timeout
+        filling_deadline: Optional[float] = (
+            start_time + float(filling_grace_timeout) if assume_filling else None
+        )
+        current_interval = max(float(poll_interval), 0.1)
+        max_interval = max(current_interval, float(max_poll_interval))
+        tracker = _FillTracker(seen_activity=bool(assume_filling))
+
+        while True:
+            now = time.monotonic()
+            status = self.buffer_status(
+                timeout=max(3.0, min(current_interval * 2.0, 8.0)),
+                max_retries=0,
+                log_failures=False,
+            )
+            if status:
+                snap = self._build_fill_snapshot(status)
+                if snap.current_size >= min_size and not snap.is_filling:
+                    return True
+                if snap.is_filling:
+                    progressed = tracker.observe(snap)
+                    if filling_deadline is None or progressed:
+                        filling_deadline = now + float(filling_grace_timeout)
+                else:
+                    if filling_deadline is not None and self._fill_completed(snap):
+                        return False
+                    if not tracker.seen_activity:
+                        filling_deadline = None
+                        tracker.clear_idle_markers()
+
+            if filling_deadline is not None and now >= filling_deadline:
+                return False
+            if filling_deadline is None and now >= base_deadline:
+                return False
+
+            time.sleep(current_interval)
+            current_interval = self._next_backoff_interval(
+                current_interval,
+                factor=backoff_factor,
+                max_interval=max_interval,
+            )
+
+    def wait_until_sleeping(
+        self,
+        *,
+        timeout: float = 120.0,
+        poll_interval: float = 1.0,
+        max_poll_interval: float = 5.0,
+        backoff_factor: float = 1.5,
+    ) -> bool:
+        def _sleeping(status: dict) -> bool:
+            return bool(status.get("is_sleeping", False)) and not bool(
+                status.get("sleep_requested", False)
+            ) and not bool(status.get("is_filling", False))
+
+        return self._wait_for_status(
+            _sleeping,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            max_poll_interval=max_poll_interval,
+            backoff_factor=backoff_factor,
+        )
+
+    def wait_until_awake(
+        self,
+        *,
+        timeout: float = 120.0,
+        poll_interval: float = 1.0,
+        max_poll_interval: float = 5.0,
+        backoff_factor: float = 1.5,
+    ) -> bool:
+        def _awake(status: dict) -> bool:
+            return (not bool(status.get("is_sleeping", False))) and (
+                not bool(status.get("sleep_requested", False))
+            )
+
+        return self._wait_for_status(
+            _awake,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            max_poll_interval=max_poll_interval,
+            backoff_factor=backoff_factor,
+        )
+
+    def _post_control_command(
+        self,
+        *,
+        endpoint: str,
+        success_key: str,
+        wait_fn: Callable[..., bool],
+        wait_timeout: float,
+        max_retries: int,
+        initial_delay: float,
+        max_delay: float,
+    ) -> dict:
+        delay = max(float(initial_delay), 0.1)
+        capped_delay = max(delay, float(max_delay))
+        for attempt in range(max_retries):
+            try:
+                response = self._transport.request(
+                    endpoint,
+                    method="post",
+                    timeout=20.0,
+                    retries=2,
+                )
+                if response.get(success_key, False):
+                    if not wait_fn(timeout=wait_timeout, poll_interval=1.0):
+                        logger.warning(
+                            "%s acknowledged but server did not reach steady state",
+                            endpoint,
+                        )
+                    return response
+            except Exception as exc:
+                logger.warning("%s attempt %s failed: %s", endpoint, attempt + 1, exc)
+
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+                delay = min(delay * 2.0, capped_delay)
+        return {success_key: False, "error": "Max retries exceeded"}
+
+    def sleep(
+        self,
+        *,
+        max_retries: int = 100,
+        retry_sleep_time: float = 2.0,
+        max_retry_sleep_time: float = 8.0,
+    ) -> dict:
+        return self._post_control_command(
+            endpoint="sleep",
+            success_key="sleep",
+            wait_fn=self.wait_until_sleeping,
+            wait_timeout=60.0,
+            max_retries=max_retries,
+            initial_delay=retry_sleep_time,
+            max_delay=max_retry_sleep_time,
+        )
+
+    def wake_up(
+        self,
+        *,
+        max_retries: int = 10,
+        retry_wake_up_time: float = 1.0,
+        max_retry_wake_up_time: float = 8.0,
+    ) -> dict:
+        return self._post_control_command(
+            endpoint="wake_up",
+            success_key="wake_up",
+            wait_fn=self.wait_until_awake,
+            wait_timeout=60.0,
+            max_retries=max_retries,
+            initial_delay=retry_wake_up_time,
+            max_delay=max_retry_wake_up_time,
+        )
+
+
 class VLLMClient:
+    """Facade preserving existing public API while delegating responsibilities."""
+
     def __init__(
         self,
         host: str = "0.0.0.0",
@@ -50,349 +637,95 @@ class VLLMClient:
         self.host = host
         self.server_port = server_port
         self.group_port = group_port
-        self._base_url = f"http://{self.host}:{self.server_port}"
-        self._init_communicator = init_communicator
-        self._connection_timeout = connection_timeout
-        
-        # Try to connect with retries
+        self._init_communicator = bool(init_communicator)
+        self._connection_timeout = float(connection_timeout)
+
+        self._transport = _VLLMTransport(self.session, host, server_port)
+        self._buffer = _BufferController(self._transport)
+        self._communicator = _CommunicatorSync(self._transport, host, group_port)
+        self._model_sync = _ModelSync(self._communicator)
+
         self._connect_with_retries()
-        
-        if init_communicator:
+        if self._init_communicator:
             self._init_communicator_with_retries()
             atexit.register(self.close_communicator)
-        else:
-            self.rank = 0
-            self.pynccl_comm = None
 
-    def _connect_with_retries(self):
-        """Connect to server with automatic retries."""
+    @property
+    def rank(self) -> int:
+        return self._communicator.rank
+
+    @property
+    def pynccl_comm(self) -> Optional[PyNcclCommunicator]:
+        return self._communicator.pynccl_comm
+
+    def check_server(self, total_timeout: float = 180.0, retry_interval: float = 2.0) -> None:
+        self._transport.wait_for_health(total_timeout, retry_interval)
+
+    def _connect_with_retries(self) -> None:
         max_attempts = 3
         for attempt in range(max_attempts):
             try:
                 self.check_server(self._connection_timeout)
                 return
-            except Exception as e:
-                logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
+            except Exception as exc:
+                logger.warning("Connection attempt %s failed: %s", attempt + 1, exc)
                 if attempt < max_attempts - 1:
-                    logger.info(f"Retrying connection in 5 seconds...")
-                    time.sleep(5)
-                else:
-                    logger.error("Failed to connect to VLLM server. Training will continue but VLLM operations may fail.")
+                    time.sleep(5.0)
+        logger.error(
+            "Failed to connect to VLLM server; subsequent client operations may fail."
+        )
 
-    def _init_communicator_with_retries(self):
-        """Initialize communicator with automatic retries."""
+    def _init_communicator_with_retries(self) -> None:
         max_attempts = 3
         for attempt in range(max_attempts):
             try:
                 self.init_communicator()
                 return
-            except Exception as e:
-                logger.warning(f"Communicator init attempt {attempt + 1} failed: {e}")
-                if attempt < max_attempts - 1:
-                    logger.info(f"Retrying communicator init in 3 seconds...")
-                    time.sleep(3)
-                else:
-                    logger.error("Failed to initialize communicator. Some operations may not work.")
-                    self.rank = 0
-                    self.pynccl_comm = None
-
-    def _make_request(self, endpoint: str, method: str = "get", max_retries: int = 3, retry_delay: float = 2.0, **kwargs) -> dict:
-        url = f"{self._base_url}/{endpoint.strip('/')}/"
-        
-        for attempt in range(max_retries + 1):
-            try:
-                if method.lower() == "get":
-                    response = self.session.get(url, **kwargs)
-                else:
-                    response = self.session.post(url, **kwargs)
-
-                if response.status_code == 200:
-                    return response.json() if response.content else {}
-                raise Exception(f"Request failed: {response.status_code}, {response.text}")
-                
-            except requests.exceptions.RequestException as e:
-                if attempt < max_retries:
-                    logger.warning(f"Connection failed (attempt {attempt + 1}/{max_retries + 1}): {str(e)}")
-                    logger.info(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    # Exponential backoff
-                    retry_delay *= 1.5
-                else:
-                    logger.error(f"Failed to connect after {max_retries + 1} attempts: {str(e)}")
-                    raise ConnectionError(f"Failed to connect to {url}: {str(e)}")
-        
-        # This should never be reached, but just in case
-        raise ConnectionError(f"Unexpected error connecting to {url}")
-
-    def check_server(self, total_timeout: float = 180.0, retry_interval: float = 2.0):
-        url = f"http://{self.host}:{self.server_port}/health/"
-        start_time = time.time()  # Record the start time
-
-        while True:
-            try:
-                response = requests.get(url)
-            except requests.exceptions.RequestException as exc:
-                # Check if the total timeout duration has passed
-                elapsed_time = time.time() - start_time
-                if elapsed_time >= total_timeout:
-                    raise ConnectionError(
-                        f"The vLLM server can't be reached at {self.host}:{self.server_port} after {total_timeout} "
-                        "seconds. Make sure the server is running by running `Fuchsia serve`."
-                    ) from exc
-            else:
-                if response.status_code == 200:
-                    print("Server is up!")
-                    return None
-            print( f"Server is not up yet. Retrying in {retry_interval} seconds...")
-            time.sleep(retry_interval)
-
-    def generate(
-        self,
-        prompts: list[str],
-        n: int = 1,
-        repetition_penalty: float = 1.0,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = -1,
-        min_p: float = 0.0,
-        max_tokens: int = 16,
-        guided_decoding_regex: Optional[str] = None,
-    ) -> list[list[str]]:
-        """
-        Generate completions with built-in fault tolerance.
-        Automatically retries on failure and returns empty list instead of crashing.
-        """
-        params = {
-            "prompts": prompts,
-            "n": n,
-            "repetition_penalty": repetition_penalty,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "min_p": min_p,
-            "max_tokens": max_tokens,
-            "guided_decoding_regex": guided_decoding_regex,
-        }
-        
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = self._make_request("generate", method="post", json=params, max_retries=2)
-                return response["completion_ids"]
-            except Exception as e:
-                logger.warning(f"Generate attempt {attempt + 1} failed with error: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2)  # Wait before retry
-                    
-        logger.error(f"Failed to generate completions after {max_retries} attempts. Returning empty list...")
-        return []
-
-    def init_communicator(self):
-        response = self._make_request("get_tensor_parallel_size")
-        tensor_parallel_size = response["tensor_parallel_size"]
-        world_size = tensor_parallel_size + 1
-        self.rank = tensor_parallel_size  # The client's rank is the last process
-
-        self._make_request(
-            "init_communicator",
-            method="post",
-            json={"host": self.host, "port": self.group_port, "world_size": world_size},
-        )
-
-        pg = StatelessProcessGroup.create(
-            host=self.host, port=self.group_port, rank=self.rank, world_size=world_size
-        )
-        self.pynccl_comm = PyNcclCommunicator(pg, device="cuda:0")
-
-    def update_named_param(self, name: str, weights: torch.Tensor):
-        """
-        Update named parameter with built-in fault tolerance.
-        Automatically retries on failure and logs warnings instead of crashing.
-        """
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                self._make_request(
-                    "update_named_param",
-                    method="post",
-                    json={
-                        "name": name,
-                        "dtype": str(weights.dtype),
-                        "shape": tuple(weights.shape),
-                    },
-                    max_retries=2
+            except Exception as exc:
+                logger.warning(
+                    "Communicator init attempt %s failed: %s",
+                    attempt + 1,
+                    exc,
                 )
-                
-                if self.pynccl_comm is not None:            
-                    self.pynccl_comm.broadcast(
-                        weights, src=self.rank, stream=torch.cuda.current_stream()
-                    )
-                    self.pynccl_comm.group.barrier()
-                
-                # Success - no need to log, this happens frequently
-                return
-                
-            except Exception as e:
-                logger.warning(f"Update parameter '{name}' attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(1)  # Wait before retry
-                    
-        logger.error(f"Failed to update parameter '{name}' after {max_retries} attempts. Skipping...")
+                if attempt < max_attempts - 1:
+                    time.sleep(3.0)
+        logger.error("Failed to initialize communicator; running without NCCL sync.")
+        self._communicator.rank = 0
+        self._communicator.pynccl_comm = None
 
-    def update_lora_params(self, model: PeftModel):
-        
-        if not isinstance(model, PeftModel):
-            raise ValueError("Model is not a PeftModel")
-            
-        target_modules = model.peft_config["default"].target_modules
-        alpha = model.peft_config["default"].lora_alpha
-        r = model.peft_config["default"].r
-        print(target_modules)
-        weights = {}
-        for name, param in model.named_parameters():
-            weights[name] = param.data
-            
-        for name, param in model.named_parameters():
-            if "lora" in name:
-                continue
-            if any(target in name for target in target_modules):
-                if "bias" in name:
-                    new_name = name.replace("base_model.model.","")
-                    new_wights = param.data.clone() 
-                    self.update_named_param(new_name, new_wights)
-                    continue
+    def init_communicator(self) -> None:
+        self._communicator.init()
 
-                if "lora" not in name:
-                    prefix = name.replace(".base_layer.weight","")
-                    A_name = f"{prefix}.lora_A.default.weight"
-                    B_name = f"{prefix}.lora_B.default.weight"
-                    delta = (weights[B_name].data.clone() @ weights[A_name].data.clone()) * (alpha / r)
-                    new_wights = param.data.clone() + delta
-                    new_name = name.replace("base_model.model.","").replace(".base_layer.weight",".weight")
-                    self.update_named_param(new_name, new_wights)
+    def close_communicator(self) -> dict:
+        return self._communicator.close(enabled=self._init_communicator)
 
-    def update_model_params(self, model: nn.Module,tokenizer=None, lora=False, single_gpu=False,lora_path=None):
-        if single_gpu:
-            # for name, param in model.named_parameters():
-            #     if "lora" in name:
-            #         print(f"{param.data.sum()}")
-            if tokenizer is not None:
-                tokenizer.save_pretrained(lora_path)
-            model.save_pretrained(lora_path,adapter_name="grpo")
-            return
-        if lora:
-            self.update_lora_params(model)
-            return
-        
-        for name, param in model.named_parameters():
-            self.update_named_param(name, param.data)
+    def update_named_param(self, name: str, weights: torch.Tensor) -> None:
+        self._communicator.push_named_param(name, weights)
 
-    def reset_prefix_cache(self):
-        """Reset prefix cache with built-in fault tolerance."""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                self._make_request("reset_prefix_cache", method="post", max_retries=2)
-                logger.info("Prefix cache successfully reset")
-                return
-            except Exception as e:
-                logger.warning(f"Reset prefix cache attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(1)
-                    
-        logger.error(f"Failed to reset prefix cache after {max_retries} attempts. Continuing anyway...")
-
-    def close_communicator(self):
-        """Close communicator with built-in fault tolerance."""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                self._make_request("close_communicator", method="post", max_retries=2)
-                logger.info("Communicator successfully closed")
-                return
-            except Exception as e:
-                logger.warning(f"Close communicator attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(1)
-                    
-        logger.error(f"Failed to close communicator after {max_retries} attempts. Continuing anyway...")
+    def update_model_params(
+        self,
+        model: nn.Module,
+        tokenizer=None,
+        lora: bool = False,
+        single_gpu: bool = False,
+        lora_path: Optional[str] = None,
+    ) -> None:
+        self._model_sync.update_model_params(
+            model,
+            tokenizer,
+            lora=lora,
+            single_gpu=single_gpu,
+            lora_path=lora_path,
+        )
 
     def get_sample(self) -> Optional[dict]:
-        """
-        Get a sample from the VLLM server with built-in fault tolerance.
-        Automatically retries on failure and returns None instead of crashing.
-        """
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = self._make_request("get_sample", method="post", max_retries=2)
-                return response.get("sample")
-            except Exception as e:
-                logger.warning(f"Get sample attempt {attempt + 1} failed with error: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(1)  # Wait before retry
-                    
-        logger.error(f"Failed to get sample after {max_retries} attempts. Returning None...")
-        return None
+        return self._buffer.get_sample()
 
-    def empty_buffer(self):
-        """
-        Empty the VLLM server buffer with built-in fault tolerance.
-        Automatically retries on failure and logs warnings instead of crashing.
-        """
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                result = self._make_request("empty_buffer", method="post", max_retries=2)
-                logger.info("VLLM buffer successfully emptied")
-                return result
-            except Exception as e:
-                logger.warning(f"Empty buffer attempt {attempt + 1} failed with error: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(1)  # Wait before retry
-                    
-        logger.error(f"Failed to empty buffer after {max_retries} attempts. Continuing anyway...")
-        return {"empty_buffer": False, "error": "Max retries exceeded"}
+    def empty_buffer(self) -> dict:
+        return self._buffer.empty_buffer()
 
-    def fill_buffer(self, num_samples: int = None):
-        """
-        Fill the VLLM server buffer with built-in fault tolerance.
-        Automatically retries on failure and logs warnings instead of crashing.
-        """
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                if num_samples is None:
-                    result = self._make_request("buffer_fill", method="post", max_retries=2)
-                else:
-                    result = self._make_request(
-                        "buffer_fill", method="post", json={"num_samples": num_samples}, max_retries=2
-                    )
-                logger.info("VLLM buffer successfully filled")
-                return result
-            except Exception as e:
-                logger.warning(f"Buffer fill attempt {attempt + 1} failed with error: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2)  # Wait before retry
-                    
-        logger.error(f"Failed to fill buffer after {max_retries} attempts. Continuing anyway...")
-        return {"buffer_fill": False, "error": "Max retries exceeded"}
-
-    def trigger_buffer_fill(self):
-        """Trigger buffer fill with built-in fault tolerance."""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                result = self._make_request("buffer_fill", method="post", max_retries=2)
-                logger.info("Buffer fill successfully triggered")
-                return result
-            except Exception as e:
-                logger.warning(f"Trigger buffer fill attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(1)
-                    
-        logger.error(f"Failed to trigger buffer fill after {max_retries} attempts. Continuing anyway...")
-        return {"buffer_fill": False, "error": "Max retries exceeded"}
+    def fill_buffer(self, num_samples: Optional[int] = None) -> dict:
+        return self._buffer.fill_buffer(num_samples)
 
     def buffer_status(
         self,
@@ -400,51 +733,12 @@ class VLLMClient:
         timeout: float = 5.0,
         max_retries: int = 0,
         log_failures: bool = False,
-    ):
-        """
-        Get VLLM buffer/sleep status.
-        Returns an empty dict when status is unavailable.
-        """
-        try:
-            return self._make_request(
-                "buffer_status",
-                method="get",
-                max_retries=max_retries,
-                timeout=timeout,
-            )
-        except Exception as e:
-            if log_failures:
-                logger.warning(f"Failed to fetch buffer status: {e}")
-            else:
-                logger.debug("Buffer status probe failed: %s", e)
-            return {}
-
-    def _wait_for_status(
-        self,
-        predicate: Callable[[dict], bool],
-        timeout: float,
-        poll_interval: float,
-        max_poll_interval: float,
-        backoff_factor: float,
-    ) -> bool:
-        """
-        Poll buffer status with exponential backoff until `predicate` is satisfied or timeout elapses.
-        """
-        deadline = time.monotonic() + timeout
-        current_interval = max(float(poll_interval), 0.1)
-        max_interval = max(current_interval, float(max_poll_interval))
-
-        while time.monotonic() < deadline:
-            status = self.buffer_status(
-                timeout=max(1.0, min(poll_interval * 2.0, 3.0)),
-                max_retries=0,
-                log_failures=False,
-            )
-            if status and predicate(status):
-                return True
-            time.sleep(current_interval)
-            current_interval = min(current_interval * max(float(backoff_factor), 1.0), max_interval)
-        return False
+    ) -> dict:
+        return self._buffer.buffer_status(
+            timeout=timeout,
+            max_retries=max_retries,
+            log_failures=log_failures,
+        )
 
     def wait_for_buffer_ready(
         self,
@@ -456,111 +750,15 @@ class VLLMClient:
         filling_grace_timeout: float = 600.0,
         assume_filling: bool = False,
     ) -> bool:
-        """
-        Wait until the rollout buffer has at least `min_size` items and is not actively filling.
-        """
-        def _to_float(value) -> float | None:
-            try:
-                return float(value) if value is not None else None
-            except (TypeError, ValueError):
-                return None
-
-        start_time = time.monotonic()
-        base_deadline = start_time + timeout
-        filling_deadline: float | None = (
-            start_time + float(filling_grace_timeout) if assume_filling else None
+        return self._buffer.wait_for_buffer_ready(
+            min_size=min_size,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            max_poll_interval=max_poll_interval,
+            backoff_factor=backoff_factor,
+            filling_grace_timeout=filling_grace_timeout,
+            assume_filling=assume_filling,
         )
-        current_interval = max(float(poll_interval), 0.1)
-        max_interval = max(current_interval, float(max_poll_interval))
-        last_fill_heartbeat: float | None = None
-        last_fill_started: float | None = None
-        last_generated_groups: int | None = None
-        seen_fill_activity = bool(assume_filling)
-
-        while True:
-            now = time.monotonic()
-            status_timeout = max(3.0, min(current_interval * 2.0, 8.0))
-            status = self.buffer_status(
-                timeout=status_timeout,
-                max_retries=0,
-                log_failures=False,
-            )
-            if status:
-                current_size = int(status.get("current_size", 0))
-                slot_claimed = bool(status.get("fill_slot_claimed", False))
-                generation_in_progress = bool(status.get("generation_in_progress", False))
-                fill_started = _to_float(status.get("last_fill_started_at"))
-                fill_finished = _to_float(status.get("last_fill_finished_at"))
-                has_unfinished_fill = (
-                    fill_started is not None
-                    and (fill_finished is None or fill_finished < fill_started)
-                )
-                is_filling = bool(
-                    status.get("is_filling", False)
-                    or slot_claimed
-                    or has_unfinished_fill
-                    or generation_in_progress
-                )
-                if current_size >= min_size and not is_filling:
-                    return True
-
-                if is_filling:
-                    seen_fill_activity = True
-                    heartbeat = status.get("last_fill_heartbeat_at")
-                    try:
-                        parsed_heartbeat = float(heartbeat) if heartbeat is not None else None
-                    except (TypeError, ValueError):
-                        parsed_heartbeat = None
-
-                    if filling_deadline is None:
-                        filling_deadline = now + float(filling_grace_timeout)
-                    elif (
-                        parsed_heartbeat is not None
-                        and (last_fill_heartbeat is None or parsed_heartbeat > last_fill_heartbeat)
-                    ):
-                        filling_deadline = now + float(filling_grace_timeout)
-                    if (
-                        fill_started is not None
-                        and (last_fill_started is None or fill_started > last_fill_started)
-                    ):
-                        filling_deadline = now + float(filling_grace_timeout)
-                    generated_groups = status.get("last_fill_generated_groups")
-                    try:
-                        parsed_generated_groups = int(generated_groups)
-                    except (TypeError, ValueError):
-                        parsed_generated_groups = None
-                    if (
-                        parsed_generated_groups is not None
-                        and (
-                            last_generated_groups is None
-                            or parsed_generated_groups > last_generated_groups
-                        )
-                    ):
-                        filling_deadline = now + float(filling_grace_timeout)
-                    last_fill_heartbeat = parsed_heartbeat
-                    last_fill_started = fill_started
-                    last_generated_groups = parsed_generated_groups
-                else:
-                    fill_completed = (
-                        fill_started is not None
-                        and fill_finished is not None
-                        and fill_finished >= fill_started
-                    )
-                    if fill_completed and filling_deadline is not None:
-                        # Fill worker completed but could not produce enough items; allow caller to retry.
-                        return False
-                    if not seen_fill_activity:
-                        filling_deadline = None
-                        last_fill_heartbeat = None
-
-            if filling_deadline is not None:
-                if now >= filling_deadline:
-                    return False
-            elif now >= base_deadline:
-                return False
-
-            time.sleep(current_interval)
-            current_interval = min(current_interval * max(float(backoff_factor), 1.0), max_interval)
 
     def wait_until_sleeping(
         self,
@@ -569,17 +767,7 @@ class VLLMClient:
         max_poll_interval: float = 5.0,
         backoff_factor: float = 1.5,
     ) -> bool:
-        """
-        Wait until server reports sleeping and no pending sleep/fill operations.
-        """
-        def _sleeping(status: dict) -> bool:
-            is_sleeping = bool(status.get("is_sleeping", False))
-            sleep_requested = bool(status.get("sleep_requested", False))
-            is_filling = bool(status.get("is_filling", False))
-            return is_sleeping and not sleep_requested and not is_filling
-
-        return self._wait_for_status(
-            predicate=_sleeping,
+        return self._buffer.wait_until_sleeping(
             timeout=timeout,
             poll_interval=poll_interval,
             max_poll_interval=max_poll_interval,
@@ -593,87 +781,33 @@ class VLLMClient:
         max_poll_interval: float = 5.0,
         backoff_factor: float = 1.5,
     ) -> bool:
-        """
-        Wait until server reports awake state (not sleeping and no pending sleep request).
-        """
-        def _awake(status: dict) -> bool:
-            is_sleeping = bool(status.get("is_sleeping", False))
-            sleep_requested = bool(status.get("sleep_requested", False))
-            return (not is_sleeping) and (not sleep_requested)
-
-        return self._wait_for_status(
-            predicate=_awake,
+        return self._buffer.wait_until_awake(
             timeout=timeout,
             poll_interval=poll_interval,
             max_poll_interval=max_poll_interval,
             backoff_factor=backoff_factor,
         )
 
-    def sleep(self, max_retries=100, retry_sleep_time=2, max_retry_sleep_time=8):
-        """
-        Put the VLLM server to sleep with built-in fault tolerance.
-        Automatically retries on failure and logs warnings instead of crashing.
-        """ 
-        for attempt in range(max_retries):
-            try:
-                response = self._make_request("sleep", method="post", max_retries=2)
-                if response and response.get("sleep", False):
-                    if not self.wait_until_sleeping(timeout=60.0, poll_interval=1.0):
-                        logger.warning("Sleep acknowledged but server did not report steady sleeping state within timeout")
-                    logger.info("VLLM client successfully put to sleep")
-                    return response
-                else:
-                    logger.warning(f"Sleep attempt {attempt + 1} failed: {response}")
-                    if attempt < max_retries - 1:
-                        time.sleep(retry_sleep_time)  # Wait before retry
-                        retry_sleep_time = min(retry_sleep_time * 2, max_retry_sleep_time)
-            except Exception as e:
-                logger.warning(f"Sleep attempt {attempt + 1} failed with error: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(retry_sleep_time)  # Wait before retry
-                    retry_sleep_time = min(retry_sleep_time * 2, max_retry_sleep_time)
-                    
-        logger.error(f"Failed to put VLLM client to sleep after {max_retries} attempts. Continuing anyway...")
-        return {"sleep": False, "error": "Max retries exceeded"}
+    def sleep(
+        self,
+        max_retries: int = 100,
+        retry_sleep_time: float = 2.0,
+        max_retry_sleep_time: float = 8.0,
+    ) -> dict:
+        return self._buffer.sleep(
+            max_retries=max_retries,
+            retry_sleep_time=retry_sleep_time,
+            max_retry_sleep_time=max_retry_sleep_time,
+        )
 
-    def wake_up(self, max_retries=10, retry_wake_up_time=1, max_retry_wake_up_time=8):
-        """
-        Wake up the VLLM server with built-in fault tolerance.
-        Automatically retries on failure and logs warnings instead of crashing.
-        """
-        for attempt in range(max_retries):
-            try:
-                res = self._make_request("wake_up", method="post", max_retries=2)
-                if not self.wait_until_awake(timeout=60.0, poll_interval=1.0):
-                    logger.warning(
-                        "Wake acknowledged but server did not report steady awake state within timeout"
-                    )
-                logger.info("VLLM client successfully woken up")
-                return res
-            except Exception as e:
-                logger.warning(f"Wake up attempt {attempt + 1} failed with error: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(retry_wake_up_time)  # Wait before retry
-                    retry_wake_up_time = min(retry_wake_up_time * 2, max_retry_wake_up_time)
-                    
-        logger.error(f"Failed to wake up VLLM client after {max_retries} attempts. Continuing anyway...")
-        return {"wake_up": False, "error": "Max retries exceeded"}
-
-
-# Example usage
-if __name__ == "__main__":
-    from vllm import SamplingParams
-
-    client = VLLMClient()
-
-    # Generate completions
-    responses = client.generate(["Hello, AI!", "Tell me a joke"], n=4, max_tokens=32)
-    print("Responses:", responses)  # noqa
-
-    # Update model weights
-    from transformers import AutoModelForCausalLM
-
-    model = AutoModelForCausalLM.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B").to(
-        "cuda"
-    )
-    client.update_model_params(model)
+    def wake_up(
+        self,
+        max_retries: int = 10,
+        retry_wake_up_time: float = 1.0,
+        max_retry_wake_up_time: float = 8.0,
+    ) -> dict:
+        return self._buffer.wake_up(
+            max_retries=max_retries,
+            retry_wake_up_time=retry_wake_up_time,
+            max_retry_wake_up_time=max_retry_wake_up_time,
+        )
