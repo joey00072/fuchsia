@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Optional
 
+import torch
 import torch.nn as nn
 
 try:
@@ -9,9 +11,95 @@ try:
 except Exception:  # pragma: no cover - depends on torch build
     checkpoint_wrapper = None
 
-from fuchsia.cpu_offloading import cpu_offloaded_checkpoint
-
 CHECKPOINT_MODES = {"activation", "activation_offload"}
+_CHECKPOINT_WRAPPER_KWARGS = {
+    "preserve_rng_state",
+    "use_reentrant",
+    "determinism_check",
+    "debug",
+    "context_fn",
+    "early_stop",
+}
+
+
+class _CPUOffloadedCheckpoint(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, run_fn, activations):
+        with torch.no_grad():
+            outputs = run_fn(activations)
+
+        ctx.run_fn = run_fn
+        ctx.device = activations.device
+        ctx.save_for_backward(activations.to("cpu", non_blocking=True))
+        return outputs
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        (cpu_activations,) = ctx.saved_tensors
+        replay_activations = cpu_activations.to(ctx.device, non_blocking=True).detach()
+        replay_activations.requires_grad_(True)
+
+        with torch.enable_grad():
+            outputs = ctx.run_fn(replay_activations)
+
+        if torch.is_tensor(outputs):
+            outputs_seq = (outputs,)
+        elif isinstance(outputs, Sequence):
+            outputs_seq = tuple(outputs)
+        else:
+            raise TypeError(
+                f"Unsupported checkpoint output type: {type(outputs)!r}"
+            )
+
+        tensor_outputs: list[torch.Tensor] = []
+        tensor_grads: list[torch.Tensor] = []
+        for idx, out in enumerate(outputs_seq):
+            if not torch.is_tensor(out) or not out.requires_grad:
+                continue
+            grad = grad_outputs[idx] if idx < len(grad_outputs) else None
+            if grad is None:
+                if out.numel() != 1:
+                    raise RuntimeError(
+                        "Missing gradient for non-scalar checkpoint output"
+                    )
+                grad = torch.ones_like(out)
+            tensor_outputs.append(out)
+            tensor_grads.append(grad)
+
+        if tensor_outputs:
+            torch.autograd.backward(tensor_outputs, tensor_grads)
+
+        return None, replay_activations.grad
+
+
+def _find_primary_activation_index(args: tuple[object, ...]) -> int | None:
+    for idx, value in enumerate(args):
+        if torch.is_tensor(value) and value.is_floating_point():
+            return idx
+    return None
+
+
+def cpu_offloaded_checkpoint(function, *args, **kwargs):
+    if not args:
+        return function(*args, **kwargs)
+
+    forward_kwargs = dict(kwargs)
+    for key in _CHECKPOINT_WRAPPER_KWARGS:
+        forward_kwargs.pop(key, None)
+
+    hidden_idx = _find_primary_activation_index(args)
+    if hidden_idx is None:
+        return function(*args, **forward_kwargs)
+
+    hidden_states = args[hidden_idx]
+    prefix = args[:hidden_idx]
+    suffix = args[hidden_idx + 1 :]
+
+    def run_fn(replay_hidden_states):
+        call_args = (*prefix, replay_hidden_states, *suffix)
+        return function(*call_args, **forward_kwargs)
+
+    return _CPUOffloadedCheckpoint.apply(run_fn, hidden_states)
 
 
 def _resolve_transformer_layers(model: nn.Module) -> Optional[nn.ModuleList]:
