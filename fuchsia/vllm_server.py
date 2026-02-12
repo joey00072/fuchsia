@@ -507,6 +507,12 @@ class VLLMServer:
     async def _request_wake_up(self) -> dict:
         """Wakes up the LLM engine from sleep mode."""
         try:
+            if self.is_data_sampler and not self._is_sleeping:
+                return {
+                    "message": "LLM engine is already awake",
+                    "wake_up": True,
+                    "already_awake": True,
+                }
             self.llm.wake_up()
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -518,10 +524,10 @@ class VLLMServer:
                 self._lora_request_id += 1
                 self._sleep_requested = False
                 self._is_sleeping = False
-            return {"message": "LLM engine has been woken up successfully"}
+            return {"message": "LLM engine has been woken up successfully", "wake_up": True}
         except Exception as exc:
             logger.error("Failed to wake up LLM: %s", exc)
-            return {"error": f"Failed to wake up LLM: {exc}"}
+            return {"error": f"Failed to wake up LLM: {exc}", "wake_up": False}
 
     def _try_schedule_buffer_fill(
         self,

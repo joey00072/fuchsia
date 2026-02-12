@@ -572,6 +572,14 @@ class _BufferController:
                     timeout=20.0,
                     retries=2,
                 )
+                # Backward compatibility: older wake endpoints may omit "wake_up".
+                if (
+                    endpoint == "wake_up"
+                    and success_key not in response
+                    and "error" not in response
+                ):
+                    response[success_key] = True
+                    response["inferred_success"] = True
                 if response.get(success_key, False):
                     if not wait_fn(timeout=wait_timeout, poll_interval=1.0):
                         logger.warning(
