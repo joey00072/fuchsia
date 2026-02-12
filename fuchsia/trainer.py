@@ -1231,8 +1231,8 @@ class Trainer:
                     group_metrics["gpu/peak_reserved_gb"],
                 )
 
-                for metric_name, metric_value in group_metrics.items():
-                    iteration_metrics[metric_name].append(metric_value)
+                for metric_name, values in iteration_metrics.items():
+                    values.append(group_metrics[metric_name])
 
             if not iteration_metrics["loss"]:
                 continue
