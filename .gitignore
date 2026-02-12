@@ -72,6 +72,8 @@ coverage.xml
 # Fuchsia
 wandb/
 lora_weights/ 
+AGENTS.md
+docs/agent_docs/
 
 dev*
 unsloth*

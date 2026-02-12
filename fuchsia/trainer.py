@@ -4,7 +4,7 @@ import gc
 import logging
 import os
 import time
-from collections import defaultdict
+from numbers import Real
 from pathlib import Path
 from typing import Callable, List, Optional, Union, Dict, Any, Tuple, Iterator
 
@@ -137,7 +137,8 @@ class Trainer:
         if self.log_wandb:
             wandb.init(project=config.wandb_project)
 
-        self.metrics = defaultdict(list)
+        self.metrics: dict[str, float] = {}
+        self._last_logged_step = 0
 
         self._debug_log(
             "trainer_init model=%s device=%s batch_size=%s group_size=%s micro_batch_size=%s "
@@ -211,6 +212,64 @@ class Trainer:
             total_bytes / (1024**3),
             payload,
         )
+
+    @staticmethod
+    def _is_numeric_scalar(value: Any) -> bool:
+        return isinstance(value, Real) and not isinstance(value, bool)
+
+    def _current_learning_rate(self) -> float:
+        if not self.optimizer.param_groups:
+            return 0.0
+        return float(self.optimizer.param_groups[0].get("lr", 0.0))
+
+    def _compute_grad_norm(self) -> float:
+        total_sq = 0.0
+        for param in self.model.parameters():
+            grad = getattr(param, "grad", None)
+            if grad is None:
+                continue
+            grad_norm = grad.detach().float().norm(2).item()
+            total_sq += grad_norm * grad_norm
+        return total_sq ** 0.5
+
+    def _collect_gpu_metrics(self) -> dict[str, float]:
+        if not torch.cuda.is_available():
+            return {
+                "gpu/allocated_gb": 0.0,
+                "gpu/reserved_gb": 0.0,
+                "gpu/free_gb": 0.0,
+                "gpu/total_gb": 0.0,
+                "gpu/peak_allocated_gb": 0.0,
+                "gpu/peak_reserved_gb": 0.0,
+            }
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        return {
+            "gpu/allocated_gb": float(torch.cuda.memory_allocated() / (1024**3)),
+            "gpu/reserved_gb": float(torch.cuda.memory_reserved() / (1024**3)),
+            "gpu/free_gb": float(free_bytes / (1024**3)),
+            "gpu/total_gb": float(total_bytes / (1024**3)),
+            "gpu/peak_allocated_gb": float(torch.cuda.max_memory_allocated() / (1024**3)),
+            "gpu/peak_reserved_gb": float(torch.cuda.max_memory_reserved() / (1024**3)),
+        }
+
+    def _log_to_wandb(self, metrics: dict[str, Any], *, step: Optional[int] = None) -> None:
+        if not self.log_wandb:
+            return
+        payload = {k: float(v) for k, v in metrics.items() if self._is_numeric_scalar(v)}
+        if not payload:
+            return
+        if step is None:
+            wandb.log(payload)
+            return
+        wandb.log(payload, step=step)
+
+    def _record_step_metrics(self, step: int, metrics: dict[str, Any]) -> None:
+        self._last_logged_step = step
+        self.metrics["idx"] = float(step)
+        for key, value in metrics.items():
+            if self._is_numeric_scalar(value):
+                self.metrics[key] = float(value)
+        self._log_to_wandb(metrics, step=step)
 
     def _setup_memory_management(self) -> None:
         """Setup CUDA memory management for optimal performance."""
@@ -612,22 +671,24 @@ class Trainer:
 
         return loss.mean(), avg_kld
 
-    def sample_batch(self) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, dict]:
+    def sample_batch(self) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, dict, dict[str, float]]:
         prepared = next(self.data_loader_iter)
         if not isinstance(prepared, dict):
             raise RuntimeError(
                 f"Prepared dataset must yield dict batches, got {type(prepared)}"
             )
 
+        batch_metrics: dict[str, float] = {}
         metrics = prepared.get("metrics", {})
         if isinstance(metrics, dict):
             prompts = metrics.get("prompt")
             completions = metrics.get("completions")
             if prompts is not None and completions is not None:
-                self.metrics["samples"].append({"prompt": prompts, "completions": completions})
+                batch_metrics["rollout/prompt_count"] = float(len(prompts))
+                batch_metrics["rollout/completion_count"] = float(len(completions))
             avg_token_lengths = metrics.get("avg_token_lengths")
             if avg_token_lengths is not None:
-                self.metrics["avg_token_lengths"].append(avg_token_lengths)
+                batch_metrics["rollout/avg_completion_tokens"] = float(avg_token_lengths)
 
             if self.config.debug:
                 decoded_outputs = metrics.get("decoded_outputs") or []
@@ -655,22 +716,23 @@ class Trainer:
             prepared["loss_mask"],
             prepared["ignore_sample"],
             server_info,
+            batch_metrics,
         )
 
     def log_metrics(self) -> None:
         if not self.log_wandb:
             return
             
-        current_idx = self.metrics.get("idx", [0])[-1] if self.metrics.get("idx") else 0
+        current_idx = int(self.metrics.get("idx", 0.0))
         
         metrics = {
-            f"train/{k}": v[-1] 
-            for k, v in self.metrics.items() 
-            if k != "idx" and v
+            k: float(v)
+            for k, v in self.metrics.items()
+            if k != "idx" and self._is_numeric_scalar(v)
         }
-        metrics["train/iteration"] = current_idx
+        metrics["train/iteration"] = float(current_idx)
         
-        wandb.log(metrics)
+        self._log_to_wandb(metrics, step=current_idx)
 
     def handle_policy_update(self) -> None:
         self.vllm_client.update_model_params(
@@ -695,6 +757,7 @@ class Trainer:
         self._debug_gpu_memory("hotswap_start")
         pre_status = self.vllm_client.buffer_status()
         self._debug_log("hotswap_status phase=start status=%s", pre_status)
+        pre_buffer_size = float(pre_status.get("current_size", 0.0)) if isinstance(pre_status, dict) else 0.0
 
         trainer_alloc_before = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
         trainer_reserved_before = torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
@@ -815,7 +878,13 @@ class Trainer:
                 f"Buffer failed to reach ready state (min_size={min_buffer_items}) before sleep; "
                 "aborting hotswap cycle to avoid trainer stall"
             )
-        self._debug_log("hotswap_status phase=buffer_ready status=%s", self.vllm_client.buffer_status())
+        buffer_ready_status = self.vllm_client.buffer_status()
+        self._debug_log("hotswap_status phase=buffer_ready status=%s", buffer_ready_status)
+        ready_buffer_size = (
+            float(buffer_ready_status.get("current_size", 0.0))
+            if isinstance(buffer_ready_status, dict)
+            else 0.0
+        )
 
         sleep_response = self.vllm_client.sleep(max_retries=40, retry_sleep_time=1, max_retry_sleep_time=4)
         if not (isinstance(sleep_response, dict) and sleep_response.get("sleep", False)):
@@ -848,6 +917,16 @@ class Trainer:
             "hotswap_timing total_seconds=%.3f wake_fill_sleep_seconds=%.3f",
             total_vllm_cycle_time,
             vllm_wake_time,
+        )
+        self._log_to_wandb(
+            {
+                "sync/hotswap_total_seconds": total_vllm_cycle_time,
+                "sync/vllm_wake_fill_sleep_seconds": vllm_wake_time,
+                "sync/buffer_size_before_wake": pre_buffer_size,
+                "sync/buffer_size_before_sleep": ready_buffer_size,
+                "sync/min_buffer_items_target": float(min_buffer_items),
+            },
+            step=self._last_logged_step if self._last_logged_step > 0 else None,
         )
 
     def _resolve_group_micro_batch_size(self, group_size: int) -> int:
@@ -895,14 +974,14 @@ class Trainer:
             torch.cuda.empty_cache()
         return pi_old
 
-    def _step_scheduler(self) -> None:
-        if not self.use_scheduler or self.scheduler is None:
-            return
-        self.scheduler.step()
-        current_lr = self.scheduler.get_last_lr()[0]
-        if self.log_wandb:
-            self.metrics["learning_rate"].append(current_lr)
+    def _step_scheduler(self) -> float:
+        if self.use_scheduler and self.scheduler is not None:
+            self.scheduler.step()
+            current_lr = float(self.scheduler.get_last_lr()[0])
+        else:
+            current_lr = self._current_learning_rate()
         self.logger.debug(f"Current learning rate: {current_lr:.2e}")
+        return current_lr
 
     def _train_single_group(
         self,
@@ -918,6 +997,9 @@ class Trainer:
         micro_ranges = list(self._iter_micro_ranges(b_inputs.shape[0], micro_batch_size))
         if not micro_ranges:
             raise RuntimeError("No microbatches produced for group training step")
+        step_started_at = time.perf_counter()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         microbatch_share = micro_batch_size / max(int(b_inputs.shape[0]), 1)
         self._debug_log(
             "group_step rows=%s micro_batch_size=%s micro_steps=%s microbatch_share=%.4f seq_len=%s",
@@ -939,6 +1021,8 @@ class Trainer:
         group_losses: list[float] = []
         group_klds: list[float] = []
         num_micro_steps = len(micro_ranges)
+        tokens_in_step = int(b_loss_mask.sum().item()) if torch.is_tensor(b_loss_mask) else 0
+        samples_in_step = int(b_inputs.shape[0])
 
         for start, end in micro_ranges:
             inputs = b_inputs[start:end]
@@ -963,19 +1047,39 @@ class Trainer:
             group_klds.append(kld)
             (loss / num_micro_steps).backward()
 
+        grad_norm = self._compute_grad_norm()
         self.optimizer.step()
-        self._step_scheduler()
+        current_lr = self._step_scheduler()
+        step_seconds = max(time.perf_counter() - step_started_at, 1e-9)
+        throughput_tokens = tokens_in_step / step_seconds
+        throughput_samples = samples_in_step / step_seconds
+        gpu_metrics = self._collect_gpu_metrics()
         self._debug_gpu_memory("group_step_end")
 
         avg_loss = sum(group_losses) / len(group_losses)
         avg_kld = sum(group_klds) / len(group_klds)
-        return {
+        step_metrics = {
             "loss": avg_loss,
             "kld": avg_kld,
             "total_reward": b_reward.mean().item(),
             "mean_group_reward": b_mean_rewards.mean().item(),
             "valid_samples": b_ignore_sample.sum().item(),
+            "optim/learning_rate": current_lr,
+            "optim/lr": current_lr,
+            "optim/grad_norm": grad_norm,
+            "perf/step_seconds": step_seconds,
+            "perf/tokens_per_step": float(tokens_in_step),
+            "perf/samples_per_step": float(samples_in_step),
+            "perf/throughput_tokens_per_sec": throughput_tokens,
+            "perf/throughput": throughput_tokens,
+            "perf/throughput_samples_per_sec": throughput_samples,
+            "perf/micro_steps": float(num_micro_steps),
+            "perf/micro_batch_size": float(micro_batch_size),
+            "perf/microbatch_share": microbatch_share,
         }
+        step_metrics.update(gpu_metrics)
+        step_metrics["perf/peak_memory_gb"] = step_metrics.get("gpu/peak_reserved_gb", 0.0)
+        return step_metrics
 
     def train(self, epochs: int = 1, max_iterations: Optional[int] = None) -> None:
         idx = 0
@@ -986,6 +1090,7 @@ class Trainer:
             if not self._is_model_on_gpu:
                 self.load_model_to_gpu()
 
+            batch_wait_started_at = time.perf_counter()
             (
                 x_batch_inputs,
                 x_rewards,
@@ -994,7 +1099,9 @@ class Trainer:
                 loss_mask,
                 ignore_samples,
                 server_info,
+                batch_metrics,
             ) = self.sample_batch()
+            batch_wait_seconds = max(time.perf_counter() - batch_wait_started_at, 0.0)
             group_size = server_info["group_size"]
             micro_batch_size = self._resolve_group_micro_batch_size(group_size)
             microbatch_share = micro_batch_size / max(group_size, 1)
@@ -1083,28 +1190,76 @@ class Trainer:
                     b_std_rewards,
                     micro_batch_size,
                 )
+                step_metrics = {
+                    "train/loss": group_metrics["loss"],
+                    "train/kld": group_metrics["kld"],
+                    "train/total_reward": group_metrics["total_reward"],
+                    "train/mean_group_reward": group_metrics["mean_group_reward"],
+                    "train/valid_samples": group_metrics["valid_samples"],
+                    "perf/group_size": float(group_size),
+                    "perf/data_wait_seconds": batch_wait_seconds,
+                    "perf/loss_mask_tokens": float(b_loss_mask.sum().item()),
+                }
+                for key, value in batch_metrics.items():
+                    step_metrics[key] = value
+                for key, value in group_metrics.items():
+                    if "/" in key:
+                        step_metrics[key] = value
+                step_metrics["train/iteration"] = float(idx)
+                self._record_step_metrics(idx, step_metrics)
+
                 print(
-                    f"{idx:04d} loss: {group_metrics['loss']} "
-                    f"reward: {group_metrics['total_reward']}"
+                    f"{idx:04d} loss: {group_metrics['loss']:.6f} "
+                    f"reward: {group_metrics['total_reward']:.6f} "
+                    f"kld: {group_metrics['kld']:.6f} "
+                    f"lr: {group_metrics['optim/learning_rate']:.3e} "
+                    f"grad_norm: {group_metrics['optim/grad_norm']:.4f} "
+                    f"tok/s: {group_metrics['perf/throughput_tokens_per_sec']:.1f} "
+                    f"gpu_peak_res_gb: {group_metrics['gpu/peak_reserved_gb']:.2f}"
+                )
+                self.logger.info(
+                    "Step %s | loss %.6f | reward %.6f | kld %.6f | lr %.3e | grad_norm %.4f | "
+                    "step_time %.3fs | tok/s %.1f | peak_res %.2fGB",
+                    idx,
+                    group_metrics["loss"],
+                    group_metrics["total_reward"],
+                    group_metrics["kld"],
+                    group_metrics["optim/learning_rate"],
+                    group_metrics["optim/grad_norm"],
+                    group_metrics["perf/step_seconds"],
+                    group_metrics["perf/throughput_tokens_per_sec"],
+                    group_metrics["gpu/peak_reserved_gb"],
                 )
 
                 for metric_name, metric_value in group_metrics.items():
                     iteration_metrics[metric_name].append(metric_value)
 
-            if self.log_wandb and iteration_metrics["loss"]:
-                self.metrics["idx"].append(idx)
-                self.metrics["total_reward"].append(sum(iteration_metrics["total_reward"]) / len(iteration_metrics["total_reward"]))
-                self.metrics["mean_group_reward"].append(sum(iteration_metrics["mean_group_reward"]) / len(iteration_metrics["mean_group_reward"]))
-                self.metrics["loss"].append(sum(iteration_metrics["loss"]) / len(iteration_metrics["loss"]))
-                self.metrics["valid_samples"].append(sum(iteration_metrics["valid_samples"]))
-                self.metrics["kld"].append(sum(iteration_metrics["kld"]) / len(iteration_metrics["kld"]))
-
             if not iteration_metrics["loss"]:
                 continue
 
-            print(f"iter {idx}  >>> reward: {sum(iteration_metrics['mean_group_reward']) / len(iteration_metrics['mean_group_reward'])}")
+            avg_iter_reward = sum(iteration_metrics["mean_group_reward"]) / len(iteration_metrics["mean_group_reward"])
+            avg_iter_loss = sum(iteration_metrics["loss"]) / len(iteration_metrics["loss"])
+            avg_iter_kld = sum(iteration_metrics["kld"]) / len(iteration_metrics["kld"])
+            print(f"iter {idx}  >>> reward: {avg_iter_reward}")
             print(f"Total time: {str(datetime.timedelta(seconds=int(time.perf_counter() - start_time)))}")
-            self.log_metrics()
+            self.logger.info(
+                "Iteration summary up to step %s | mean_reward %.6f | mean_loss %.6f | mean_kld %.6f | "
+                "data_wait %.3fs",
+                idx,
+                avg_iter_reward,
+                avg_iter_loss,
+                avg_iter_kld,
+                batch_wait_seconds,
+            )
+            self._log_to_wandb(
+                {
+                    "iter/mean_reward": avg_iter_reward,
+                    "iter/mean_loss": avg_iter_loss,
+                    "iter/mean_kld": avg_iter_kld,
+                    "iter/data_wait_seconds": batch_wait_seconds,
+                },
+                step=idx,
+            )
 
             if self.num_policy_updates > 0 and idx % self.num_policy_updates == 0:
                 self.handle_policy_update()
